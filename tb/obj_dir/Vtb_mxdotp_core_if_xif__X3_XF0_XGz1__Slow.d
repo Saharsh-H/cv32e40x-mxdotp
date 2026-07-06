@@ -1,3 +1,0 @@
-Vtb_mxdotp_core_if_xif__X3_XF0_XGz1__Slow.o: \
- Vtb_mxdotp_core_if_xif__X3_XF0_XGz1__Slow.cpp Vtb_mxdotp_core__pch.h \
- Vtb_mxdotp_core__Syms.h Vtb_mxdotp_core_if_xif__X3_XF0_XGz1.h

@@ -211,6 +211,24 @@ module mxdotp_xif
     end
 
     //--------------------------------------------------------------------------
+    // Execute (placeholder - see mxdotp_execute.sv)
+    //--------------------------------------------------------------------------
+
+    logic [X_RFR_WIDTH-1:0] exec_result;
+
+    mxdotp_execute #(
+        .X_RFR_WIDTH (X_RFR_WIDTH),
+        .X_RFW_WIDTH (X_RFR_WIDTH)
+    ) execute_i (
+        .rs1          (saved_rs[0]),
+        .rs2          (saved_rs[1]),
+        .rs3          (saved_rs[2]),
+        .mx_operation (saved_operation),
+        .mx_format    (saved_format),
+        .result_data  (exec_result)
+    );
+
+    //--------------------------------------------------------------------------
     // Result Interface
     //--------------------------------------------------------------------------
 
@@ -220,17 +238,14 @@ module mxdotp_xif
         result_if.result_valid = 1'b0;
         result_if.result       = '0;
 
-        // Return a dummy result after commit
         if (state_q == MX_RESULT) begin
 
             result_if.result_valid = 1'b1;
 
-            result_if.result.id = saved_id;
-            result_if.result.rd = saved_rd;
-            result_if.result.we = 1'b1;
-
-            // Dummy computation
-            result_if.result.data = '0;
+            result_if.result.id   = saved_id;
+            result_if.result.rd   = saved_rd;
+            result_if.result.we   = 1'b1;
+            result_if.result.data = exec_result;
 
         end
 
