@@ -3,104 +3,61 @@
 // Project : MXDOTP XIF Coprocessor - Verilator Testbench
 //------------------------------------------------------------------------------
 // Description:
-//   Minimal C++ driver for Verilator. Instantiates the elaborated RTL,
-//   clocks it, and waits for the scoreboard (in tb_mxdotp_core.sv) to set
-//   the pass/fail flags. No SystemVerilog $display output is captured here
-//   (Verilator doesn't support that natively), but the simulation will print
-//   all SV output to stdout, and we check the scoreboard state at the end.
+//   Minimal C++ driver for Verilator.
 //
+//   tb_mxdotp_core.sv is declared as `module tb_mxdotp_core;` - it has NO
+//   ports. It generates its own clk_i/rst_ni internally, runs its own
+//   scoreboard, and its own watchdog calls $finish (pass) or $fatal
+//   (fail) when done. This harness therefore does not drive any signal -
+//   there is nothing to drive. Its only job is to keep simulation time
+//   advancing (required for --timing designs, which rely on Verilator's
+//   event scheduler to run the SV always/initial blocks with delays) and
+//   stop when the design itself is finished.
+//
+//   Pass/fail is intentionally NOT inspected here via hierarchical signal
+//   access. tb_mxdotp_core.sv's watchdog calls $fatal on failure, which
+//   Verilator converts into a non-zero process exit code automatically -
+//   so `make`/CI sees failures for free, and this file never goes stale
+//   relative to the scoreboard's internal state names.
 //==============================================================================
 
 #include <verilated.h>
 #include <verilated_vcd_c.h>
 #include "Vtb_mxdotp_core.h"
 
-#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-
-// Global Verilator context
-VerilatedContext* contextp = nullptr;
-Vtb_mxdotp_core* top = nullptr;
-VerilatedVcdC* tfp = nullptr;
-
-// Simulation parameters
-const uint64_t TIMEOUT_CYCLES = 500;
-const uint64_t CLK_PERIOD_PS = 10000; // 10ns in picoseconds
-
-// Verilator time in picoseconds
-uint64_t sim_time = 0;
-
-void clock_step(uint64_t num_cycles = 1) {
-    for (uint64_t i = 0; i < num_cycles; i++) {
-        // Clock low
-        top->clk_i = 0;
-        contextp->timeInc(CLK_PERIOD_PS / 2);
-        top->eval();
-        if (tfp) tfp->dump(sim_time);
-        sim_time += CLK_PERIOD_PS / 2;
-
-        // Clock high
-        top->clk_i = 1;
-        contextp->timeInc(CLK_PERIOD_PS / 2);
-        top->eval();
-        if (tfp) tfp->dump(sim_time);
-        sim_time += CLK_PERIOD_PS / 2;
-    }
-}
 
 int main(int argc, char** argv) {
-    // Construct the Verilated model
-    contextp = new VerilatedContext;
+    VerilatedContext* contextp = new VerilatedContext;
     contextp->commandArgs(argc, argv);
-    top = new Vtb_mxdotp_core{contextp};
+    contextp->traceEverOn(true);
 
-    // Trace setup (optional; generates a .vcd file)
-    Verilated::traceEverOn(true);
-    tfp = new VerilatedVcdC;
+    Vtb_mxdotp_core* top = new Vtb_mxdotp_core{contextp};
+
+    VerilatedVcdC* tfp = new VerilatedVcdC;
     top->trace(tfp, 99);
     tfp->open("tb_mxdotp_core.vcd");
 
     printf("Verilator testbench starting...\n");
-    printf("Simulation timeout: %lu cycles\n", TIMEOUT_CYCLES);
+    printf("(tb_mxdotp_core.sv drives its own clock/reset and watchdog;\n"
+           " this harness just pumps simulation time.)\n");
 
-    // Reset
-    top->rst_ni = 0;
-    clock_step(10);
-
-    // Release reset
-    top->rst_ni = 1;
-    printf("Reset released at cycle 10\n");
-
-    // Run simulation
-    uint64_t cycle_count = 0;
-    while (cycle_count < TIMEOUT_CYCLES && !contextp->gotFinish()) {
-        clock_step(1);
-        cycle_count++;
-
-        // Check if scoreboard has finished (sb_state == SB_DONE or SB_FAIL)
-        // In verilated testbenches, you'd need to expose these via a trace or
-        // hook into the module hierarchy. For now, just run until timeout.
+    while (!contextp->gotFinish()) {
+        top->eval();
+        tfp->dump(contextp->time());
+        contextp->timeInc(1);
     }
 
-    printf("\nSimulation complete after %lu cycles\n", cycle_count);
+    printf("\nSimulation finished at time %llu\n",
+           static_cast<unsigned long long>(contextp->time()));
 
-    // Close waveform
-    if (tfp) {
-        tfp->close();
-        delete tfp;
-    }
-
-    // Check final state - ideally we'd read sb_state and pass_count from the SV module
-    // but Verilator doesn't directly expose hierarchical signals in C++ without extra setup.
-    // For now, we exit with status 0 (you'd integrate a more sophisticated check here).
-
-    printf("Waveform written to tb_mxdotp_core.vcd\n");
+    tfp->close();
+    delete tfp;
 
     top->final();
     delete top;
     delete contextp;
 
-    printf("Test flow completed. Check waveform for detailed results.\n");
+    printf("Waveform written to tb_mxdotp_core.vcd\n");
     return 0;
 }

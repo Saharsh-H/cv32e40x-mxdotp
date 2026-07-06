@@ -266,6 +266,11 @@ module tb_mxdotp_core;
   wire [31:0] exp_rs2_val = u_instr_rom.MXDOTP_RS2_VAL;
   wire [31:0] exp_rs3_val = u_instr_rom.MXDOTP_RS3_VAL;
 
+  // Tracks mxdotp_execute.sv's current MX_FUNCT3_DOTP behavior (rs1 + rs2,
+  // rs3 unused). Update this the same day mxdotp_execute.sv's real MXFP4
+  // arithmetic replaces the placeholder, or this check will go stale again.
+  wire [31:0] exp_result_data = exp_rs1_val + exp_rs2_val;
+
   //----------------------------------------------------------------------------
   // Protocol assertion: once result_valid is asserted without being accepted
   // the same cycle, it must remain asserted until result_ready arrives.
@@ -298,23 +303,34 @@ module tb_mxdotp_core;
   int unsigned pass_count;
   int unsigned fail_count;
 
+  // Failure flag for this cycle (set combinationally, consumed by always_ff)
+  logic        sb_fail_this_cycle;
+  string       sb_fail_msg;
+
+  initial begin
+    sb_state            = SB_WAIT_ISSUE;
+    pass_count          = 0;
+    fail_count          = 0;
+    sb_fail_this_cycle  = 1'b0;
+    sb_fail_msg         = "";
+  end
+
   task automatic sb_fail(string msg);
     $display("[%0t] FAIL: %s", $time, msg);
     fail_count++;
-    sb_state = SB_FAIL;
+    sb_fail_this_cycle = 1'b1;
+    sb_fail_msg        = msg;
   endtask
-
-  initial begin
-    sb_state   = SB_WAIT_ISSUE;
-    pass_count = 0;
-    fail_count = 0;
-  end
 
   always_ff @(posedge clk_i) begin
     if (!rst_ni) begin
       sb_state <= SB_WAIT_ISSUE;
     end else begin
-      unique case (sb_state)
+      // If a failure was flagged this cycle, transition to SB_FAIL and hold.
+      if (sb_fail_this_cycle) begin
+        sb_state <= SB_FAIL;
+      end else begin
+        unique case (sb_state)
 
         SB_WAIT_ISSUE: begin
           if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_instr)) begin
@@ -355,8 +371,8 @@ module tb_mxdotp_core;
               sb_fail($sformatf("Result rd mismatch: got %0d expected %0d", xif_result_rd, exp_rd));
             end else if (!xif_result_we) begin
               sb_fail("Result.we was not asserted");
-            end else if (xif_result_data !== 32'h0) begin
-              sb_fail($sformatf("Result.data unexpected: got 0x%0h, expected 0x0 (dummy value)", xif_result_data));
+            end else if (xif_result_data !== exp_result_data) begin
+              sb_fail($sformatf("Result.data unexpected: got 0x%0h, expected 0x%0h", xif_result_data, exp_result_data));
             end else begin
               $display("[%0t] RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
                         $time, xif_result_id, xif_result_rd, xif_result_data, xif_result_we);
@@ -367,8 +383,8 @@ module tb_mxdotp_core;
 
         SB_WAIT_WB: begin
           if (rf_we_wb_o && (rf_waddr_wb_o == exp_rd)) begin
-            if (rf_wdata_wb_o !== 32'h0) begin
-              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x0", exp_rd, rf_wdata_wb_o));
+            if (rf_wdata_wb_o !== exp_result_data) begin
+              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_rd, rf_wdata_wb_o, exp_result_data));
             end else begin
               $display("[%0t] WB     ok: x%0d <= 0x%0h", $time, exp_rd, rf_wdata_wb_o);
               $display("=====================================================");
@@ -385,9 +401,19 @@ module tb_mxdotp_core;
 
         default: sb_fail("Scoreboard reached an unknown state");
 
-      endcase
+        endcase
+      end
     end
   end
+
+  always_ff @(posedge clk_i) begin
+  if (rf_we_wb_o) begin
+    $display("[%0t] RF WB: x%0d <= 0x%08h",
+             $time,
+             rf_waddr_wb_o,
+             rf_wdata_wb_o);
+  end
+end
 
   //----------------------------------------------------------------------------
   // Watchdog: bounds simulation time and reports final PASS/FAIL
@@ -403,7 +429,16 @@ module tb_mxdotp_core;
       fail_count++;
     end
     $display("Summary: pass=%0d fail=%0d", pass_count, fail_count);
-    $finish;
+
+    // $fatal (unlike $display+$finish) makes Verilator - and most other
+    // simulators - exit with a non-zero process status. That's what lets
+    // `make`/CI actually see a scoreboard failure: verilator_tb.cpp does not
+    // (and should not need to) reach into this module's internal signals to
+    // find out whether the test passed.
+    if (fail_count != 0)
+      $fatal(1, "Test FAILED (%0d failure(s))", fail_count);
+    else
+      $finish;
   end
 
   //----------------------------------------------------------------------------

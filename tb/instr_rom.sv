@@ -66,6 +66,7 @@ module instr_rom
   localparam logic [31:0] INSTR_ADDI_X2 = encode_i(OPCODE_OPIMM, 3'b000, MXDOTP_RS2, 5'd0, MXDOTP_RS2_VAL[11:0]);
   localparam logic [31:0] INSTR_ADDI_X3 = encode_i(OPCODE_OPIMM, 3'b000, MXDOTP_RS3, 5'd0, MXDOTP_RS3_VAL[11:0]);
 
+  
   localparam logic [31:0] INSTR_MXDOTP = encode_r4(
     MX_OPCODE, MX_FUNCT3_DOTP, MX_FMT_MXFP4,
     MXDOTP_RD, MXDOTP_RS1, MXDOTP_RS2, MXDOTP_RS3

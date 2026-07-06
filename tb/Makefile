@@ -1,80 +1,126 @@
 #==============================================================================
 # File    : Makefile
 # Project : MXDOTP XIF Coprocessor - Verilator Build
-#------------------------------------------------------------------------------
-# Usage:
-#   make           # Compile and run
-#   make clean     # Clean build artifacts
-#   make view-vcd  # Open waveform in GTKWave (if installed)
-#
-# Requirements:
-#   - Verilator 5.x (or 4.x)
-#   - SystemVerilog RTL files (cv32e40x_*.sv, if_*.sv, mxdotp_*.sv, tb_*.sv)
-#   - C++ compiler (g++ or clang++)
 #==============================================================================
 
-# Verilator command - try verilator5 first, fall back to verilator
+#----------------------------------------------------------------------------
+# Verilator
+#----------------------------------------------------------------------------
+
 VERILATOR := $(shell which verilator5 || which verilator)
 ifeq ($(VERILATOR),)
-    $(error verilator not found in PATH. Install Verilator 5.x)
+$(error Verilator not found in PATH)
 endif
 
+#----------------------------------------------------------------------------
 # Directories
-RTL_DIR       := rtl
-TB_DIR        := tb
-BUILD_DIR     := obj_dir
-SRC_DIR       := .
+#----------------------------------------------------------------------------
 
-# Top module
+ROOT_DIR      := ..
+RTL_DIR       := $(ROOT_DIR)/rtl
+TB_DIR        := .
+BHV_DIR       := $(ROOT_DIR)/bhv
+BUILD_DIR     := obj_dir
+
 TOP_MODULE    := tb_mxdotp_core
 
-# Source files - adjust paths to match your project layout
-CV32E40X_SRCS := $(wildcard $(RTL_DIR)/cv32e40x*.sv)
-XV32_SRCS     := $(wildcard $(RTL_DIR)/if_*.sv)
-MXDOTP_SRCS   := $(wildcard $(RTL_DIR)/mxdotp*.sv)
-TB_SRCS       := $(TB_DIR)/tb_pkg.sv \
-                 $(TB_DIR)/instr_rom.sv \
-                 $(TB_DIR)/data_mem_stub.sv \
-                 $(TB_DIR)/tb_mxdotp_core.sv
+MANIFEST      := $(ROOT_DIR)/cv32e40x_manifest.flist
+VERILATOR_FLIST := $(BUILD_DIR)/verilator.f
 
-ALL_SRCS      := $(CV32E40X_SRCS) $(XV32_SRCS) $(MXDOTP_SRCS) $(TB_SRCS)
+#----------------------------------------------------------------------------
+# Testbench
+#----------------------------------------------------------------------------
 
+TB_SRCS := \
+	$(TB_DIR)/tb_pkg.sv \
+	$(TB_DIR)/instr_rom.sv \
+	$(TB_DIR)/data_mem_stub.sv \
+	$(TB_DIR)/tb_mxdotp_core.sv
+
+#----------------------------------------------------------------------------
+# MXDOTP sources
+#----------------------------------------------------------------------------
+
+MXDOTP_SRCS := \
+	$(RTL_DIR)/mxdotp/mxdotp_pkg.sv \
+	$(RTL_DIR)/mxdotp/mxdotp_decoder.sv \
+	$(RTL_DIR)/mxdotp/mxdotp_execute.sv \
+	$(RTL_DIR)/mxdotp/mxdotp_xif.sv \
+	$(RTL_DIR)/mxdotp/mxdotp_core_top.sv
+
+#----------------------------------------------------------------------------
+# C++ harness
+#----------------------------------------------------------------------------
+
+CXX_FILES := $(TB_DIR)/verilator_tb.cpp
+
+#----------------------------------------------------------------------------
 # Verilator flags
-VERILATOR_FLAGS := -Wno-UNOPTFLAT \
-                   --top-module $(TOP_MODULE) \
-                   --trace \
-                   --trace-fst \
-                   --cc \
-                   --exe \
-                   -O3 \
-                   --build \
-                   -j $(shell nproc)
+#----------------------------------------------------------------------------
 
-# C++ files
-CXX_FILES     := $(SRC_DIR)/verilator_tb.cpp
+VERILATOR_FLAGS := \
+	-sv \
+	--cc \
+    --Wno-fatal \
+	--exe \
+	--build \
+	--trace \
+	--top-module $(TOP_MODULE) \
+	--Mdir $(BUILD_DIR) \
+	-j 8 \
+	-O3 \
+    --timing \
+	-Wall \
+	-Wno-UNOPTFLAT \
+	-Wno-BLKANDNBLK \
+	-I$(RTL_DIR)/include \
+	-I$(RTL_DIR)/mxdotp \
+	-I$(BHV_DIR) \
+	-I$(BHV_DIR)/include
 
-# Final executable
-EXECUTABLE    := $(BUILD_DIR)/V$(TOP_MODULE)
+EXECUTABLE := $(BUILD_DIR)/V$(TOP_MODULE)
 
-# Default target
+.DEFAULT_GOAL := all
+
+#==============================================================================
+# Build manifest for Verilator
+#==============================================================================
+
+$(VERILATOR_FLIST): $(MANIFEST)
+	@mkdir -p $(BUILD_DIR)
+	@echo "Generating Verilator file list..."
+	@sed 's|$${DESIGN_RTL_DIR}|$(abspath $(RTL_DIR))|g' $(MANIFEST) | \
+	grep -v "cv32e40x_wrapper.sv" | \
+	grep -v "cv32e40x_rvfi.sv" | \
+	grep -v "cv32e40x_rvfi_pkg.sv" | \
+	grep -v "/sva/" > $@
+#==============================================================================
+# Build
+#==============================================================================
+
 all: $(EXECUTABLE)
-	@echo "Build complete. Running simulation..."
+	@echo
+	@echo "==============================="
+	@echo "Running simulation..."
+	@echo "==============================="
 	$(EXECUTABLE)
 
-# Verilator compilation
-$(EXECUTABLE): $(ALL_SRCS) $(CXX_FILES)
-	@mkdir -p $(BUILD_DIR)
+$(EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
 	$(VERILATOR) $(VERILATOR_FLAGS) \
-		--Mdir $(BUILD_DIR) \
-		$(ALL_SRCS) \
+		-f $(VERILATOR_FLIST) \
+		$(MXDOTP_SRCS) \
+		$(TB_SRCS) \
 		$(CXX_FILES)
 
-# View waveform
-view-vcd: tb_mxdotp_core.vcd
+#==============================================================================
+# Utilities
+#==============================================================================
+
+view:
 	gtkwave tb_mxdotp_core.vcd &
 
-# Clean
 clean:
-	rm -rf $(BUILD_DIR) tb_mxdotp_core.vcd *.o
+	rm -rf $(BUILD_DIR)
+	rm -f *.vcd *.fst
 
-.PHONY: all clean view-vcd
+.PHONY: all clean view
