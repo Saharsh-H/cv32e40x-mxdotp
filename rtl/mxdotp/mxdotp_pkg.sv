@@ -1,11 +1,22 @@
 //==============================================================================
 // File    : mxdotp_pkg.sv
 // Project : MXDOTP XIF Coprocessor
-// Author  :
 //------------------------------------------------------------------------------
 // Description:
 //   Common package containing ISA encodings, configuration constants, and
 //   shared typedefs for the MXDOTP coprocessor.
+//
+//   Instruction encoding follows the standard RISC-V R4-type layout (the same
+//   layout used by FMADD.S/D in the F/D extensions):
+//
+//     [31:27] rs3     [26:25] funct2   [24:20] rs2   [19:15] rs1
+//     [14:12] funct3  [11:7]  rd       [6:0]   opcode
+//
+//   This is a deliberate choice: cv32e40x_id_stage.sv already hardwires its
+//   third register-file read port address to instr[31:27] (REG_S3_MSB/LSB)
+//   whenever REGFILE_NUM_READ_PORTS == 3 (i.e. X_NUM_RS == 3). Using the
+//   standard R4 rs3 position means our decoder's view of rs3 matches the
+//   register the core actually reads, with zero core RTL changes required.
 //
 //   All MXDOTP RTL modules should import this package:
 //
@@ -42,24 +53,25 @@ package mxdotp_pkg;
 
 
   //----------------------------------------------------------------------------
-  // Data Format / Variant (funct7)
+  // Data Format / Variant (funct2, R4-type bits [26:25])
   //----------------------------------------------------------------------------
   //
-  // funct7 selects the arithmetic format.
+  // funct2 selects the arithmetic format. Only 2 bits are available in the
+  // R4-type encoding (the remaining bits of the old funct7 field are now
+  // consumed by rs3).
   //
-  // These values apply to every MX instruction.
-  //
-  localparam logic [6:0] MX_FMT_MXFP4          = 7'b0000000;
-  localparam logic [6:0] MX_FMT_M2FP4          = 7'b0000001;
-  localparam logic [6:0] MX_FMT_NVFP4          = 7'b0000010;
-  localparam logic [6:0] MX_FMT_MXFP4_RESIDUE  = 7'b0000011;
+  localparam logic [1:0] MX_FMT_MXFP4         = 2'b00;
+  localparam logic [1:0] MX_FMT_M2FP4         = 2'b01;
+  localparam logic [1:0] MX_FMT_NVFP4         = 2'b10;
+  localparam logic [1:0] MX_FMT_MXFP4_RESIDUE = 2'b11;
 
 
   //----------------------------------------------------------------------------
   // XIF Configuration
   //----------------------------------------------------------------------------
   //
-  // These reflect the chosen XIF configuration.
+  // These reflect the chosen XIF configuration. MX_NUM_RS = 3 to support the
+  // R4-type rs3 operand (matches X_NUM_RS passed to cv32e40x_core / if_xif).
   //
   localparam int MX_NUM_RS = 3;
 
@@ -70,7 +82,6 @@ package mxdotp_pkg;
   typedef enum logic [1:0] {
     MX_IDLE,
     MX_WAIT_COMMIT,
-    MX_EXECUTE,
     MX_RESULT
   } mxdotp_state_t;
 
