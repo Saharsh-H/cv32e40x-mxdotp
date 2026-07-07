@@ -59,7 +59,15 @@ module mxdotp_decoder
     //--------------------------------------------------------------------------
     // MX Instruction Detection
     //--------------------------------------------------------------------------
-
-    assign is_mx = (opcode == MX_OPCODE);
+    //
+    // Requires both the opcode match AND a recognized funct3. Without the
+    // funct3 check, an instruction with MX_OPCODE but an unassigned funct3
+    // (e.g. 111) would still be accepted into the coprocessor - harmless
+    // today since mxdotp_execute.sv's dispatch has a default case, but not
+    // clean ISA behavior (such an instruction should probably be illegal,
+    // not silently accepted and silently doing nothing).
+    //
+    assign is_mx = (opcode == MX_OPCODE) &&
+                   ((mx_operation == MX_FUNCT3_DOTP) || (mx_operation == MX_FUNCT3_FINAL));
 
 endmodule

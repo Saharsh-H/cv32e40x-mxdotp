@@ -210,7 +210,8 @@ module mxdotp_core_top
   //----------------------------------------------------------------------------
   mxdotp_xif #(
     .X_ID_WIDTH  ( X_ID_WIDTH  ),
-    .X_RFR_WIDTH ( X_RFR_WIDTH )
+    .X_RFR_WIDTH ( X_RFR_WIDTH ),
+    .X_RFW_WIDTH ( X_RFW_WIDTH )
   ) mxdotp_i (
     .clk_i         ( clk_i                  ),
     .rst_ni        ( rst_ni                 ),

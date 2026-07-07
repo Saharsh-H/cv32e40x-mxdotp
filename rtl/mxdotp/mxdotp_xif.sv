@@ -15,14 +15,18 @@ module mxdotp_xif
     import cv32e40x_pkg::*;
     import mxdotp_pkg::*;
 #(
-    // Must match the X_ID_WIDTH / X_RFR_WIDTH used to instantiate the if_xif
-    // interface this module is connected to. Passed explicitly from the top
-    // level (mxdotp_core_top.sv) rather than pulled off the interface
-    // instance, so a parameter mismatch shows up as a port-width mismatch
-    // at elaboration instead of silently compiling with the interface's
-    // values.
+    // Must match the X_ID_WIDTH / X_RFR_WIDTH / X_RFW_WIDTH used to
+    // instantiate the if_xif interface this module is connected to. Passed
+    // explicitly from the top level (mxdotp_core_top.sv) rather than pulled
+    // off the interface instance, so a parameter mismatch shows up as a
+    // port-width mismatch at elaboration instead of silently compiling with
+    // the interface's values.
     parameter int X_ID_WIDTH  = 4,
-    parameter int X_RFR_WIDTH = 32
+    parameter int X_RFR_WIDTH = 32,
+    parameter int X_RFW_WIDTH = 32   // genuinely separate from X_RFR_WIDTH now -
+                                      // previously mxdotp_execute was instantiated
+                                      // with X_RFW_WIDTH(X_RFR_WIDTH), harmless only
+                                      // because both happened to be 32 today
 )
 (
     input  logic clk_i,
@@ -51,6 +55,9 @@ module mxdotp_xif
         assert (X_RFR_WIDTH == issue_if.X_RFR_WIDTH) else
             $error("mxdotp_xif: X_RFR_WIDTH (%0d) does not match issue_if.X_RFR_WIDTH (%0d)",
                     X_RFR_WIDTH, issue_if.X_RFR_WIDTH);
+        assert (X_RFW_WIDTH == result_if.X_RFW_WIDTH) else
+            $error("mxdotp_xif: X_RFW_WIDTH (%0d) does not match result_if.X_RFW_WIDTH (%0d)",
+                    X_RFW_WIDTH, result_if.X_RFW_WIDTH);
     end
     // synthesis translate_on
 
@@ -120,7 +127,16 @@ module mxdotp_xif
         if (issue_if.issue_valid && state_q == MX_IDLE && is_mx)
         begin
             issue_if.issue_resp.accept    = 1'b1;
-            issue_if.issue_resp.writeback = 1'b1;
+            // MXDOTP stages its scaled sum-of-products in mxdotp_execute's
+            // private pending_sop_q register and does not touch rd; only
+            // MXFINAL (which combines that pending value with rs1's old FP32
+            // accumulator) produces an architectural result. This is checked
+            // against cv32e40x_id_stage.sv: issue_resp.writeback drives
+            // xif_we, which feeds rf_we = rf_we_dec || xif_we and flows
+            // straight through to rf_we_wb_o in the WB stage - so setting it
+            // to 0 here genuinely suppresses the register write, unlike
+            // dualread/dualwrite which have no consumer in this core at all.
+            issue_if.issue_resp.writeback = (mx_operation == MX_FUNCT3_FINAL);
         end
 
     end
@@ -219,12 +235,11 @@ module mxdotp_xif
     end
 
     //--------------------------------------------------------------------------
-    // Execute (placeholder arithmetic; see mxdotp_execute.sv - real
-    // MXFP4/M2FP4/NVFP4 datapaths will replace the case branches inside it,
-    // not this handshake)
+    // Execute (real MXFP8 k=4 datapath - see mxdotp_execute.sv. This
+    // handshake shape is unchanged from the earlier placeholder version)
     //--------------------------------------------------------------------------
 
-    logic [X_RFR_WIDTH-1:0] exec_result;
+    logic [X_RFW_WIDTH-1:0] exec_result;
     logic                   exec_start;
     logic                   exec_done;
 
@@ -240,11 +255,7 @@ module mxdotp_xif
 
     mxdotp_execute #(
         .X_RFR_WIDTH (X_RFR_WIDTH),
-        // mxdotp_xif has no independent write-width parameter, so this
-        // assumes X_RFW_WIDTH == X_RFR_WIDTH (true today, both = 32 at the
-        // top level). If they're ever configured to differ, this needs its
-        // own parameter threaded through mxdotp_core_top.sv.
-        .X_RFW_WIDTH (X_RFR_WIDTH)
+        .X_RFW_WIDTH (X_RFW_WIDTH)
     ) execute_i (
         .clk_i        (clk_i),
         .rst_ni       (rst_ni),
@@ -274,7 +285,12 @@ module mxdotp_xif
 
             result_if.result.id   = saved_id;
             result_if.result.rd   = saved_rd;
-            result_if.result.we   = 1'b1;
+            // Consistent with issue_resp.writeback above: MXDOTP has no
+            // architectural result. The core already ignores this write for
+            // MXDOTP via issue_resp.writeback, but drive it accurately here
+            // too rather than relying solely on that - our own testbench's
+            // xif_result_we monitor reads this field directly.
+            result_if.result.we   = (saved_operation == MX_FUNCT3_FINAL);
             result_if.result.data = exec_result;
 
         end
