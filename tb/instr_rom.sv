@@ -84,11 +84,35 @@ module instr_rom
     rom[0] = INSTR_ADDI_X1;
     rom[1] = INSTR_ADDI_X2;
     rom[2] = INSTR_ADDI_X3;
-    rom[3] = INSTR_MXDOTP;
-    rom[4] = INSTR_JAL_SELF;
+
+    // --- DO NOT REMOVE: rs3-forwarding hazard workaround ---
+    // cv32e40x_id_stage.sv only forwards rs1/rs2 (operand_a_fw/operand_b_fw,
+    // driven by the bypass network). rs3 (issue_req.rs[2]) is read straight
+    // from the register file with no forwarding path and no hazard stall to
+    // cover it - a pre-existing cv32e40x limitation (its bypass network
+    // predates XIF's 3-operand R4-type support), not an MXDOTP bug.
+    //
+    // Without a gap here, MXDOTP would read x3 while addi x3's writeback is
+    // still in flight and see the stale pre-write value (0, not 9) - this
+    // exact failure was diagnosed and confirmed via waveform/RF-writeback
+    // monitoring before these NOPs were added. 2 cycles is the calculated
+    // minimum (addi x3 must clear WB before MXDOTP's ID stage reads x3);
+    // using 3 for a small margin costs nothing here.
+    //
+    // This is a test-program scheduling workaround, not an MXDOTP ISA
+    // requirement - real software talking to this coprocessor will need the
+    // same instruction spacing until/unless rs3 forwarding is implemented
+    // in cv32e40x's bypass controller (deliberately deferred - see project
+    // notes: it's a throughput optimization, not a correctness fix).
+    rom[3] = INSTR_NOP;
+    rom[4] = INSTR_NOP;
+    rom[5] = INSTR_NOP;
+
+    rom[6] = INSTR_MXDOTP;
+    rom[7] = INSTR_JAL_SELF;
 
     // Add further instructions here, e.g.:
-    //   rom[5] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
+    //   rom[8] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
     //
     // Or, once an assembler/linker flow exists, replace the block above with:
     //   $readmemh("program.mem", rom);

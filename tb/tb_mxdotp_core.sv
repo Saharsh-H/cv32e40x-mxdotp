@@ -17,11 +17,10 @@
 //   u_instr_rom, so editing the program in instr_rom.sv keeps the checks in
 //   sync automatically.
 //
-//   IMPORTANT - see the "XSim time-0 workaround" block below before removing
-//   it: without it, this environment reliably crashes XSim at time 0 ps
-//   inside cv32e40x_alignment_buffer.sv, for reasons unrelated to the OBI
-//   wiring in this file (see the block comment there for the full
-//   explanation).
+//   Note: XSim currently crashes at time 0 inside cv32e40x_alignment_buffer.sv
+//   for reasons unrelated to this testbench (XSim-specific; $deposit/force
+//   workarounds attempted earlier did not resolve it). This environment is
+//   verified under Verilator, which does not hit the issue.
 //
 //==============================================================================
 
@@ -405,15 +404,6 @@ module tb_mxdotp_core;
       end
     end
   end
-
-  always_ff @(posedge clk_i) begin
-  if (rf_we_wb_o) begin
-    $display("[%0t] RF WB: x%0d <= 0x%08h",
-             $time,
-             rf_waddr_wb_o,
-             rf_wdata_wb_o);
-  end
-end
 
   //----------------------------------------------------------------------------
   // Watchdog: bounds simulation time and reports final PASS/FAIL

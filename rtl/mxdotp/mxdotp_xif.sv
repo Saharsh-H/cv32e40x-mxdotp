@@ -148,8 +148,16 @@ module mxdotp_xif
             //--------------------------------------------------------------
             MX_WAIT_COMMIT: begin
                 if (commit_if.commit_valid) begin
-                    state_d = commit_if.commit.commit_kill ? MX_IDLE : MX_RESULT;
+                    state_d = commit_if.commit.commit_kill ? MX_IDLE : MX_COMPUTE;
                 end
+            end
+
+            //--------------------------------------------------------------
+            // Wait for mxdotp_execute's start_i/done_o handshake
+            //--------------------------------------------------------------
+            MX_COMPUTE: begin
+                if (exec_done)
+                    state_d = MX_RESULT;
             end
 
             //--------------------------------------------------------------
@@ -211,15 +219,37 @@ module mxdotp_xif
     end
 
     //--------------------------------------------------------------------------
-    // Execute (placeholder - see mxdotp_execute.sv)
+    // Execute (placeholder arithmetic; see mxdotp_execute.sv - real
+    // MXFP4/M2FP4/NVFP4 datapaths will replace the case branches inside it,
+    // not this handshake)
     //--------------------------------------------------------------------------
 
     logic [X_RFR_WIDTH-1:0] exec_result;
+    logic                   exec_start;
+    logic                   exec_done;
+
+    // Pulse start_i for exactly one cycle: the same cycle commit_valid
+    // fires with commit_kill=0, which is also the cycle state_q is about
+    // to transition MX_WAIT_COMMIT -> MX_COMPUTE. saved_rs/saved_operation/
+    // saved_format are already valid and stable by this point (captured
+    // back at issue), so mxdotp_execute's own start_i-triggered capture
+    // sees correct values.
+    assign exec_start = (state_q == MX_WAIT_COMMIT) &&
+                         commit_if.commit_valid &&
+                         !commit_if.commit.commit_kill;
 
     mxdotp_execute #(
         .X_RFR_WIDTH (X_RFR_WIDTH),
+        // mxdotp_xif has no independent write-width parameter, so this
+        // assumes X_RFW_WIDTH == X_RFR_WIDTH (true today, both = 32 at the
+        // top level). If they're ever configured to differ, this needs its
+        // own parameter threaded through mxdotp_core_top.sv.
         .X_RFW_WIDTH (X_RFR_WIDTH)
     ) execute_i (
+        .clk_i        (clk_i),
+        .rst_ni       (rst_ni),
+        .start_i      (exec_start),
+        .done_o       (exec_done),
         .rs1          (saved_rs[0]),
         .rs2          (saved_rs[1]),
         .rs3          (saved_rs[2]),

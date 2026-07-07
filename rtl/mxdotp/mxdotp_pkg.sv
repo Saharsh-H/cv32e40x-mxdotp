@@ -79,9 +79,16 @@ package mxdotp_pkg;
   //----------------------------------------------------------------------------
   // Controller FSM
   //----------------------------------------------------------------------------
+  //
+  // MX_COMPUTE: waits for mxdotp_execute's start_i/done_o handshake. Entered
+  // once the instruction has committed (i.e. is guaranteed not to be killed),
+  // left once done_o pulses. Sized at 2 bits (4 states fit); if a 5th state
+  // is ever needed this typedef's width must grow accordingly.
+  //
   typedef enum logic [1:0] {
     MX_IDLE,
     MX_WAIT_COMMIT,
+    MX_COMPUTE,
     MX_RESULT
   } mxdotp_state_t;
 
