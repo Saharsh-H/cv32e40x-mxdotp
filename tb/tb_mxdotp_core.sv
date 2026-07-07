@@ -257,18 +257,21 @@ module tb_mxdotp_core;
   wire [4:0]  rf_waddr_wb_o = dut.core_i.rf_waddr_wb;
   wire [31:0] rf_wdata_wb_o = dut.core_i.rf_wdata_wb;
 
-  // Expected values for the MXDOTP instruction under test, read hierarchically
-  // from instr_rom.sv - edit the program there, not here.
-  wire [31:0] exp_instr   = u_instr_rom.INSTR_MXDOTP;
-  wire [4:0]  exp_rd      = u_instr_rom.MXDOTP_RD;
-  wire [31:0] exp_rs1_val = u_instr_rom.MXDOTP_RS1_VAL;
-  wire [31:0] exp_rs2_val = u_instr_rom.MXDOTP_RS2_VAL;
-  wire [31:0] exp_rs3_val = u_instr_rom.MXDOTP_RS3_VAL;
+  // Expected values for the MXDOTP / MXFINAL pair under test, read
+  // hierarchically from instr_rom.sv - edit the program there, not here.
+  wire [31:0] exp_dotp_instr  = u_instr_rom.INSTR_MXDOTP;
+  wire [31:0] exp_a_val       = u_instr_rom.MXDOTP_A_VAL;
+  wire [31:0] exp_b_val       = u_instr_rom.MXDOTP_B_VAL;
+  wire [31:0] exp_scales      = u_instr_rom.MXDOTP_SCALES;
 
-  // Tracks mxdotp_execute.sv's current MX_FUNCT3_DOTP behavior (rs1 + rs2,
-  // rs3 unused). Update this the same day mxdotp_execute.sv's real MXFP4
-  // arithmetic replaces the placeholder, or this check will go stale again.
-  wire [31:0] exp_result_data = exp_rs1_val + exp_rs2_val;
+  wire [31:0] exp_final_instr = u_instr_rom.INSTR_MXFINAL;
+  wire [4:0]  exp_final_rd    = u_instr_rom.REG_RESULT;
+  wire [31:0] exp_old_acc     = u_instr_rom.MXFINAL_OLD_ACC;
+
+  // Hand-computed expected MXFINAL result (see instr_rom.sv header) - not
+  // yet golden-model-derived; this is a sanity vector (all-1.0 elements,
+  // unit scale, zero old accumulator -> 4.0), not the rigorous test suite.
+  wire [31:0] exp_final_data  = u_instr_rom.MXFINAL_EXPECTED;
 
   //----------------------------------------------------------------------------
   // Protocol assertion: once result_valid is asserted without being accepted
@@ -288,11 +291,14 @@ module tb_mxdotp_core;
   // Issue -> Commit -> Result -> Register file writeback
   //----------------------------------------------------------------------------
 
-  typedef enum logic [2:0] {
-    SB_WAIT_ISSUE,
-    SB_WAIT_COMMIT,
-    SB_WAIT_RESULT,
-    SB_WAIT_WB,
+  typedef enum logic [3:0] {
+    SB_WAIT_DOTP_ISSUE,
+    SB_WAIT_DOTP_COMMIT,
+    SB_WAIT_DOTP_RESULT,
+    SB_WAIT_FINAL_ISSUE,
+    SB_WAIT_FINAL_COMMIT,
+    SB_WAIT_FINAL_RESULT,
+    SB_WAIT_FINAL_WB,
     SB_DONE,
     SB_FAIL
   } sb_state_e;
@@ -307,7 +313,7 @@ module tb_mxdotp_core;
   string       sb_fail_msg;
 
   initial begin
-    sb_state            = SB_WAIT_ISSUE;
+    sb_state            = SB_WAIT_DOTP_ISSUE;
     pass_count          = 0;
     fail_count          = 0;
     sb_fail_this_cycle  = 1'b0;
@@ -344,7 +350,7 @@ module tb_mxdotp_core;
     if (!rst_ni) begin
       wb_seen_q <= 1'b0;
       wb_data_q <= '0;
-    end else if (!wb_seen_q && rf_we_wb_o && (rf_waddr_wb_o == exp_rd)) begin
+    end else if (!wb_seen_q && rf_we_wb_o && (rf_waddr_wb_o == exp_final_rd)) begin
       wb_seen_q <= 1'b1;
       wb_data_q <= rf_wdata_wb_o;
     end
@@ -359,7 +365,7 @@ module tb_mxdotp_core;
 
   always_ff @(posedge clk_i) begin
     if (!rst_ni) begin
-      sb_state <= SB_WAIT_ISSUE;
+      sb_state <= SB_WAIT_DOTP_ISSUE;
     end else begin
       // If a failure was flagged this cycle, transition to SB_FAIL and hold.
       if (sb_fail_this_cycle) begin
@@ -367,63 +373,118 @@ module tb_mxdotp_core;
       end else begin
         unique case (sb_state)
 
-        SB_WAIT_ISSUE: begin
-          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_instr)) begin
+        //----------------------------------------------------------------
+        // MXDOTP: rs1=A, rs2=B, rs3=scales. No writeback expected - only
+        // the issue/commit/result handshake is checked here; the actual
+        // arithmetic result is verified indirectly via MXFINAL's output.
+        //----------------------------------------------------------------
+
+        SB_WAIT_DOTP_ISSUE: begin
+          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_dotp_instr)) begin
             if (!xif_issue_accept) begin
               sb_fail("MXDOTP instruction was not accepted at issue");
-            end else if (!xif_issue_wb) begin
-              sb_fail("MXDOTP issue_resp.writeback was not asserted");
-            end else if ((xif_issue_rs0 !== exp_rs1_val) || (xif_issue_rs1 !== exp_rs2_val) || (xif_issue_rs2 !== exp_rs3_val)) begin
-              sb_fail($sformatf("Operand mismatch at issue: rs1=%0d rs2=%0d rs3=%0d (expected %0d,%0d,%0d)",
-                                 xif_issue_rs0, xif_issue_rs1, xif_issue_rs2, exp_rs1_val, exp_rs2_val, exp_rs3_val));
+            end else if (xif_issue_wb) begin
+              sb_fail("MXDOTP issue_resp.writeback was asserted (expected 0 - MXDOTP has no architectural result)");
+            end else if ((xif_issue_rs0 !== exp_a_val) || (xif_issue_rs1 !== exp_b_val) || (xif_issue_rs2 !== exp_scales)) begin
+              sb_fail($sformatf("MXDOTP operand mismatch at issue: A=0x%0h B=0x%0h scales=0x%0h (expected 0x%0h,0x%0h,0x%0h)",
+                                 xif_issue_rs0, xif_issue_rs1, xif_issue_rs2, exp_a_val, exp_b_val, exp_scales));
             end else begin
               expected_id <= xif_issue_id;
-              $display("[%0t] ISSUE  ok: id=%0d rs1=%0d rs2=%0d rs3=%0d",
+              $display("[%0t] DOTP  ISSUE  ok: id=%0d A=0x%0h B=0x%0h scales=0x%0h",
                         $time, xif_issue_id, xif_issue_rs0, xif_issue_rs1, xif_issue_rs2);
-              sb_state <= SB_WAIT_COMMIT;
+              sb_state <= SB_WAIT_DOTP_COMMIT;
             end
           end
         end
 
-        SB_WAIT_COMMIT: begin
+        SB_WAIT_DOTP_COMMIT: begin
           if (xif_commit_valid) begin
             if (xif_commit_id !== expected_id) begin
-              sb_fail($sformatf("Commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
+              sb_fail($sformatf("MXDOTP commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
             end else if (xif_commit_kill) begin
               sb_fail("MXDOTP instruction was killed at commit (unexpected for this program)");
             end else begin
-              $display("[%0t] COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
-              sb_state <= SB_WAIT_RESULT;
+              $display("[%0t] DOTP  COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
+              sb_state <= SB_WAIT_DOTP_RESULT;
             end
           end
         end
 
-        SB_WAIT_RESULT: begin
+        SB_WAIT_DOTP_RESULT: begin
           if (xif_result_valid && xif_result_ready) begin
             if (xif_result_id !== expected_id) begin
-              sb_fail($sformatf("Result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
-            end else if (xif_result_rd !== exp_rd) begin
-              sb_fail($sformatf("Result rd mismatch: got %0d expected %0d", xif_result_rd, exp_rd));
-            end else if (!xif_result_we) begin
-              sb_fail("Result.we was not asserted");
-            end else if (xif_result_data !== exp_result_data) begin
-              sb_fail($sformatf("Result.data unexpected: got 0x%0h, expected 0x%0h", xif_result_data, exp_result_data));
+              sb_fail($sformatf("MXDOTP result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
+            end else if (xif_result_we) begin
+              sb_fail("MXDOTP result.we was asserted (expected 0 - no architectural result)");
             end else begin
-              $display("[%0t] RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
-                        $time, xif_result_id, xif_result_rd, xif_result_data, xif_result_we);
-              sb_state <= SB_WAIT_WB;
+              $display("[%0t] DOTP  RESULT ok: id=%0d we=%0d (no writeback, as expected)",
+                        $time, xif_result_id, xif_result_we);
+              sb_state <= SB_WAIT_FINAL_ISSUE;
             end
           end
         end
 
-        SB_WAIT_WB: begin
-          if (wb_seen_q) begin
-            if (wb_data_q !== exp_result_data) begin
-              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_rd, wb_data_q, exp_result_data));
+        //----------------------------------------------------------------
+        // MXFINAL: rs1=old FP32 accumulator. Combines with MXDOTP's staged
+        // sum-of-products, rounds once, writes the result to rd.
+        //----------------------------------------------------------------
+
+        SB_WAIT_FINAL_ISSUE: begin
+          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_final_instr)) begin
+            if (!xif_issue_accept) begin
+              sb_fail("MXFINAL instruction was not accepted at issue");
+            end else if (!xif_issue_wb) begin
+              sb_fail("MXFINAL issue_resp.writeback was not asserted");
+            end else if (xif_issue_rs0 !== exp_old_acc) begin
+              sb_fail($sformatf("MXFINAL operand mismatch at issue: rs1=0x%0h (expected 0x%0h)",
+                                 xif_issue_rs0, exp_old_acc));
             end else begin
-              $display("[%0t] WB     ok: x%0d <= 0x%0h", $time, exp_rd, wb_data_q);
+              expected_id <= xif_issue_id;
+              $display("[%0t] FINAL ISSUE  ok: id=%0d old_acc=0x%0h", $time, xif_issue_id, xif_issue_rs0);
+              sb_state <= SB_WAIT_FINAL_COMMIT;
+            end
+          end
+        end
+
+        SB_WAIT_FINAL_COMMIT: begin
+          if (xif_commit_valid) begin
+            if (xif_commit_id !== expected_id) begin
+              sb_fail($sformatf("MXFINAL commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
+            end else if (xif_commit_kill) begin
+              sb_fail("MXFINAL instruction was killed at commit (unexpected for this program)");
+            end else begin
+              $display("[%0t] FINAL COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
+              sb_state <= SB_WAIT_FINAL_RESULT;
+            end
+          end
+        end
+
+        SB_WAIT_FINAL_RESULT: begin
+          if (xif_result_valid && xif_result_ready) begin
+            if (xif_result_id !== expected_id) begin
+              sb_fail($sformatf("MXFINAL result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
+            end else if (xif_result_rd !== exp_final_rd) begin
+              sb_fail($sformatf("MXFINAL result rd mismatch: got %0d expected %0d", xif_result_rd, exp_final_rd));
+            end else if (!xif_result_we) begin
+              sb_fail("MXFINAL result.we was not asserted");
+            end else if (xif_result_data !== exp_final_data) begin
+              sb_fail($sformatf("MXFINAL result.data unexpected: got 0x%0h, expected 0x%0h", xif_result_data, exp_final_data));
+            end else begin
+              $display("[%0t] FINAL RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
+                        $time, xif_result_id, xif_result_rd, xif_result_data, xif_result_we);
+              sb_state <= SB_WAIT_FINAL_WB;
+            end
+          end
+        end
+
+        SB_WAIT_FINAL_WB: begin
+          if (wb_seen_q) begin
+            if (wb_data_q !== exp_final_data) begin
+              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_final_rd, wb_data_q, exp_final_data));
+            end else begin
+              $display("[%0t] FINAL WB     ok: x%0d <= 0x%0h", $time, exp_final_rd, wb_data_q);
               $display("=====================================================");
-              $display(" PASS: MXDOTP traversed Issue -> Commit -> Result -> WB");
+              $display(" PASS: MXDOTP -> MXFINAL traversed Issue -> Commit -> Result -> WB");
               $display("=====================================================");
               pass_count++;
               sb_state <= SB_DONE;
