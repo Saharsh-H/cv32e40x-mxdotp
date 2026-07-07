@@ -314,6 +314,42 @@ module tb_mxdotp_core;
     sb_fail_msg         = "";
   end
 
+  //----------------------------------------------------------------------------
+  // RF writeback capture - independent of sb_state.
+  //
+  // CV32E40X retires an accepted XIF result into the register file
+  // *combinationally in the same cycle* result_valid && result_ready fires
+  // (rf_we_wb/rf_waddr_wb/rf_wdata_wb are driven straight from the accepted
+  // result in the WB stage, not registered a cycle later). The main
+  // scoreboard below is a single always_ff/case block that only evaluates
+  // one state's body per clock edge, so the SB_WAIT_RESULT -> SB_WAIT_WB
+  // transition (triggered this same cycle) can't also check the WB
+  // condition on that same cycle - by the time sb_state actually becomes
+  // SB_WAIT_WB (the following cycle), the one-shot rf_we_wb_o pulse for x5
+  // has already come and gone (the next instruction to retire, e.g. the
+  // JAL_SELF's x0 write, has taken its place). That race - not a bug in
+  // mxdotp_xif.sv/mxdotp_execute.sv - is what was causing the SB_WAIT_WB
+  // timeout: this test's own scoreboard was arriving one cycle too late to
+  // see an event it should have caught the very cycle RESULT fired.
+  //
+  // Fix: capture the write the instant it happens, in its own always_ff,
+  // independent of sb_state. SB_WAIT_WB then reads this latch instead of
+  // sampling the live (possibly already-passed) pulse directly.
+  //----------------------------------------------------------------------------
+
+  logic        wb_seen_q;
+  logic [31:0] wb_data_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen_q <= 1'b0;
+      wb_data_q <= '0;
+    end else if (!wb_seen_q && rf_we_wb_o && (rf_waddr_wb_o == exp_rd)) begin
+      wb_seen_q <= 1'b1;
+      wb_data_q <= rf_wdata_wb_o;
+    end
+  end
+
   task automatic sb_fail(string msg);
     $display("[%0t] FAIL: %s", $time, msg);
     fail_count++;
@@ -381,11 +417,11 @@ module tb_mxdotp_core;
         end
 
         SB_WAIT_WB: begin
-          if (rf_we_wb_o && (rf_waddr_wb_o == exp_rd)) begin
-            if (rf_wdata_wb_o !== exp_result_data) begin
-              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_rd, rf_wdata_wb_o, exp_result_data));
+          if (wb_seen_q) begin
+            if (wb_data_q !== exp_result_data) begin
+              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_rd, wb_data_q, exp_result_data));
             end else begin
-              $display("[%0t] WB     ok: x%0d <= 0x%0h", $time, exp_rd, rf_wdata_wb_o);
+              $display("[%0t] WB     ok: x%0d <= 0x%0h", $time, exp_rd, wb_data_q);
               $display("=====================================================");
               $display(" PASS: MXDOTP traversed Issue -> Commit -> Result -> WB");
               $display("=====================================================");
