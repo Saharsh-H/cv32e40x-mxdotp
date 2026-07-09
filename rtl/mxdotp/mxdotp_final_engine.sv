@@ -11,6 +11,16 @@
 //   rs2=old FP32 accumulator - BOTH plain 32-bit reads, no dual-read for
 //   either, in any format.
 //
+//   RESIDUE-STYLE FORMATS ONLY as of the fused-fast-path milestone (see
+//   mxdotp_pkg.sv's MX_SLOT_FUSED milestone header): plain (non-residue)
+//   MXFP4/MXFP8 now go exclusively through mxdotp_fused_engine.sv and never
+//   reach this engine at all. Because every instruction reaching this
+//   engine is therefore guaranteed - by ISA convention, not a runtime check
+//   - to be a residue-style format, the format mask this engine used to
+//   apply is gone: p2/residue's contribution is now included
+//   UNCONDITIONALLY, always. There is no mx_format input any more; nothing
+//   left in this engine's own logic is format-dependent.
+//
 //   p1_i/p2_i are the "mailbox" snapshot - MXDOTP's raw, unscaled dot-product
 //   sums. This engine captures them into its own private registers at
 //   start_i, on the exact same cycle (and via the exact same mechanism) it
@@ -24,18 +34,24 @@
 //   Applies scale_exp(a_scale,b_scale) to the captured p1 via place_in_acc
 //   (with the -2 exponent correction fp4_to_code's fixed-point convention
 //   needs - see mxdotp_pkg.sv) - always. Applies scale_exp(ar_scale,b_scale)
-//   to the captured p2 the same way, but that contribution is only added to
-//   the final sum when mx_format == MX_FMT_MXFP4_RESIDUAL - masked out
-//   (contributes exactly zero) for every other format. Brings in the old
-//   accumulator via fp32_to_acc, sums at full ACC_FULL_WIDTH precision (no
-//   intermediate narrowing), and performs the single final round-to-
-//   nearest-even via acc_to_fp32.
+//   to the captured p2 the same way and always adds it to the final sum -
+//   no mask, since p2/AR is meaningful for every format that ever reaches
+//   this engine now. Brings in the old accumulator via fp32_to_acc, sums at
+//   full ACC_FULL_WIDTH precision (no intermediate narrowing), and performs
+//   the single final round-to-nearest-even via acc_to_fp32.
 //==============================================================================
 
 module mxdotp_final_engine
     import mxdotp_pkg::*;
 #(
-    parameter int X_RFR_WIDTH    = 32,
+    // Real system value is always 64 (mxdotp_core_top.sv -> mxdotp_xif.sv ->
+    // here), same as the other two engines - matched here for consistency
+    // even though, unlike mxdotp_dotp_engine.sv/mxdotp_fused_engine.sv, this
+    // module never actually needs more than the low 32 bits of rs1_i/rs2_i
+    // (scales/old_acc are plain 32-bit reads, never dual-read - see file
+    // header) and would work correctly at 32 too. No elaboration-time
+    // guard needed here for that reason.
+    parameter int X_RFR_WIDTH    = 64,
     parameter int X_RFW_WIDTH    = 32,
     parameter int LATENCY_CYCLES = 2   // must be >= 1; not yet re-tuned for the
                                         // real datapath's actual critical path -
@@ -51,7 +67,6 @@ module mxdotp_final_engine
 
     input  logic [X_RFR_WIDTH-1:0]    rs1_i,  // scales
     input  logic [X_RFR_WIDTH-1:0]    rs2_i,  // old FP32 accumulator
-    input  logic [1:0]                mx_format_i,
     input  logic signed [PSUM_WIDTH-1:0] p1_i,  // mailbox snapshot: raw sum(A.B)
     input  logic signed [PSUM_WIDTH-1:0] p2_i,  // mailbox snapshot: raw sum(AR.B)
 
@@ -64,7 +79,6 @@ module mxdotp_final_engine
   //----------------------------------------------------------------------------
 
   logic [X_RFR_WIDTH-1:0] rs1_q, rs2_q;
-  logic [1:0]             mx_format_q;
   logic signed [PSUM_WIDTH-1:0] p1_q, p2_q;
 
   //----------------------------------------------------------------------------
@@ -82,7 +96,6 @@ module mxdotp_final_engine
       cycle_cnt_q <= '0;
       rs1_q       <= '0;
       rs2_q       <= '0;
-      mx_format_q <= '0;
       p1_q        <= '0;
       p2_q        <= '0;
     end else if (start_i && !busy_q) begin
@@ -90,7 +103,6 @@ module mxdotp_final_engine
       cycle_cnt_q <= CNT_WIDTH'(LATENCY_CYCLES - 1);
       rs1_q       <= rs1_i;
       rs2_q       <= rs2_i;
-      mx_format_q <= mx_format_i;
       p1_q        <= p1_i;
       p2_q        <= p2_i;
     end else if (busy_q) begin
@@ -107,9 +119,10 @@ module mxdotp_final_engine
   //----------------------------------------------------------------------------
   // Datapath: decode rs1_q=scales / rs2_q=old_acc, apply each scale pair to
   // the captured p1_q/p2_q via place_in_acc, bring in the old accumulator
-  // via fp32_to_acc, and sum at full ACC_FULL_WIDTH precision. p2's
-  // contribution is masked to zero unless mx_format_q == MX_FMT_MXFP4_RESIDUAL
-  // - this is the only format-dependent step in this engine.
+  // via fp32_to_acc, and sum at full ACC_FULL_WIDTH precision. p2/residue's
+  // contribution is now UNCONDITIONAL - no format check anywhere in this
+  // engine - since only residue-style formats ever reach it post-split (see
+  // file header / mxdotp_pkg.sv's MX_SLOT_FUSED milestone header).
   //----------------------------------------------------------------------------
 
   logic [7:0]  a_scale, ar_scale, b_scale;
@@ -124,7 +137,6 @@ module mxdotp_final_engine
 
   logic signed [ACC_WIDTH-1:0]      contrib1, contrib2, acc_contrib;
   logic signed [ACC_FULL_WIDTH-1:0] contrib1_wide, contrib2_wide, acc_contrib_wide;
-  logic signed [ACC_FULL_WIDTH-1:0] contrib2_masked_wide;
   logic signed [ACC_FULL_WIDTH-1:0] final_sum_wide;
 
   always_comb begin
@@ -153,13 +165,8 @@ module mxdotp_final_engine
     contrib2_wide    = contrib2;
     acc_contrib_wide = acc_contrib;
 
-    // The one and only format-dependent step in this engine: p2's (residue's)
-    // contribution is included only for MX_FMT_MXFP4_RESIDUAL. Every other
-    // format (MX_FMT_MXFP4, and the two reserved-but-not-yet-implemented
-    // codes) gets exactly zero from it.
-    contrib2_masked_wide = (mx_format_q == MX_FMT_MXFP4_RESIDUAL) ? contrib2_wide : '0;
-
-    final_sum_wide = contrib1_wide + contrib2_masked_wide + acc_contrib_wide;
+    // p2/residue's contribution is always included now - see header.
+    final_sum_wide = contrib1_wide + contrib2_wide + acc_contrib_wide;
   end
 
   //----------------------------------------------------------------------------

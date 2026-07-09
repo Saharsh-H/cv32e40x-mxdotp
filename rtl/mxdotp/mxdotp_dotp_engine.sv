@@ -26,7 +26,16 @@
 module mxdotp_dotp_engine
     import mxdotp_pkg::*;
 #(
-    parameter int X_RFR_WIDTH    = 32,
+    // Real system value is always 64 (mxdotp_core_top.sv -> mxdotp_xif.sv ->
+    // here) - this module's own unpacking is hard-fixed to MX_K=16 nibbles
+    // per operand (16*4=64 bits), so 64 is the only value that actually
+    // works, not an independent tunable. The default matches that rather
+    // than an arbitrary smaller placeholder (32 doesn't work at all - see
+    // the elaboration-time assert below, added after standalone Vivado
+    // synthesis of just this module - no mxdotp_xif.sv around to supply
+    // the real override - silently fell back to an old, invalid default
+    // and Vivado correctly flagged the resulting out-of-range part-select).
+    parameter int X_RFR_WIDTH    = 64,
     parameter int LATENCY_CYCLES = 2   // must be >= 1; not yet re-tuned for the
                                         // real datapath's actual critical path -
                                         // correctness-first, timing later.
@@ -66,6 +75,21 @@ module mxdotp_dotp_engine
     output logic signed [PSUM_WIDTH-1:0] p1_o,
     output logic signed [PSUM_WIDTH-1:0] p2_o
 );
+
+  // Elaboration-time guard: this module's unpacking is hard-fixed to
+  // MX_K=16 nibbles per operand (16*4=64 bits) - X_RFR_WIDTH is not an
+  // independently free parameter, it must be >= 64. Catches exactly the
+  // failure mode a standalone Vivado synthesis run just hit (module's own
+  // default silently too small, no mxdotp_xif.sv around to supply the real
+  // override) with a clear message instead of a bare out-of-range
+  // part-select error deep in the unpacking loop.
+  // synthesis translate_off
+  initial begin
+    assert (X_RFR_WIDTH >= 64) else
+      $error("mxdotp_dotp_engine: X_RFR_WIDTH (%0d) must be >= 64 - MX_K=16 nibbles per operand need the full 64 bits, this is not a free parameter.",
+              X_RFR_WIDTH);
+  end
+  // synthesis translate_on
 
   //----------------------------------------------------------------------------
   // Input capture (on start_i)

@@ -70,6 +70,6 @@ module mxdotp_decoder
     //
     assign is_mx = (opcode == MX_OPCODE) &&
                    ((mx_operation == MX_FUNCT3_DOTP) || (mx_operation == MX_FUNCT3_FINAL) ||
-                    (mx_operation == MX_FUNCT3_DUALREAD_TEST));
+                    (mx_operation == MX_FUNCT3_DUALREAD_TEST) || (mx_operation == MX_FUNCT3_FUSED));
 
 endmodule

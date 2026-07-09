@@ -134,10 +134,25 @@ package mxdotp_pkg;
   // Instruction Class (funct3)
   //----------------------------------------------------------------------------
   //
-  // 000 : MXDOTP   - exact/raw dot product arithmetic only (A.B and AR.B),
-  //                  stage internally, no WB, no scale knowledge at all
-  // 001 : MXFINAL  - apply MX scale(s) to the staged raw products, combine
-  //                  with the FP32 accumulator, round once, write rd
+  // MILESTONE (current): fused fast-path engine for plain (non-residue)
+  // formats - see mx_raw_contrib_t and the MX_SLOT_FUSED milestone header
+  // further down for the full rationale. This split the two-instruction
+  // DOTP/FINAL convention's role in two:
+  //
+  // 000 : MXDOTP   - RESIDUE-STYLE FORMATS ONLY now. Exact/raw dot product
+  //                  arithmetic (A.B and AR.B), stage internally, no WB, no
+  //                  scale knowledge at all. rs3 is always a meaningful
+  //                  residue/auxiliary operand on this path now (AR today;
+  //                  "X meta" for whatever a future residue-style format
+  //                  needs there) - never present-but-unused the way it was
+  //                  when plain MXFP4 still went through this instruction.
+  // 001 : MXFINAL  - RESIDUE-STYLE FORMATS ONLY now. Apply MX scale(s) to
+  //                  the staged raw products, combine with the FP32
+  //                  accumulator, round once, write rd. Always includes the
+  //                  residue/p2 contribution unconditionally (no format
+  //                  mask any more - see mxdotp_final_engine.sv) since every
+  //                  instruction reaching this slot is, by ISA convention,
+  //                  a residue-style format.
   // 010 : MXDUALREAD_TEST - validation-only, NOT part of the real MXDOTP ISA
   //                  (see mxdotp_execute.sv for why this exists). rs1=base
   //                  register; requests issue_resp.dualread=1 and writes the
@@ -147,26 +162,52 @@ package mxdotp_pkg;
   //                  dual-read mechanism (cv32e40x_core.sv's X_DUALREAD,
   //                  REGFILE_NUM_READ_PORTS==6) actually works, independent
   //                  of format.
+  // 011 : MXFUSED  - PLAIN (non-residue) FORMATS ONLY. Single-instruction,
+  //                  single-engine fast path: rs1=A, rs2=B (64-bit dual-
+  //                  read, same shape as MXDOTP's) and rs3={reserved[15:0],
+  //                  b_scale[7:0],a_scale[7:0]} (upper 32, from rs3+1) /
+  //                  old FP32 accumulator (lower 32, from rs3) - also 64-bit
+  //                  dual-read, packed the same way MXFINAL's rs1 is today,
+  //                  just relocated to rs3. Computes the raw dot product,
+  //                  applies the scale, accumulates, rounds, and writes rd -
+  //                  all in one instruction, no mailbox, no AR/residue
+  //                  operand at all. mx_format selects the ELEMENT format
+  //                  here (MX_FMT_MXFP4 implemented; MX_FMT_MXFP8 reserved/
+  //                  stubbed - see mxdotp_fused_engine.sv), not a residue
+  //                  variant - MX_FMT_MXFP4_RESIDUAL/MX_FMT_M2XFP4 aren't
+  //                  meaningful for an instruction with no AR operand and
+  //                  fall through to the same safe-inert stub MXFP8 does.
   //
   localparam logic [2:0] MX_FUNCT3_DOTP           = 3'b000;
   localparam logic [2:0] MX_FUNCT3_FINAL          = 3'b001;
   localparam logic [2:0] MX_FUNCT3_DUALREAD_TEST  = 3'b010;
+  localparam logic [2:0] MX_FUNCT3_FUSED          = 3'b011;
 
 
   //----------------------------------------------------------------------------
   // Data Format / Variant (funct2, R4-type bits [26:25])
   //----------------------------------------------------------------------------
   //
-  // See the "unified operand convention" milestone header above for the full
-  // rationale. Only MXFP4 and MXFP4_RESIDUAL are actually implemented in
-  // mxdotp_execute.sv right now; M2XFP4 and MXFP8 are finalized as ISA
-  // encodings so they can be added later without an instruction-semantics
-  // change, but are NOT yet wired to any arithmetic.
+  // Same four encodings, but their MEANING now depends on which funct3 they
+  // ride along with (see the funct3 milestone comment above):
+  //   - Under MXDOTP/MXFINAL (residue-style path): selects the residue
+  //     variant. Only MX_FMT_MXFP4_RESIDUAL is implemented; MX_FMT_MXFP4
+  //     reaching this path is stale/unused post-split (no longer produced
+  //     by the intended software convention) but still falls through
+  //     safely rather than being treated as an error - see
+  //     mxdotp_final_engine.sv.
+  //   - Under MXFUSED (plain fast path): selects the ELEMENT format.
+  //     MX_FMT_MXFP4 is implemented; MX_FMT_MXFP8 is a reserved/stubbed
+  //     front-end (see mxdotp_fused_engine.sv) that safely contributes
+  //     zero until its real arithmetic is designed. MX_FMT_MXFP4_RESIDUAL/
+  //     MX_FMT_M2XFP4 aren't meaningful here (no AR operand exists in this
+  //     instruction's encoding) and fall into the same stub.
   //
   localparam logic [1:0] MX_FMT_MXFP4          = 2'b00;
   localparam logic [1:0] MX_FMT_MXFP4_RESIDUAL = 2'b01;
   localparam logic [1:0] MX_FMT_M2XFP4         = 2'b10;  // RESERVED - not yet implemented
-  localparam logic [1:0] MX_FMT_MXFP8          = 2'b11;  // RESERVED - not yet implemented
+  localparam logic [1:0] MX_FMT_MXFP8          = 2'b11;  // RESERVED (MXDOTP path) /
+                                                          // stubbed front-end (MXFUSED path)
 
 
   //----------------------------------------------------------------------------
@@ -244,17 +285,91 @@ package mxdotp_pkg;
 
   // --- Order-delivery queue: tags which slot produced each outstanding
   //     instruction, in the order they were accepted. Depth exactly matches
-  //     the number of independent slots (DOTP, FINAL, DUALREAD_TEST) since
-  //     each slot can have at most one instruction outstanding at a time by
-  //     construction - three is a real bound, not a heuristic. ---
-  localparam int MX_NUM_SLOTS  = 3;
+  //     the number of independent slots (DOTP, FINAL, DUALREAD_TEST, FUSED)
+  //     since each slot can have at most one instruction outstanding at a
+  //     time by construction - four is a real bound, not a heuristic. ---
+  localparam int MX_NUM_SLOTS  = 4;
   localparam int MX_ORDER_DEPTH = MX_NUM_SLOTS;
 
   typedef enum logic [1:0] {
     MX_SLOT_DOTP,
     MX_SLOT_FINAL,
-    MX_SLOT_DUALREAD
+    MX_SLOT_DUALREAD,
+    MX_SLOT_FUSED
   } mx_slot_e;
+
+  //==============================================================================
+  //
+  // MILESTONE: fused fast-path engine for plain (non-residue) formats
+  //
+  // Even after pipelining, plain MX_FMT_MXFP4 still paid the FULL two-
+  // instruction, two-slot MXDOTP->MXFINAL round trip (mailbox, order queue,
+  // two separate Issue->Commit->Result handshakes) even though it doesn't
+  // structurally need three register operands the way a residue format
+  // does - MXDOTP's own AR/p2 arithmetic was computed and then unconditionally
+  // discarded by MXFINAL's format mask for this format. Two distinct, now-
+  // addressed wastes:
+  //   1) Protocol overhead paid twice per plain-format dot product (two
+  //      issue slots, two commit-gated FSMs, a mailbox handoff) for an
+  //      instruction pair that only ever had two operands' worth of real
+  //      information (A, B) plus scales/old_acc - never a genuine third
+  //      (AR) operand.
+  //   2) mxdotp_dotp_engine.sv unconditionally computing p2=sum(AR_i*B_i)
+  //      for a format that immediately discards it.
+  //
+  // This is an intentional ISA-breaking change (not preserving the earlier
+  // "one operand convention for every format" uniformity), splitting the
+  // instruction set into two genuinely different conventions by need:
+  //   - MXDOTP/MXFINAL: RESIDUE-STYLE FORMATS ONLY from here on. Still
+  //     genuinely need three dual-read operands at DOTP time (A, B, AR) and
+  //     a second instruction at FINAL time (scales, old_acc) - nothing about
+  //     this path shrinks, since the operand count is real, not an artifact
+  //     of ISA uniformity. mxdotp_final_engine.sv is simplified to match:
+  //     its format mask is gone, since every instruction reaching it is now
+  //     guaranteed (by ISA convention, not a runtime check) to want the
+  //     residue contribution included.
+  //   - MXFUSED (new, MX_FUNCT3_FUSED): the plain fast path. rs1=A, rs2=B
+  //     (dual-read, same shape as MXDOTP), rs3={scales,old_acc} (also dual-
+  //     read, packed like MXFINAL's rs1 is today but relocated) - one
+  //     instruction, one slot, no mailbox (nothing to hand off across
+  //     instructions - the raw-sum-to-rounded-result handoff happens
+  //     entirely inside mxdotp_fused_engine.sv, privately, between its own
+  //     front-end and back-end).
+  //
+  // mxdotp_fused_engine.sv is structured as a format-selected FRONT-END
+  // (unpack + multiply + sum, one branch per element format) feeding a
+  // single shared BACK-END (scale + accumulate + round - the same
+  // place_in_acc/fp32_to_acc/acc_to_fp32 machinery mxdotp_final_engine.sv
+  // already uses). The contract between them is mx_raw_contrib_t (below):
+  // a front-end reduces whatever its element format is to one signed
+  // magnitude plus an exponent correction, ready for place_in_acc as-is -
+  // the back-end never special-cases *format*, only that struct's
+  // contents. MX_FMT_MXFP4's front-end is implemented now (reusing
+  // fp4_to_code, MX_K, PSUM_WIDTH exactly as mxdotp_dotp_engine.sv does,
+  // just without ever computing an AR/p2 term - a real area win specific
+  // to this path, not just a protocol one). MX_FMT_MXFP8's front-end is a
+  // deliberate STUB (contributes zero, same "reserved format falls through
+  // safely" convention used elsewhere in this project) - MXFP8's real
+  // arithmetic is NOT a simple reparameterization of MXFP4's exact "2x
+  // value" fixed-point trick (E4M3/E5M2 have real mantissas and a much
+  // wider dynamic range), and is deliberately deferred until that's
+  // designed on its own terms (see the MXDOTP paper's FP9/E5M3-intermediate,
+  // early-accumulation approach for MXFP8, referenced in
+  // mxdotp_fused_engine.sv's header, for what that will likely need to
+  // look like).
+  //
+  // ACC_WIDTH=95/ACC_ANCHOR=34 (below) are shared, UNCHANGED, by both the
+  // fused engine's back-end and mxdotp_final_engine.sv's - deliberately not
+  // re-derived for MXFP4's smaller dynamic range yet (still Known
+  // Limitation #1 / a deferred "optimize later" item). These are not
+  // arbitrary placeholders: they are the MXDOTP paper's own sizing for its
+  // real MXFP8/k=8 datapath (95-bit fixed-point accumulator, anchor at 34,
+  // sized to exactly hold the sum of eight products plus the shifted
+  // accumulator, sign and rounding bits included) - i.e. already the
+  // *intended* width for MXFP8's eventual front-end, and over-provisioned
+  // headroom (not lossy) for MXFP4's smaller range in the meantime.
+  //
+  //==============================================================================
 
   //============================================================================
   // MXFP4 numeric datapath: widths and pure helper functions
@@ -385,6 +500,25 @@ package mxdotp_pkg;
   endfunction
 
   //----------------------------------------------------------------------------
+  // mx_raw_contrib_t: the contract between a mxdotp_fused_engine.sv FRONT-END
+  // (format-specific unpack/multiply/sum) and its shared BACK-END (scale +
+  // accumulate + round). A front-end reduces its own element format down to
+  // exactly this - a signed magnitude already shaped for place_in_acc, plus
+  // whatever per-format exponent correction its own numeric representation
+  // needs (e.g. -2 for MXFP4's code=2*value convention - see fp4_to_code
+  // above and mxdotp_fused_engine.sv). The back-end never special-cases
+  // *format*, only this struct's contents - a future MXFP8 front-end plugs
+  // in by producing the same three fields, not by teaching the back-end
+  // anything new. mag is pre-zero-extended to 32 bits so it can be passed to
+  // place_in_acc without further shaping at the call site.
+  //----------------------------------------------------------------------------
+  typedef struct packed {
+    logic        sign;
+    logic [31:0] mag;
+    mx_exp_t     exp_corr;
+  } mx_raw_contrib_t;
+
+  //----------------------------------------------------------------------------
   // scale_exp: fold a pair of E8M0 block scales into a single signed exponent
   // offset. Applying X^A * X^B to a value is exactly this added to its
   // existing exponent - no separate multiply needed (E8M0 has no mantissa).
@@ -509,8 +643,23 @@ package mxdotp_pkg;
         if (lead_pos - 1 - i >= 0) mant_out[22-i] = mag[lead_pos-1-i];
       end
       if (lead_pos - 24 >= 0) round_bit = mag[lead_pos-24];
-      for (i = 0; i < lead_pos-24; i++) begin
-        if (mag[i]) sticky_bit = 1'b1;
+      // Fixed-bound loop (ACC_FULL_WIDTH is a compile-time constant), guarded
+      // by a data-dependent `if` - the same pattern the mant_out loop just
+      // above already uses, not a new one. lead_pos-24 was the loop's actual
+      // trip count before this rewrite (data-dependent, since lead_pos comes
+      // from the leading-one scan above) - Vivado cannot statically unroll a
+      // variable trip count ([Synth 8-3380] "loop condition does not
+      // converge"), so the bound is widened to the provably-safe constant
+      // ACC_FULL_WIDTH (mag's own bit range is 0..ACC_FULL_WIDTH-1, so no
+      // valid i is ever excluded) and the original bound is enforced inside
+      // as a guard instead. Semantically identical: every i that the old
+      // loop would have visited (0 <= i < lead_pos-24) still contributes;
+      // every additional i this loop now visits (lead_pos-24 <= i <
+      // ACC_FULL_WIDTH) is guarded off and contributes nothing, exactly as
+      // if the loop had stopped there - not an approximation, the same
+      // boolean OR-reduction, just expressed with a synthesizable trip count.
+      for (i = 0; i < ACC_FULL_WIDTH; i++) begin
+        if (i < lead_pos-24 && mag[i]) sticky_bit = 1'b1;
       end
 
       mant_ext = {1'b0, mant_out};
