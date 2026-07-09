@@ -1,3 +1,14 @@
-TAGS
+# Vim swap files
 *.swp
+
+# Editor backup files
 *~
+
+# ctags
+TAGS
+
+# Verilator build directory
+tb/obj_dir/
+
+# Simulation files
+tb/tb_mxdotp_core.vcd

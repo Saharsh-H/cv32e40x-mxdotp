@@ -42,6 +42,20 @@ module cv32e40x_core import cv32e40x_pkg::*;
   parameter int          X_MEM_WIDTH                  = 32,
   parameter int          X_RFR_WIDTH                  = 32,
   parameter int          X_RFW_WIDTH                  = 32,
+  parameter bit          X_DUALREAD                   = 0, // Physically provision a
+                                                            // second register-file read
+                                                            // port per XIF source operand
+                                                            // (rs1+1/rs2+1/rs3+1), enabling
+                                                            // genuine dualread support (see
+                                                            // REGFILE_NUM_READ_PORTS below).
+                                                            // Independent of X_RFR_WIDTH:
+                                                            // the coprocessor must also set
+                                                            // X_RFR_WIDTH=64 (2*XLEN) for the
+                                                            // paired reads to actually have
+                                                            // somewhere to go in issue_req.rs[].
+                                                            // Dualwrite (rd/rd+1) is a
+                                                            // separate, still-unimplemented
+                                                            // mechanism - not affected by this.
   parameter logic [31:0] X_MISA                       = 32'h00000000,
   parameter logic [1:0]  X_ECS_XS                     = 2'b00,
   parameter bit          ZC_EXT                       = 0, // todo: remove once fully implemented
@@ -133,8 +147,14 @@ module cv32e40x_core import cv32e40x_pkg::*;
 );
 
   // Number of register file read ports
-  // Core will only use two, but X_EXT may mandate 2 or 3
-  localparam int unsigned REGFILE_NUM_READ_PORTS = X_EXT ? X_NUM_RS : 2;
+  // Core will only use two, but X_EXT may mandate 2 or 3 (one per XIF source operand);
+  // X_DUALREAD doubles that again, adding one companion port per operand (rs1+1/rs2+1/
+  // rs3+1) so the coprocessor can request a paired 64-bit read of rs_i/rs_i+1 (see
+  // if_xif.sv's issue_resp.dualread). The base ports [0 +: X_NUM_RS] keep their existing
+  // meaning unchanged either way; the companion ports, when present, are always the upper
+  // half [X_NUM_RS +: X_NUM_RS] - see cv32e40x_id_stage.sv's gen_dualread_raddr.
+  localparam int unsigned REGFILE_NUM_READ_PORTS =
+      X_EXT ? (X_DUALREAD ? X_NUM_RS * 2 : X_NUM_RS) : 2;
 
   logic [31:0]       pc_if;             // Program counter in IF stage
 

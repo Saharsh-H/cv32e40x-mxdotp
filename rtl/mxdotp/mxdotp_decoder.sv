@@ -11,7 +11,8 @@
 //
 //   rs3 is placed at instr[31:27] to match cv32e40x_id_stage.sv, which
 //   hardwires its third register-file read port address to that exact bit
-//   range (REG_S3_MSB/LSB) whenever REGFILE_NUM_READ_PORTS == 3. No core RTL
+//   range (REG_S3_MSB/LSB) whenever REGFILE_NUM_READ_PORTS >= 3 (3 without
+//   dual-read, 6 with it - see cv32e40x_core.sv's X_DUALREAD). No core RTL
 //   changes are required as a result.
 //
 //   Input:
@@ -68,6 +69,7 @@ module mxdotp_decoder
     // not silently accepted and silently doing nothing).
     //
     assign is_mx = (opcode == MX_OPCODE) &&
-                   ((mx_operation == MX_FUNCT3_DOTP) || (mx_operation == MX_FUNCT3_FINAL));
+                   ((mx_operation == MX_FUNCT3_DOTP) || (mx_operation == MX_FUNCT3_FINAL) ||
+                    (mx_operation == MX_FUNCT3_DUALREAD_TEST));
 
 endmodule

@@ -102,8 +102,17 @@ module mxdotp_core_top
   localparam int          X_NUM_RS    = 3;   // rs1, rs2, rs3 (R4-type)
   localparam int          X_ID_WIDTH  = 4;
   localparam int          X_MEM_WIDTH = 32;
-  localparam int          X_RFR_WIDTH = 32;
-  localparam int          X_RFW_WIDTH = 32;
+  // X_RFR_WIDTH = 64 (2*XLEN), not 32: this is what actually lets a coprocessor request a
+  // genuine paired 64-bit read of {rs_i+1, rs_i} via issue_resp.dualread - see
+  // cv32e40x_core.sv's X_DUALREAD below. MXDOTP (any format - see mxdotp_pkg.sv's unified
+  // ISA milestone header) always sets dualread, using the full 64 bits for A/B/AR;
+  // MXFINAL never does (scales/old_acc are both plain 32-bit operands, so their upper 32
+  // bits are simply zero-extended padding within the wider container). MX_FUNCT3_DUALREAD_TEST
+  // is a separate, validation-only instruction added to exercise the mechanism directly.
+  localparam int          X_RFR_WIDTH = 64;
+  localparam int          X_RFW_WIDTH = 32;  // dual-WRITE (rd/rd+1) is a separate, still-
+                                              // unimplemented mechanism - out of scope here;
+                                              // MXFINAL only ever writes a single FP32 word.
   localparam logic [31:0] X_MISA      = 32'h0000_0000;
   localparam logic [1:0]  X_ECS_XS    = 2'b00;
 
@@ -130,6 +139,9 @@ module mxdotp_core_top
     .X_MEM_WIDTH     ( X_MEM_WIDTH      ),
     .X_RFR_WIDTH     ( X_RFR_WIDTH      ),
     .X_RFW_WIDTH     ( X_RFW_WIDTH      ),
+    .X_DUALREAD      ( 1'b1             ), // Physically provision the rs1+1/rs2+1/rs3+1
+                                            // companion read ports (REGFILE_NUM_READ_PORTS
+                                            // becomes 6, not 3 - see cv32e40x_core.sv).
     .X_MISA          ( X_MISA           ),
     .X_ECS_XS        ( X_ECS_XS         ),
     .PMA_NUM_REGIONS ( PMA_NUM_REGIONS  ),

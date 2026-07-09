@@ -1142,6 +1142,17 @@ typedef struct packed {
 typedef struct packed {
   op_fw_mux_e   operand_a_fw_mux_sel;   // Operand A forward mux sel
   op_fw_mux_e   operand_b_fw_mux_sel;   // Operand B forward mux sel
+  op_fw_mux_e   operand_rs3_fw_mux_sel; // Operand rs3 (XIF 3rd read port) forward mux sel.
+                                         // Only meaningful when REGFILE_NUM_READ_PORTS >= 3;
+                                         // driven to SEL_REGFILE otherwise (see
+                                         // cv32e40x_controller_bypass.sv).
+  op_fw_mux_e   operand_a_hi_fw_mux_sel;   // rs1+1 (dual-read companion) forward mux sel
+  op_fw_mux_e   operand_b_hi_fw_mux_sel;   // rs2+1 (dual-read companion) forward mux sel
+  op_fw_mux_e   operand_rs3_hi_fw_mux_sel; // rs3+1 (dual-read companion) forward mux sel
+                                            // operand_*_hi_fw_mux_sel only meaningful when
+                                            // REGFILE_NUM_READ_PORTS == 6 (X_DUALREAD == 1);
+                                            // driven to SEL_REGFILE otherwise (see
+                                            // cv32e40x_controller_bypass.sv).
   jalr_fw_mux_e jalr_fw_mux_sel;        // Jump target forward mux sel
   logic         jalr_stall;             // Stall due to JALR hazard (JALR used result from EX or LSU result in WB)
   logic         load_stall;             // Stall due to load operation

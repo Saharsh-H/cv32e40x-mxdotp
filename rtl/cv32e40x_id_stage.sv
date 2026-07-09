@@ -157,6 +157,13 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
   logic [31:0]          operand_c;
   logic [31:0]          operand_a_fw;
   logic [31:0]          operand_b_fw;
+  logic [31:0]          operand_rs3_fw;  // Forwarded value of the XIF 3rd read port (rs3),
+                                          // only driven/used when REGFILE_NUM_READ_PORTS >= 3
+  logic [31:0]          operand_a_hi_fw;    // Forwarded value of rs1+1 (dual-read companion)
+  logic [31:0]          operand_b_hi_fw;    // Forwarded value of rs2+1 (dual-read companion)
+  logic [31:0]          operand_rs3_hi_fw;  // Forwarded value of rs3+1 (dual-read companion)
+                                             // operand_*_hi_fw only driven/used when
+                                             // REGFILE_NUM_READ_PORTS == 6 (dual-read)
   logic [31:0]          jalr_fw;
   alu_op_a_mux_e        alu_op_a_mux_sel;
   alu_op_b_mux_e        alu_op_b_mux_sel;
@@ -221,8 +228,24 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
 
   // Assign rs3 address if Xif mandates three read ports
   generate
-    if(REGFILE_NUM_READ_PORTS == 3) begin : gen_rs3_raddr
+    if (REGFILE_NUM_READ_PORTS >= 3) begin : gen_rs3_raddr
       assign rf_raddr_o[2] = instr[REG_S3_MSB:REG_S3_LSB];
+    end
+  endgenerate
+
+  // Dual-read companion ports: rs1+1/rs2+1/rs3+1, one register above each base operand.
+  // Only exist when REGFILE_NUM_READ_PORTS == 6 (X_DUALREAD == 1 at the core level - see
+  // cv32e40x_core.sv). Convention: companion port i+3 pairs with base port i (ports 0/1/2
+  // keep their existing meaning completely unchanged in either configuration). Address
+  // computation is a plain +1 on the already-decoded base address - wraparound at 5 bits
+  // (e.g. x31's companion is x0) is intentionally unguarded here, same as RV32's existing
+  // register-pair conventions (e.g. atomic dword ops): it's a software contract, not
+  // something this core needs to special-case.
+  generate
+    if (REGFILE_NUM_READ_PORTS == 6) begin : gen_dualread_raddr
+      assign rf_raddr_o[3] = rf_addr_t'(rf_raddr_o[0] + 1'b1);
+      assign rf_raddr_o[4] = rf_addr_t'(rf_raddr_o[1] + 1'b1);
+      assign rf_raddr_o[5] = rf_addr_t'(rf_raddr_o[2] + 1'b1);
     end
   endgenerate
 
@@ -335,6 +358,70 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
     endcase;
   end
 
+  // Operand rs3 forwarding mux (XIF's 3rd read port, e.g. R4-type instructions such as
+  // MXDOTP). Mirrors operand_a_fw_mux/operand_b_fw_mux exactly - same forwarding sources
+  // (rf_wdata_ex_i/rf_wdata_wb_i), same mux-select type (op_fw_mux_e via ctrl_byp_i), just
+  // gated on REGFILE_NUM_READ_PORTS >= 3 since rf_rdata_i[2]/rf_raddr_o[2] (see gen_rs3_raddr
+  // above) only exist in that configuration. Previously rs3 had no forwarding path at all -
+  // xif_issue_if.issue_req.rs[2] read straight from the register file with no bypass and no
+  // hazard stall to cover it, requiring a software NOP-padding workaround. The stall case
+  // (rs3's producer not yet forwardable, e.g. a load or another XIF op still in EX) was
+  // already handled generically by cv32e40x_controller_bypass.sv's existing load_stall logic
+  // - only this mux and its ctrl_byp_i.operand_rs3_fw_mux_sel select were missing.
+  generate
+    if (REGFILE_NUM_READ_PORTS >= 3) begin : gen_rs3_fw_mux
+      always_comb begin : operand_rs3_fw_mux
+        case (ctrl_byp_i.operand_rs3_fw_mux_sel)
+          SEL_FW_EX:    operand_rs3_fw = rf_wdata_ex_i;
+          SEL_FW_WB:    operand_rs3_fw = rf_wdata_wb_i;
+          SEL_REGFILE:  operand_rs3_fw = rf_rdata_i[2];
+          default:      operand_rs3_fw = rf_rdata_i[2];
+        endcase;
+      end
+    end else begin : gen_no_rs3_fw_mux
+      assign operand_rs3_fw = '0;  // unused in this configuration
+    end
+  endgenerate
+
+  // Dual-read companion forwarding muxes (rs1+1/rs2+1/rs3+1, ports 3/4/5 - see
+  // gen_dualread_raddr above). Exactly the same shape as operand_a_fw_mux/
+  // operand_b_fw_mux/operand_rs3_fw_mux - each companion register is forwarded
+  // completely independently of its own base register (they're two different physical
+  // registers that could have been written by two different in-flight instructions), so
+  // this is 3 more standalone muxes rather than any widening of the existing ones.
+  generate
+    if (REGFILE_NUM_READ_PORTS == 6) begin : gen_dualread_fw_mux
+      always_comb begin : operand_a_hi_fw_mux
+        case (ctrl_byp_i.operand_a_hi_fw_mux_sel)
+          SEL_FW_EX:    operand_a_hi_fw = rf_wdata_ex_i;
+          SEL_FW_WB:    operand_a_hi_fw = rf_wdata_wb_i;
+          SEL_REGFILE:  operand_a_hi_fw = rf_rdata_i[3];
+          default:      operand_a_hi_fw = rf_rdata_i[3];
+        endcase;
+      end
+      always_comb begin : operand_b_hi_fw_mux
+        case (ctrl_byp_i.operand_b_hi_fw_mux_sel)
+          SEL_FW_EX:    operand_b_hi_fw = rf_wdata_ex_i;
+          SEL_FW_WB:    operand_b_hi_fw = rf_wdata_wb_i;
+          SEL_REGFILE:  operand_b_hi_fw = rf_rdata_i[4];
+          default:      operand_b_hi_fw = rf_rdata_i[4];
+        endcase;
+      end
+      always_comb begin : operand_rs3_hi_fw_mux
+        case (ctrl_byp_i.operand_rs3_hi_fw_mux_sel)
+          SEL_FW_EX:    operand_rs3_hi_fw = rf_wdata_ex_i;
+          SEL_FW_WB:    operand_rs3_hi_fw = rf_wdata_wb_i;
+          SEL_REGFILE:  operand_rs3_hi_fw = rf_rdata_i[5];
+          default:      operand_rs3_hi_fw = rf_rdata_i[5];
+        endcase;
+      end
+    end else begin : gen_no_dualread_fw_mux
+      assign operand_a_hi_fw   = '0;  // unused in this configuration
+      assign operand_b_hi_fw   = '0;
+      assign operand_rs3_hi_fw = '0;
+    end
+  endgenerate
+
   //////////////////////////////////////////////////////
   //   ___                                 _    ____  //
   //  / _ \ _ __   ___ _ __ __ _ _ __   __| |  / ___| //
@@ -439,7 +526,26 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
   //       issue_valid depends on halt_id (and data_rvalid) via the local instr_valid.
   //       Can issue_valid be made fast by using the registered instr_valid and only factor in kill_id and not halt_id?
   //       Maybe it is ok to have a late issue_valid, as accept signal will depend on late rs_valid anyway?
-  assign rf_re_o        = illegal_insn ? '1 : REGFILE_NUM_READ_PORTS'(rf_re);
+  //
+  // Dual-read companion ports [5:3] (rs1+1/rs2+1/rs3+1 - see gen_dualread_raddr above) are
+  // deliberately NOT included in the same blanket "illegal_insn ? '1" speculation as ports
+  // [2:0]. Unlike the base 3 ports (whose speculative read is harmless even when unused -
+  // it was already the existing, working behavior for every XIF instruction, dualread or
+  // not), blindly enabling the companion ports for every XIF-candidate instruction would
+  // make cv32e40x_controller_bypass.sv's load_stall (which ORs across all rf_rd_ex_hz/
+  // rf_rd_wb_hz bits) trigger on whatever rs1+1/rs2+1/rs3+1 happen to alias, even for
+  // ordinary non-dualread ops like this project's own MXDOTP/MXFINAL - a real, if
+  // conservative-not-corrupting, stall regression. So the companion ports are qualified by
+  // the coprocessor's own same-cycle issue_resp.dualread instead (same pattern already used
+  // for issue_resp.writeback/dualwrite/accept elsewhere in this file).
+  generate
+    if (REGFILE_NUM_READ_PORTS == 6) begin : gen_rf_re_dualread
+      assign rf_re_o[2:0] = illegal_insn ? 3'b111 : {1'b0, rf_re};
+      assign rf_re_o[5:3] = {3{illegal_insn && xif_issue_if.issue_resp.dualread}};
+    end else begin : gen_rf_re_no_dualread
+      assign rf_re_o = illegal_insn ? '1 : REGFILE_NUM_READ_PORTS'(rf_re);
+    end
+  endgenerate
 
   // Register writeback is enabled either by the decoder or by the XIF
   assign rf_we          = rf_we_dec || xif_we;
@@ -642,6 +748,21 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
   generate
     if (X_EXT) begin : x_ext
 
+      // Sanity check: REGFILE_NUM_READ_PORTS == 6 (dual-read companion ports compiled in,
+      // see cv32e40x_core.sv's X_DUALREAD) is only meaningful if the XIF interface itself
+      // is actually wide enough to carry a paired 64-bit read. If X_RFR_WIDTH is left at
+      // 32 while X_DUALREAD=1, the {hi,lo} concatenation below would silently truncate
+      // instead of failing loudly, so catch the mismatch here instead.
+      // synthesis translate_off
+      initial begin
+        if (REGFILE_NUM_READ_PORTS == 6) begin
+          assert (xif_issue_if.X_RFR_WIDTH >= 64) else
+            $error("cv32e40x_id_stage: REGFILE_NUM_READ_PORTS == 6 (dual-read) but X_RFR_WIDTH (%0d) < 64",
+                    xif_issue_if.X_RFR_WIDTH);
+        end
+      end
+      // synthesis translate_on
+
       // remember whether an instruction was accepted or rejected (required if EX stage is not ready)
       // TODO: check whether this state machine should be put back in its initial state when the instruction in ID gets killed
       logic xif_accepted_q, xif_rejected_q;
@@ -681,17 +802,49 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
       always_comb begin
         xif_issue_if.issue_req.rs       = '0;
         xif_issue_if.issue_req.rs_valid = '0;
+
+        // rs1 (operand index 0). Base 32 bits: forwarded rf/EX/WB value (operand_a_fw),
+        // unchanged from before this dual-read work. When this configuration actually has
+        // the companion port compiled in (REGFILE_NUM_READ_PORTS == 6) AND the
+        // coprocessor's same-cycle issue_resp asserts dualread, the upper half of the
+        // X_RFR_WIDTH-bit slot carries the forwarded rs1+1 value (operand_a_hi_fw) instead
+        // of zero - together giving the coprocessor a genuine paired read of {rs1+1, rs1}.
+        // Non-dualread instructions (e.g. this project's own MXDOTP/MXFINAL) always take
+        // the zero-extended branch, so widening X_RFR_WIDTH to support dual-read elsewhere
+        // does not change their operand values at all.
         if (xif_issue_if.X_NUM_RS > 0) begin
-          xif_issue_if.issue_req.rs      [0] = operand_a_fw;
+          if ((REGFILE_NUM_READ_PORTS == 6) && xif_issue_if.issue_resp.dualread) begin
+            xif_issue_if.issue_req.rs[0] = {operand_a_hi_fw, operand_a_fw};
+          end else begin
+            xif_issue_if.issue_req.rs[0] = {{(xif_issue_if.X_RFR_WIDTH-32){1'b0}}, operand_a_fw};
+          end
           xif_issue_if.issue_req.rs_valid[0] = 1'b1;
         end
+
+        // rs2 (operand index 1) - identical shape to rs1 above.
         if (xif_issue_if.X_NUM_RS > 1) begin
-          xif_issue_if.issue_req.rs      [1] = operand_b_fw;
+          if ((REGFILE_NUM_READ_PORTS == 6) && xif_issue_if.issue_resp.dualread) begin
+            xif_issue_if.issue_req.rs[1] = {operand_b_hi_fw, operand_b_fw};
+          end else begin
+            xif_issue_if.issue_req.rs[1] = {{(xif_issue_if.X_RFR_WIDTH-32){1'b0}}, operand_b_fw};
+          end
           xif_issue_if.issue_req.rs_valid[1] = 1'b1;
         end
-        // TODO: implement forwarding for other operands than rs1 and rs2
-        for (integer i = 2; i < xif_issue_if.X_NUM_RS && i < REGFILE_NUM_READ_PORTS; i++) begin
-          xif_issue_if.issue_req.rs      [i] = rf_rdata_i[i];
+
+        // rs3 (index 2) is forwarded the same way rs1/rs2 are - see operand_rs3_fw_mux /
+        // operand_rs3_hi_fw_mux above. Any further logical operand beyond index 2
+        // (X_NUM_RS > 3, not used by this core today) still falls back to an unforwarded,
+        // single-width regfile read, same as before this dual-read work.
+        for (integer i = 2; i < xif_issue_if.X_NUM_RS; i++) begin
+          if (i == 2 && REGFILE_NUM_READ_PORTS >= 3) begin
+            if ((REGFILE_NUM_READ_PORTS == 6) && xif_issue_if.issue_resp.dualread) begin
+              xif_issue_if.issue_req.rs[2] = {operand_rs3_hi_fw, operand_rs3_fw};
+            end else begin
+              xif_issue_if.issue_req.rs[2] = {{(xif_issue_if.X_RFR_WIDTH-32){1'b0}}, operand_rs3_fw};
+            end
+          end else if (i < REGFILE_NUM_READ_PORTS) begin
+            xif_issue_if.issue_req.rs[i] = {{(xif_issue_if.X_RFR_WIDTH-32){1'b0}}, rf_rdata_i[i]};
+          end
           xif_issue_if.issue_req.rs_valid[i] = 1'b1;
         end
       end

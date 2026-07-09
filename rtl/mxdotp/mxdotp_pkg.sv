@@ -4,8 +4,8 @@
 //------------------------------------------------------------------------------
 // Description:
 //   Common package containing ISA encodings, configuration constants, shared
-//   typedefs, and the numeric helper functions (FP8 format unification, FP9
-//   multiply, wide fixed-point accumulate) for the MXDOTP coprocessor.
+//   typedefs, and the numeric helper functions (MXFP4 decode, wide fixed-
+//   point accumulate) for the MXDOTP coprocessor.
 //
 //   Instruction encoding follows the standard RISC-V R4-type layout (the same
 //   layout used by FMADD.S/D in the F/D extensions):
@@ -15,7 +15,7 @@
 //
 //   This is a deliberate choice: cv32e40x_id_stage.sv already hardwires its
 //   third register-file read port address to instr[31:27] (REG_S3_MSB/LSB)
-//   whenever REGFILE_NUM_READ_PORTS == 3 (i.e. X_NUM_RS == 3). Using the
+//   whenever REGFILE_NUM_READ_PORTS >= 3 (i.e. X_NUM_RS == 3). Using the
 //   standard R4 rs3 position means our decoder's view of rs3 matches the
 //   register the core actually reads, with zero core RTL changes required.
 //
@@ -25,35 +25,100 @@
 //
 //==============================================================================
 //
-// MILESTONE: first real MXFP8 datapath (replaces the rs1+rs2 placeholder)
+// MILESTONE HISTORY (brief - see git history / prior handoff docs for the
+// full blow-by-blow):
+//   - MXFP8 (E4M3/E5M2) placeholder datapath, k=4.
+//   - Migrated to MXFP4 (E2M1), k=8 - matches the MXDOTP paper's k=8 point
+//     directly (32-bit operand / 4-bit element == 8).
+//   - Added rs3 forwarding and genuine dual-read support at the CV32E40X
+//     core level (cv32e40x_id_stage.sv/cv32e40x_controller_bypass.sv/
+//     cv32e40x_core.sv's X_DUALREAD) - real core enhancements, not MXDOTP-
+//     specific, but what made everything below possible.
+//   - Added a k=16, "residual" datapath (MX_FMT_MXFP4_RESIDUAL) as a SECOND
+//     format alongside the original k=8 one, to make real use of dual-read:
+//     MXDOTP took A, B, AND a residue operand AR (all 64-bit), computing two
+//     raw dot products (A.B and AR.B); MXFINAL took a combined 64-bit
+//     {scales,old_acc} operand and combined both raw products with the old
+//     accumulator.
 //
-// Two-instruction split: CV32E40X's register file is natively 32 bits per
-// read port (REGFILE_DATA_WIDTH == 32, confirmed against the real core RTL).
-// The XIF spec's `dualread` field (if_xif.sv) has no consumer anywhere in
-// this core, and `dualwrite` is latched into the pipeline but never acted on
-// in cv32e40x_wb_stage.sv either - both are dead wires in this checkout, so
-// there's no way to get a genuine 64-bit operand from a single register
-// specifier without real core surgery. Instead of jamming scales AND a
-// previous FP32 accumulator into one 32-bit rs3 (8+8+32 = 48 bits doesn't
-// fit in 32 anyway), MXDOTP is split into the two ops this package already
-// had funct3 codes for:
+// MILESTONE (current): unified MXDOTP/MXFINAL operand convention across all
+// (present and future) MX formats
 //
-//   MX_FUNCT3_DOTP  : rs1=A (4x MXFP8), rs2=B (4x MXFP8), rs3=scales
-//                     ({X^A[31:24], X^B[23:16], reserved[15:0]}). Computes
-//                     the scaled sum-of-products into a private, wide
-//                     internal fixed-point register. No writeback.
-//   MX_FUNCT3_FINAL : rs1=old FP32 accumulator (full precision, and now
-//                     forwarded via the CPU's normal rs1 bypass path, so
-//                     chained accumulation no longer needs NOP padding the
-//                     way the old rs3-forwarding workaround did). Adds it to
-//                     the pending sum-of-products, rounds once, writes FP32
-//                     result to rd.
+// The two milestones above left MX_FMT_MXFP4 and MX_FMT_MXFP4_RESIDUAL with
+// DIFFERENT operand conventions (k=8 vs k=16 A/B, scales-at-DOTP-time vs
+// scales-at-FINAL-time, no-dualread vs dualread MXFINAL). That's been
+// replaced with one convention for every format, present or future:
 //
-// k=4 (not the paper's k=8): a 32-bit operand holds 4 MXFP8 bytes, not 8.
-// This directly matches Lutz et al.'s own "Fused FP8 4-Way Dot Product"
-// (ARITH 2024, cited by the MXDOTP paper as the origin of the early-
-// accumulation technique used here) - k=4 is a legitimate design point in
-// its own right, not an arbitrary shrink.
+//   MXDOTP  = exact/raw dot product arithmetic ONLY. Never touches scales.
+//   MXFINAL = apply the shared MX scale(s), combine with the FP32
+//             accumulator, round once.
+//
+// This falls out of the same factoring identity used for the residual
+// datapath, generalized:
+//
+//   acc' = s*(R + acc/s),   where R = raw dot product (MXDOTP's job),
+//                                 s = combined MX block scale (2^k, exact),
+//                                 acc/s and the final *s are both PURE
+//                                 exponent adjustments since s is a power of
+//                                 two - no floating multiply/divide needed
+//                                 anywhere in the datapath.
+//
+// Concretely, for every format:
+//
+//   MXDOTP  (funct3=MX_FUNCT3_DOTP):
+//     rs1 = A, rs2 = B, rs3 = residue/AR - ALL 64-bit dual-read, MX_K=16
+//     MXFP4 elements each, regardless of format. issue_resp.dualread is
+//     unconditionally 1 for this op. For MX_FMT_MXFP4 (no residue), rs3 is
+//     simply unused - its VALUE doesn't matter, but the operand *shape* is
+//     identical to every other format, which is the whole point (one
+//     programming model, not one per format - see the "Long-term ISA
+//     direction" rationale this milestone was designed against). Always
+//     computes BOTH p1=sum(A_i*B_i) and p2=sum(AR_i*B_i) unconditionally
+//     (the arithmetic doesn't know or care what format it's in - only
+//     MXFINAL's dispatch does), staging them in private registers
+//     pending_p1_q/pending_p2_q. No register writeback, any format.
+//
+//   MXFINAL (funct3=MX_FUNCT3_FINAL):
+//     rs1 = scales = {a_scale[31:24], ar_scale[23:16], b_scale[15:8],
+//     reserved[7:0]}, rs2 = old FP32 accumulator, rs3 = unused - BOTH rs1
+//     and rs2 are plain 32-bit reads, no dual-read needed for either (this
+//     is why MXFINAL never sets issue_resp.dualread, in any format: 24 bits
+//     of scales and a 32-bit accumulator each fit in their own register with
+//     room to spare). Applies scale_exp(a_scale,b_scale) to p1 always;
+//     applies scale_exp(ar_scale,b_scale) to p2 ONLY when mx_format ==
+//     MX_FMT_MXFP4_RESIDUAL (masked out otherwise, since AR/p2 are
+//     meaningless for the non-residual format). Brings in the accumulator,
+//     sums everything at full ACC_FULL_WIDTH precision, rounds once
+//     (acc_to_fp32), writes rd.
+//
+// Because MXDOTP's arithmetic is now completely format-independent (always
+// A, B, AR at k=16, always computing both p1 and p2), the two formats
+// implemented so far share ALL of mxdotp_execute.sv's DOTP-side logic and
+// most of its FINAL-side logic too - the only format-dependent step left is
+// whether MXFINAL's sum includes p2's contribution.
+//
+// funct2 (mx_format) assignments, finalized now even though only the first
+// two are implemented:
+//   00 : MX_FMT_MXFP4          - AR/p2 computed but unused by MXFINAL
+//   01 : MX_FMT_MXFP4_RESIDUAL - AR/p2 included by MXFINAL
+//   10 : MX_FMT_M2XFP4         - RESERVED, not yet implemented
+//   11 : MX_FMT_MXFP8          - RESERVED, not yet implemented
+// An MXDOTP/MXFINAL issued with format 10 or 11 is still *accepted* (is_mx
+// only checks funct3, not format) but is inert: mxdotp_execute's dispatch
+// only special-cases MX_FMT_MXFP4_RESIDUAL, so any other format value
+// (including the two reserved ones) falls through to the same behavior as
+// MX_FMT_MXFP4. That's a deliberate, safe default for "not implemented yet"
+// - not a silent correctness trap - since it exactly matches MX_FMT_MXFP4's
+// own defined behavior rather than doing something arbitrary.
+//
+// This drops fp9_t/fp4_to_fp9/fp9_multiply/FP9_BIAS/E2M1_BIAS entirely -
+// they existed only to let MXDOTP apply a scale it already knew about
+// immediately, which no format does anymore. fp4_to_code (see below) is now
+// the only per-element conversion in the datapath, used uniformly.
+//
+// GUARD_BITS=3 (still not re-derived - see below) comfortably covers
+// summing the (at most) 3 contributions MXFINAL ever combines (p1, p2, old
+// accumulator).
 //
 //==============================================================================
 
@@ -69,28 +134,39 @@ package mxdotp_pkg;
   // Instruction Class (funct3)
   //----------------------------------------------------------------------------
   //
-  // 000 : MXDOTP   - compute scaled sum-of-products, stage internally, no WB
-  // 001 : MXFINAL  - add staged sum-of-products to rs1 (old FP32 acc), round
-  //                  once, write result to rd
+  // 000 : MXDOTP   - exact/raw dot product arithmetic only (A.B and AR.B),
+  //                  stage internally, no WB, no scale knowledge at all
+  // 001 : MXFINAL  - apply MX scale(s) to the staged raw products, combine
+  //                  with the FP32 accumulator, round once, write rd
+  // 010 : MXDUALREAD_TEST - validation-only, NOT part of the real MXDOTP ISA
+  //                  (see mxdotp_execute.sv for why this exists). rs1=base
+  //                  register; requests issue_resp.dualread=1 and writes the
+  //                  *upper* 32 bits of the resulting paired {rs1+1,rs1} read
+  //                  (i.e. register rs1+1's value) to rd. This is the only
+  //                  way to observe, from software, whether the core's
+  //                  dual-read mechanism (cv32e40x_core.sv's X_DUALREAD,
+  //                  REGFILE_NUM_READ_PORTS==6) actually works, independent
+  //                  of format.
   //
-  localparam logic [2:0] MX_FUNCT3_DOTP  = 3'b000;
-  localparam logic [2:0] MX_FUNCT3_FINAL = 3'b001;
+  localparam logic [2:0] MX_FUNCT3_DOTP           = 3'b000;
+  localparam logic [2:0] MX_FUNCT3_FINAL          = 3'b001;
+  localparam logic [2:0] MX_FUNCT3_DUALREAD_TEST  = 3'b010;
 
 
   //----------------------------------------------------------------------------
   // Data Format / Variant (funct2, R4-type bits [26:25])
   //----------------------------------------------------------------------------
   //
-  // MX_FMT_MXFP8 is the format actually implemented this milestone (the
-  // "original" format from the MXDOTP paper). The other three codes are
-  // reserved placeholders for future formats (renamed from the earlier
-  // MXFP4/M2FP4/NVFP4 guesses made before the paper had been consulted -
-  // those were speculative placeholders, not a real ISA commitment).
+  // See the "unified operand convention" milestone header above for the full
+  // rationale. Only MXFP4 and MXFP4_RESIDUAL are actually implemented in
+  // mxdotp_execute.sv right now; M2XFP4 and MXFP8 are finalized as ISA
+  // encodings so they can be added later without an instruction-semantics
+  // change, but are NOT yet wired to any arithmetic.
   //
-  localparam logic [1:0] MX_FMT_MXFP8     = 2'b00;
-  localparam logic [1:0] MX_FMT_RESERVED1 = 2'b01;
-  localparam logic [1:0] MX_FMT_RESERVED2 = 2'b10;
-  localparam logic [1:0] MX_FMT_RESERVED3 = 2'b11;
+  localparam logic [1:0] MX_FMT_MXFP4          = 2'b00;
+  localparam logic [1:0] MX_FMT_MXFP4_RESIDUAL = 2'b01;
+  localparam logic [1:0] MX_FMT_M2XFP4         = 2'b10;  // RESERVED - not yet implemented
+  localparam logic [1:0] MX_FMT_MXFP8          = 2'b11;  // RESERVED - not yet implemented
 
 
   //----------------------------------------------------------------------------
@@ -109,63 +185,108 @@ package mxdotp_pkg;
     MX_RESULT
   } mxdotp_state_t;
 
+  //==============================================================================
+  //
+  // MILESTONE: pipelined coprocessor (independent DOTP/FINAL/DUALREAD_TEST slots)
+  //
+  // Previously, mxdotp_xif.sv was a single-in-flight FSM: one shared state_q,
+  // one shared saved_id/saved_rs/etc., one shared mxdotp_execute instance, and
+  // issue_ready asserted only in MX_IDLE. Every MX instruction therefore paid
+  // the *entire* Issue->Commit->Compute->Result round trip before the next one
+  // could even be issued - confirmed as a real, not just theoretical, cost
+  // (cv32e40x_id_stage.sv's xif_waiting ties id_ready_o/id_valid_o directly to
+  // our own issue_ready, so this was a direct, mechanical stall on the core's
+  // own ID stage, not something the core imposed on us). The XIF protocol
+  // itself does not require this: every channel (issue_req/commit/result) in
+  // if_xif.sv carries an id field specifically to let multiple offloaded
+  // instructions be outstanding at once - this project's earlier single-
+  // saved_id design simply didn't use that capability (see the comment that
+  // used to head this file).
+  //
+  // This milestone gives MXDOTP, MXFINAL, and MX_FUNCT3_DUALREAD_TEST each
+  // their own independent slot - own mxdotp_state_t register, own saved
+  // operand/id/rd registers, own execute engine with its own busy/start/done -
+  // instead of one shared FSM/engine for all three. Two consequences:
+  //
+  //   - issue_ready is no longer a single bit gated on one shared state_q; it
+  //     is computed per-instruction from whichever slot that instruction's
+  //     own mx_operation maps to, so e.g. MXFINAL can be issued (and
+  //     committed) while a preceding MXDOTP is still computing.
+  //   - A single-entry "mailbox" (mailbox_valid_q/mailbox_p1_q/mailbox_p2_q)
+  //     replaces MXDOTP writing scaled results directly - MXDOTP's engine
+  //     posts its raw p1/p2 into the mailbox once free, and MXFINAL's engine
+  //     snapshots (consumes) the mailbox into its own private registers the
+  //     instant it starts, immediately freeing the mailbox for the next
+  //     MXDOTP. This is a real data dependency (MXFINAL cannot compute before
+  //     the mailbox has valid data), not a resource conflict - it's expressed
+  //     as an extra qualifier on when each engine's own start_i may fire, not
+  //     as an extra FSM state.
+  //
+  // Safety net for a case the common DOTP->FINAL->DOTP->FINAL software
+  // pattern never exercises, but that the hardware must not silently corrupt
+  // on: two MXDOTPs issued back-to-back with no intervening MXFINAL. Since
+  // the mailbox is single-entry, MXDOTP's own COMPUTE->RESULT transition is
+  // gated on the mailbox actually being free (not just on its own engine
+  // being done) - if the mailbox is still occupied by a previous,
+  // unconsumed MXDOTP result, the new one simply waits (backpressure) rather
+  // than overwriting it. This degrades an unusual instruction ordering to a
+  // stall, not silent data loss.
+  //
+  // Because up to three instructions (one per slot) can now be outstanding at
+  // once, but CV32E40X retires strictly in program order, results can't just
+  // be posted whenever each slot happens to finish - a small in-order
+  // delivery queue (MX_ORDER_DEPTH entries, tagged by which slot produced
+  // each entry, in acceptance order) gates the shared result_if: only the
+  // oldest still-outstanding instruction's slot may present result_valid,
+  // even if a more-recently-issued slot finished computing first.
+  //
+  //==============================================================================
+
+  // --- Order-delivery queue: tags which slot produced each outstanding
+  //     instruction, in the order they were accepted. Depth exactly matches
+  //     the number of independent slots (DOTP, FINAL, DUALREAD_TEST) since
+  //     each slot can have at most one instruction outstanding at a time by
+  //     construction - three is a real bound, not a heuristic. ---
+  localparam int MX_NUM_SLOTS  = 3;
+  localparam int MX_ORDER_DEPTH = MX_NUM_SLOTS;
+
+  typedef enum logic [1:0] {
+    MX_SLOT_DOTP,
+    MX_SLOT_FINAL,
+    MX_SLOT_DUALREAD
+  } mx_slot_e;
 
   //============================================================================
-  // MXFP8 numeric datapath: formats, widths, and pure helper functions
+  // MXFP4 numeric datapath: widths and pure helper functions
   //============================================================================
   //
-  // Used exclusively by mxdotp_execute.sv. Kept here so the format-
-  // unification / multiply / wide-accumulate steps are independently-
-  // readable pure functions rather than buried inline in always blocks.
+  // Used exclusively by mxdotp_execute.sv. Kept here so the per-element
+  // decode / wide-accumulate steps are independently-readable pure functions
+  // rather than buried inline in always blocks.
   //
   // KNOWN LIMITATIONS (flagged deliberately, not silently simplified away):
-  //   - Denormals (biased exponent field == 0) are flushed to zero on input,
-  //     for both FP8 sub-formats and for the FP32 accumulator. True subnormal
-  //     support is deferred.
-  //   - No dedicated Inf/NaN detection: E4M3's single reserved NaN pattern
-  //     (exponent=1111, mantissa=111) and E5M2's Inf/NaN exponent=11111 range
-  //     are not special-cased - they fall through as regular finite values.
-  //   - The 95-bit/anchor-34 fixed-point buffer (from the MXDOTP paper) gives
-  //     roughly +-2^60 of range around 2^0 - comfortably covering realistic
-  //     MX-scaled accumulation but not the full FP32 exponent range under
-  //     pathological scale combinations. A contribution whose true magnitude
-  //     exceeds this range saturates to the max representable value rather
-  //     than wrapping or corrupting the sign bit (place_in_acc reserves its
-  //     top bit purely as a sign-safety guard and explicitly checks for
-  //     shifted-out bits, so this saturation is exact at the boundary, not
-  //     an approximation). Only the single, final acc_to_fp32 call clamps
-  //     the *result's* exponent to what FP32 can represent - that's required
-  //     IEEE-754-style behavior for any finite format, not an early
-  //     precision-losing step. Nothing narrower than ACC_FULL_WIDTH is used
-  //     anywhere before that one call (pending_sop_q and the MXFINAL
-  //     addition both carry the full width straight through).
+  //   - No dedicated Inf/NaN detection: E2M1 has no reserved Inf/NaN
+  //     encoding in the OCP MX spec, so this is moot for the element format
+  //     itself. It still applies to the FP32 accumulator path, which
+  //     doesn't special-case Inf/NaN inputs either.
+  //   - The 95-bit/anchor-34 fixed-point buffer (reused verbatim from the
+  //     original MXDOTP paper's own sizing, NOT yet re-derived for MXFP4's
+  //     much smaller dynamic range) gives far more range than an MX-scaled
+  //     accumulation realistically needs. A contribution whose true
+  //     magnitude exceeds this range saturates to the max representable
+  //     value rather than wrapping or corrupting the sign bit (place_in_acc
+  //     reserves its top bit purely as a sign-safety guard and explicitly
+  //     checks for shifted-out bits, so this saturation is exact at the
+  //     boundary, not an approximation). Only the single, final acc_to_fp32
+  //     call clamps the *result's* exponent to what FP32 can represent -
+  //     that's required IEEE-754-style behavior for any finite format, not
+  //     an early precision-losing step. Nothing narrower than
+  //     ACC_FULL_WIDTH is used anywhere before that one call.
   //----------------------------------------------------------------------------
 
-  // --- FP8 sub-format selection (hardcoded for this milestone; CSR-based
-  //     runtime selection is explicitly deferred) ---
-  typedef enum logic {
-    MXFP8_E4M3 = 1'b0,
-    MXFP8_E5M2 = 1'b1
-  } mxfp8_subfmt_e;
-
-  localparam mxfp8_subfmt_e MXFP8_SUBFMT = MXFP8_E4M3;  // <-- flip here to switch format
-
-  // --- FP8 sub-format field widths / biases ---
-  localparam int E4M3_BIAS = 7;
-  localparam int E5M2_BIAS = 15;
-
-  // --- FP9 (E5M3) unification format: both sub-formats convert into this
-  //     exactly (no rounding lost in the conversion itself) before multiply ---
-  localparam int FP9_BIAS = 15;
-
-  typedef struct packed {
-    logic       sign;
-    logic [4:0] exp;   // biased, FP9_BIAS = 15; exp==0 means (flushed) zero
-    logic [2:0] mant;
-  } fp9_t;
-
-  // --- Block size: 4 MXFP8 elements per 32-bit operand (see header note) ---
-  localparam int MX_K = 4;
+  // --- Block size: MXFP4 elements per 64-bit dual-read operand (A/B/AR),
+  //     uniform across every format now - 16x4=64 bits exactly. ---
+  localparam int MX_K = 16;
 
   // --- E8M0 block-scale format (OCP MX spec): unsigned 8-bit exponent-only
   //     scale, value = 2^(raw-127). Applying a scale is a pure exponent add. ---
@@ -174,89 +295,92 @@ package mxdotp_pkg;
   // --- Internal wide fixed-point accumulation buffer: 95-bit two's-
   //     complement buffer, bit[ACC_ANCHOR] has weight 2^0. PRODSUM_WIDTH=67
   //     is the raw sum-of-products magnitude width (before anchoring) that
-  //     the MXDOTP paper's own datapath uses - reused verbatim as documented
-  //     headroom even though we sum 4 terms, not 8: extra headroom is
-  //     conservative, not a simplification. GUARD_BITS covers summing
-  //     multiple already-anchored contributions without overflow. ---
+  //     the original MXDOTP paper's own datapath uses - reused verbatim,
+  //     deliberately NOT re-derived for MXFP4's much smaller dynamic range
+  //     yet (see milestone header above). GUARD_BITS=3 covers summing the
+  //     (at most 3) contributions MXFINAL ever combines (p1, p2, old
+  //     accumulator) without overflow. ---
   localparam int ACC_WIDTH     = 95;
   localparam int ACC_ANCHOR    = 34;
   localparam int PRODSUM_WIDTH = 67;
   localparam int GUARD_BITS    = 3;
-  localparam int ACC_FULL_WIDTH = ACC_WIDTH + GUARD_BITS;  // carries pending_sop_q and the
-                                                             // MXFINAL addition through to the
-                                                             // one and only rounding step
+  localparam int ACC_FULL_WIDTH = ACC_WIDTH + GUARD_BITS;  // carries every MXFINAL
+                                                             // contribution and their
+                                                             // sum through to the one
+                                                             // and only rounding step
                                                              // (acc_to_fp32) with no
                                                              // intermediate narrowing
 
-  // A generously-wide signed type for exponent arithmetic (combined FP9xFP9
-  // exponents, folded-in E8M0 scale exponents, and buffer shift amounts all
-  // comfortably fit with room to spare, avoiding overflow before the
-  // deliberate clamps in place_in_acc).
+  // A generously-wide signed type for exponent arithmetic (folded-in E8M0
+  // scale exponents and buffer shift amounts all comfortably fit with room
+  // to spare, avoiding overflow before the deliberate clamps in
+  // place_in_acc).
   typedef logic signed [15:0] mx_exp_t;
 
-  typedef struct packed {
-    logic       sign;
-    mx_exp_t    exp;   // weight (power of 2) of mag's LSB
-    logic [7:0] mag;   // unsigned raw significand product, Q2.6
-  } fp9_prod_t;
+  //----------------------------------------------------------------------------
+  // Per-element and per-product fixed-point widths.
+  //
+  // Every E2M1 value is an exact multiple of 0.5 (the whole format is just 8
+  // magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6), so representing an element as a
+  // plain signed fixed-point integer - code = 2*value, i.e. code in
+  // {0,+-1,+-2,+-3,+-4,+-6,+-8,+-12} - is exact, with no floating-point
+  // machinery needed at all. Sums of products of such codes stay exact
+  // fixed-point integers too, which is exactly what lets MXDOTP compute a
+  // real (not approximate) raw dot product with no scale knowledge.
+  //
+  // Bit-width derivation (worth spelling out in full - it's easy to get
+  // wrong in exactly this way, and was, earlier in this project):
+  //   - CODE_WIDTH = 5 : signed 2*value, range [-12,12], fits in 5 bits
+  //     (2^4=16 > 12).
+  //   - PROD_WIDTH = 9 : a SINGLE product code_a*code_b maxes out at
+  //     12*12=144, needing 9 bits signed (2^8=256 > 144, 2^7=128 < 144).
+  //     This is the width a single term needs - correct as far as it goes.
+  //   - PSUM_WIDTH = 13 : p1/p2 are each a SUM of MX_K=16 such terms, not
+  //     one term. Worst case (all 16 terms at +-144, same sign):
+  //     16*144 = 2304, needing 13 bits signed (2^12=4096 > 2304,
+  //     2^11=2048 < 2304) - 4 more bits than a single product, i.e.
+  //     PROD_WIDTH + $clog2(MX_K). Sizing p1/p2 at 9 bits (the single-
+  //     product width) instead of 13 would silently overflow/wrap for real,
+  //     not even that extreme, inputs - this is computed via $clog2(MX_K)
+  //     rather than hardcoded so it stays correct if MX_K ever changes.
+  //   - The "-2" exponent correction used in mxdotp_execute.sv's MXFINAL:
+  //     code = 2*value, so a raw product code_a*code_b = 4*(value_a*value_b)
+  //     - i.e. every raw product (and therefore every sum of them) carries
+  //     an implicit *4 relative to the true unscaled dot product value.
+  //     Feeding p1/p2 into place_in_acc with exponent scale_exp(...) alone
+  //     would therefore be 4x too large; subtracting 2 from the exponent
+  //     (2^-2 = 1/4) corrects for it.
+  //----------------------------------------------------------------------------
+  localparam int CODE_WIDTH = 5;
+  localparam int PROD_WIDTH = 9;
+  localparam int PSUM_WIDTH = PROD_WIDTH + $clog2(MX_K);  // = 13
 
   //----------------------------------------------------------------------------
-  // fp8_to_fp9: unify either MXFP8 sub-format into the common FP9 (E5M3)
-  // representation. Exact widening in both directions:
-  //   E4M3 -> E5M3 : same 3 mantissa bits (direct copy), exponent rebias +8
-  //                  (FP9_BIAS(15) - E4M3_BIAS(7) = 8)
-  //   E5M2 -> E5M3 : same 5 exponent bits (direct copy, same bias),
-  //                  mantissa zero-padded 2->3 bits (append a 0 LSB)
+  // fp4_to_code: convert a single MXFP4 (E2M1) element directly to its exact
+  // signed fixed-point "2*value" integer code. Exact for all eight E2M1
+  // magnitudes including the 0.5 subnormal (exp_field==0, mant==1) - a flat
+  // fixed-point representation has no renormalization problem to dodge in
+  // the first place (unlike widening into a floating, implicit-leading-1
+  // form would).
   //----------------------------------------------------------------------------
-  function automatic fp9_t fp8_to_fp9(input logic [7:0] val, input mxfp8_subfmt_e subfmt);
-    fp9_t       r;
+  function automatic logic signed [CODE_WIDTH-1:0] fp4_to_code(input logic [3:0] val);
     logic       sign;
-    logic [4:0] exp4_field, exp5_field;
+    logic [3:0] mag;  // unsigned magnitude, 0..12
     begin
-      sign = val[7];
-      if (subfmt == MXFP8_E4M3) begin
-        exp4_field = {1'b0, val[6:3]};
-        if (exp4_field == 5'd0) begin
-          r = '{sign: sign, exp: 5'd0, mant: 3'd0};
-        end else begin
-          r = '{sign: sign, exp: (exp4_field + 5'd8), mant: val[2:0]};
-        end
-      end else begin // MXFP8_E5M2
-        exp5_field = val[6:2];
-        if (exp5_field == 5'd0) begin
-          r = '{sign: sign, exp: 5'd0, mant: 3'd0};
-        end else begin
-          r = '{sign: sign, exp: exp5_field, mant: {val[1:0], 1'b0}};
-        end
-      end
-      return r;
-    end
-  endfunction
-
-  //----------------------------------------------------------------------------
-  // fp9_multiply: raw (unrounded, unnormalized) FP9 x FP9 product.
-  //
-  //   value(a)*value(b) = (-1)^(sa^sb) * 2^(ea+eb-2*FP9_BIAS-6) * (siga*sigb)
-  //
-  // where siga/sigb are 4-bit unsigned Q1.3 significands (hidden-1 + 3
-  // mantissa bits, range [8,15]) and siga*sigb is an 8-bit unsigned Q2.6
-  // product (range [64,225]). No rounding or renormalization here -
-  // deliberate (early accumulation / single final rounding): the raw product
-  // is placed directly into the wide fixed-point buffer by the caller.
-  //----------------------------------------------------------------------------
-  function automatic fp9_prod_t fp9_multiply(input fp9_t a, input fp9_t b);
-    fp9_prod_t  r;
-    logic [3:0] siga, sigb;
-    logic       is_zero;
-    begin
-      is_zero = (a.exp == 5'd0) || (b.exp == 5'd0);
-      siga = {1'b1, a.mant};
-      sigb = {1'b1, b.mant};
-      r.sign = a.sign ^ b.sign;
-      r.exp  = mx_exp_t'({11'd0, a.exp}) + mx_exp_t'({11'd0, b.exp})
-               - mx_exp_t'(2*FP9_BIAS) - mx_exp_t'(6);
-      r.mag  = is_zero ? 8'd0 : (siga * sigb);
-      return r;
+      sign = val[3];
+      // val[2:0] is {exp_field[1:0], mant} - the 3 bits that determine
+      // magnitude regardless of sign.
+      unique case (val[2:0])
+        3'b000: mag = 4'd0;   // 0.0
+        3'b001: mag = 4'd1;   // 0.5
+        3'b010: mag = 4'd2;   // 1.0
+        3'b011: mag = 4'd3;   // 1.5
+        3'b100: mag = 4'd4;   // 2.0
+        3'b101: mag = 4'd6;   // 3.0
+        3'b110: mag = 4'd8;   // 4.0
+        3'b111: mag = 4'd12;  // 6.0
+      endcase
+      return sign ? (-$signed({1'b0, mag})) : $signed({1'b0, mag});
     end
   endfunction
 
@@ -282,8 +406,7 @@ package mxdotp_pkg;
   // detected by explicitly checking whether any bits were shifted out above
   // the MAGW-bit window (not just a coarse pre-check on shift_amt), so a
   // shift landing anywhere near that boundary saturates correctly instead
-  // of silently truncating - this replaces an earlier version of this
-  // function that could do exactly that near the boundary.
+  // of silently truncating.
   //----------------------------------------------------------------------------
   function automatic logic signed [ACC_WIDTH-1:0] place_in_acc(
     input logic     sign,
