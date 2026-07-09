@@ -11,7 +11,15 @@
 //                    current program but protocol-correct if that changes
 //     dut          - mxdotp_core_top.sv (cv32e40x_core + if_xif + mxdotp_xif)
 //
-//   Scoreboard tracks exactly one MXDOTP instruction through:
+//   Scoreboard tracks the MX_FMT_MXFP4 MXDOTP/MXFINAL pair (unified ISA -
+//   see mxdotp_pkg.sv's milestone header: MXDOTP takes A/B/AR all as 64-bit
+//   dual-read operands, any format; MXFINAL takes scales/old_acc as two
+//   separate plain 32-bit operands, any format), then a third, unrelated
+//   MX_FUNCT3_DUALREAD_TEST instruction (validation-only, not part of the
+//   real MXDOTP ISA - proves the core's dual-read mechanism in isolation),
+//   then a fourth and fifth instruction pair exercising
+//   MX_FMT_MXFP4_RESIDUAL (k=16, with residue - same funct3 codes as the
+//   first pair, different mx_format), each through:
 //     Issue -> Commit -> Result -> Register file writeback
 //   reading expected id/operand/destination values hierarchically from
 //   u_instr_rom, so editing the program in instr_rom.sv keeps the checks in
@@ -236,11 +244,19 @@ module tb_mxdotp_core;
   wire        xif_issue_ready  = dut.xif.issue_ready;
   wire        xif_issue_accept = dut.xif.issue_resp.accept;
   wire        xif_issue_wb     = dut.xif.issue_resp.writeback;
+  wire        xif_issue_dr     = dut.xif.issue_resp.dualread;
   wire [31:0] xif_issue_instr  = dut.xif.issue_req.instr;
   wire [3:0]  xif_issue_id     = dut.xif.issue_req.id;
+  // Truncating 64-bit taps (X_RFR_WIDTH is now 64 - see mxdotp_core_top.sv): fine for
+  // MXDOTP/MXFINAL, which never set dualread and so only ever have meaningful data in the
+  // low 32 bits. The full 64-bit rs[0] is tapped separately below for the dualread test,
+  // which does care about the upper half.
   wire [31:0] xif_issue_rs0    = dut.xif.issue_req.rs[0];
   wire [31:0] xif_issue_rs1    = dut.xif.issue_req.rs[1];
   wire [31:0] xif_issue_rs2    = dut.xif.issue_req.rs[2];
+  wire [63:0] xif_issue_rs0_wide = dut.xif.issue_req.rs[0];
+  wire [63:0] xif_issue_rs1_wide = dut.xif.issue_req.rs[1];
+  wire [63:0] xif_issue_rs2_wide = dut.xif.issue_req.rs[2];
 
   wire        xif_commit_valid = dut.xif.commit_valid;
   wire [3:0]  xif_commit_id    = dut.xif.commit.id;
@@ -257,21 +273,50 @@ module tb_mxdotp_core;
   wire [4:0]  rf_waddr_wb_o = dut.core_i.rf_waddr_wb;
   wire [31:0] rf_wdata_wb_o = dut.core_i.rf_wdata_wb;
 
-  // Expected values for the MXDOTP / MXFINAL pair under test, read
-  // hierarchically from instr_rom.sv - edit the program there, not here.
+  // Expected values for Test 1 (MX_FMT_MXFP4) under test, read hierarchically
+  // from instr_rom.sv - edit the program there, not here. A/B/AR are all
+  // 64-bit dual-read now (unified ISA - see mxdotp_pkg.sv's milestone
+  // header), even though this format never uses AR's value.
   wire [31:0] exp_dotp_instr  = u_instr_rom.INSTR_MXDOTP;
-  wire [31:0] exp_a_val       = u_instr_rom.MXDOTP_A_VAL;
-  wire [31:0] exp_b_val       = u_instr_rom.MXDOTP_B_VAL;
-  wire [31:0] exp_scales      = u_instr_rom.MXDOTP_SCALES;
+  wire [63:0] exp_a_val       = u_instr_rom.A_VAL;
+  wire [63:0] exp_b_val       = u_instr_rom.B_VAL;
+  wire [63:0] exp_ar_val      = u_instr_rom.AR_VAL;
 
   wire [31:0] exp_final_instr = u_instr_rom.INSTR_MXFINAL;
   wire [4:0]  exp_final_rd    = u_instr_rom.REG_RESULT;
-  wire [31:0] exp_old_acc     = u_instr_rom.MXFINAL_OLD_ACC;
+  wire [31:0] exp_scales      = u_instr_rom.SCALES_VAL;
+  wire [31:0] exp_old_acc     = u_instr_rom.OLD_ACC_VAL;
 
   // Hand-computed expected MXFINAL result (see instr_rom.sv header) - not
   // yet golden-model-derived; this is a sanity vector (all-1.0 elements,
-  // unit scale, zero old accumulator -> 4.0), not the rigorous test suite.
-  wire [31:0] exp_final_data  = u_instr_rom.MXFINAL_EXPECTED;
+  // unit scale, zero old accumulator, AR present-but-masked -> 16.0), not
+  // the rigorous test suite. Cross-checked against a Python port of the
+  // exact bit-level algorithm.
+  wire [31:0] exp_final_data  = u_instr_rom.MXFP4_EXPECTED;
+
+  // Dual-read validation test (MX_FUNCT3_DUALREAD_TEST) expected values - see
+  // instr_rom.sv header for the full rationale.
+  wire [31:0] exp_dualread_instr = u_instr_rom.INSTR_MXDUALREAD_TEST;
+  wire [4:0]  exp_dualread_rd    = u_instr_rom.REG_DR_RESULT;
+  wire [31:0] exp_dualread_lo    = u_instr_rom.DUALREAD_LO_VAL;
+  wire [31:0] exp_dualread_hi    = u_instr_rom.DUALREAD_HI_VAL;
+  wire [31:0] exp_dualread_data  = u_instr_rom.DUALREAD_EXPECTED;
+
+  // MX_FMT_MXFP4_RESIDUAL (k=16, with residue) expected values - see
+  // instr_rom.sv header for the full derivation. MXFINAL(residual)'s
+  // scales/old_acc are now two SEPARATE plain 32-bit operands (rs1/rs2),
+  // not one combined 64-bit dual-read pair - see mxdotp_pkg.sv's milestone
+  // header for why that changed.
+  wire [31:0] exp_rdotp_instr  = u_instr_rom.INSTR_MXDOTP_RESIDUAL;
+  wire [63:0] exp_ra_val       = u_instr_rom.RA_VAL;
+  wire [63:0] exp_rb_val       = u_instr_rom.RB_VAL;
+  wire [63:0] exp_rar_val      = u_instr_rom.RAR_VAL;
+
+  wire [31:0] exp_rfinal_instr = u_instr_rom.INSTR_MXFINAL_RESIDUAL;
+  wire [4:0]  exp_rfinal_rd    = u_instr_rom.REG_RRESULT;
+  wire [31:0] exp_rscales      = u_instr_rom.RSCALES_VAL;
+  wire [31:0] exp_rold_acc     = u_instr_rom.ROLD_ACC_VAL;
+  wire [31:0] exp_rfinal_data  = u_instr_rom.MXFP4_RESIDUAL_EXPECTED;
 
   //----------------------------------------------------------------------------
   // Protocol assertion: once result_valid is asserted without being accepted
@@ -291,7 +336,7 @@ module tb_mxdotp_core;
   // Issue -> Commit -> Result -> Register file writeback
   //----------------------------------------------------------------------------
 
-  typedef enum logic [3:0] {
+  typedef enum logic [4:0] {
     SB_WAIT_DOTP_ISSUE,
     SB_WAIT_DOTP_COMMIT,
     SB_WAIT_DOTP_RESULT,
@@ -299,6 +344,17 @@ module tb_mxdotp_core;
     SB_WAIT_FINAL_COMMIT,
     SB_WAIT_FINAL_RESULT,
     SB_WAIT_FINAL_WB,
+    SB_WAIT_DUALREAD_ISSUE,
+    SB_WAIT_DUALREAD_COMMIT,
+    SB_WAIT_DUALREAD_RESULT,
+    SB_WAIT_DUALREAD_WB,
+    SB_WAIT_RDOTP_ISSUE,
+    SB_WAIT_RDOTP_COMMIT,
+    SB_WAIT_RDOTP_RESULT,
+    SB_WAIT_RFINAL_ISSUE,
+    SB_WAIT_RFINAL_COMMIT,
+    SB_WAIT_RFINAL_RESULT,
+    SB_WAIT_RFINAL_WB,
     SB_DONE,
     SB_FAIL
   } sb_state_e;
@@ -356,6 +412,42 @@ module tb_mxdotp_core;
     end
   end
 
+  // Second, independent instance of the exact same latch pattern above, watching for the
+  // dual-read test instruction's destination register instead of MXFINAL's. Deliberately a
+  // separate signal pair rather than reusing wb_seen_q/wb_data_q for a second purpose: the
+  // whole reason that latch exists is to decouple each capture from the scoreboard's own
+  // state and from every other capture, so aliasing two different instructions' writebacks
+  // onto one latch would just reintroduce a version of the same race this pattern was
+  // built to avoid.
+  logic        wb_seen2_q;
+  logic [31:0] wb_data2_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen2_q <= 1'b0;
+      wb_data2_q <= '0;
+    end else if (!wb_seen2_q && rf_we_wb_o && (rf_waddr_wb_o == exp_dualread_rd)) begin
+      wb_seen2_q <= 1'b1;
+      wb_data2_q <= rf_wdata_wb_o;
+    end
+  end
+
+  // Third instance of the same latch pattern, for the residual-mode test's destination
+  // register - same rationale as wb_seen2_q above: a dedicated, decoupled capture per
+  // instruction under test, not a shared/reused one.
+  logic        wb_seen3_q;
+  logic [31:0] wb_data3_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen3_q <= 1'b0;
+      wb_data3_q <= '0;
+    end else if (!wb_seen3_q && rf_we_wb_o && (rf_waddr_wb_o == exp_rfinal_rd)) begin
+      wb_seen3_q <= 1'b1;
+      wb_data3_q <= rf_wdata_wb_o;
+    end
+  end
+
   task automatic sb_fail(string msg);
     $display("[%0t] FAIL: %s", $time, msg);
     fail_count++;
@@ -374,9 +466,13 @@ module tb_mxdotp_core;
         unique case (sb_state)
 
         //----------------------------------------------------------------
-        // MXDOTP: rs1=A, rs2=B, rs3=scales. No writeback expected - only
-        // the issue/commit/result handshake is checked here; the actual
-        // arithmetic result is verified indirectly via MXFINAL's output.
+        // MXDOTP (MX_FMT_MXFP4): rs1=A, rs2=B, rs3=AR - ALL 64-bit dual-
+        // read now (unified ISA - see mxdotp_pkg.sv). AR is present (and
+        // checked here, since a wiring bug could feed the wrong value) but
+        // this format must not let it affect MXFINAL's result - that's
+        // checked indirectly via MXFINAL's output below. No writeback
+        // expected - only the issue/commit/result handshake is checked
+        // here.
         //----------------------------------------------------------------
 
         SB_WAIT_DOTP_ISSUE: begin
@@ -385,13 +481,15 @@ module tb_mxdotp_core;
               sb_fail("MXDOTP instruction was not accepted at issue");
             end else if (xif_issue_wb) begin
               sb_fail("MXDOTP issue_resp.writeback was asserted (expected 0 - MXDOTP has no architectural result)");
-            end else if ((xif_issue_rs0 !== exp_a_val) || (xif_issue_rs1 !== exp_b_val) || (xif_issue_rs2 !== exp_scales)) begin
-              sb_fail($sformatf("MXDOTP operand mismatch at issue: A=0x%0h B=0x%0h scales=0x%0h (expected 0x%0h,0x%0h,0x%0h)",
-                                 xif_issue_rs0, xif_issue_rs1, xif_issue_rs2, exp_a_val, exp_b_val, exp_scales));
+            end else if (!xif_issue_dr) begin
+              sb_fail("MXDOTP issue_resp.dualread was not asserted");
+            end else if ((xif_issue_rs0_wide !== exp_a_val) || (xif_issue_rs1_wide !== exp_b_val) || (xif_issue_rs2_wide !== exp_ar_val)) begin
+              sb_fail($sformatf("MXDOTP operand mismatch at issue: A=0x%0h B=0x%0h AR=0x%0h (expected 0x%0h,0x%0h,0x%0h)",
+                                 xif_issue_rs0_wide, xif_issue_rs1_wide, xif_issue_rs2_wide, exp_a_val, exp_b_val, exp_ar_val));
             end else begin
               expected_id <= xif_issue_id;
-              $display("[%0t] DOTP  ISSUE  ok: id=%0d A=0x%0h B=0x%0h scales=0x%0h",
-                        $time, xif_issue_id, xif_issue_rs0, xif_issue_rs1, xif_issue_rs2);
+              $display("[%0t] DOTP  ISSUE  ok: id=%0d A=0x%0h B=0x%0h AR=0x%0h",
+                        $time, xif_issue_id, xif_issue_rs0_wide, xif_issue_rs1_wide, xif_issue_rs2_wide);
               sb_state <= SB_WAIT_DOTP_COMMIT;
             end
           end
@@ -425,8 +523,10 @@ module tb_mxdotp_core;
         end
 
         //----------------------------------------------------------------
-        // MXFINAL: rs1=old FP32 accumulator. Combines with MXDOTP's staged
-        // sum-of-products, rounds once, writes the result to rd.
+        // MXFINAL (MX_FMT_MXFP4): rs1=scales, rs2=old FP32 accumulator -
+        // BOTH plain 32-bit reads now, no dual-read for either (unified
+        // ISA - see mxdotp_pkg.sv). Combines with MXDOTP's staged p1 (and,
+        // masked out for this format, p2), rounds once, writes rd.
         //----------------------------------------------------------------
 
         SB_WAIT_FINAL_ISSUE: begin
@@ -435,12 +535,15 @@ module tb_mxdotp_core;
               sb_fail("MXFINAL instruction was not accepted at issue");
             end else if (!xif_issue_wb) begin
               sb_fail("MXFINAL issue_resp.writeback was not asserted");
-            end else if (xif_issue_rs0 !== exp_old_acc) begin
-              sb_fail($sformatf("MXFINAL operand mismatch at issue: rs1=0x%0h (expected 0x%0h)",
-                                 xif_issue_rs0, exp_old_acc));
+            end else if (xif_issue_dr) begin
+              sb_fail("MXFINAL issue_resp.dualread was asserted (expected 0 - scales/old_acc are plain 32-bit reads)");
+            end else if ((xif_issue_rs0 !== exp_scales) || (xif_issue_rs1 !== exp_old_acc)) begin
+              sb_fail($sformatf("MXFINAL operand mismatch at issue: scales=0x%0h old_acc=0x%0h (expected 0x%0h,0x%0h)",
+                                 xif_issue_rs0, xif_issue_rs1, exp_scales, exp_old_acc));
             end else begin
               expected_id <= xif_issue_id;
-              $display("[%0t] FINAL ISSUE  ok: id=%0d old_acc=0x%0h", $time, xif_issue_id, xif_issue_rs0);
+              $display("[%0t] FINAL ISSUE  ok: id=%0d scales=0x%0h old_acc=0x%0h",
+                        $time, xif_issue_id, xif_issue_rs0, xif_issue_rs1);
               sb_state <= SB_WAIT_FINAL_COMMIT;
             end
           end
@@ -483,8 +586,201 @@ module tb_mxdotp_core;
               sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_final_rd, wb_data_q, exp_final_data));
             end else begin
               $display("[%0t] FINAL WB     ok: x%0d <= 0x%0h", $time, exp_final_rd, wb_data_q);
+              sb_state <= SB_WAIT_DUALREAD_ISSUE;
+            end
+          end
+        end
+
+        //----------------------------------------------------------------
+        // MX_FUNCT3_DUALREAD_TEST: validation-only, not part of the real
+        // MXDOTP ISA. rs1=x10 requests a paired {x11,x10} dual-read;
+        // rd should end up holding x11's value (the upper/"+1" half),
+        // proving cv32e40x_core.sv's dual-read mechanism end-to-end.
+        //----------------------------------------------------------------
+
+        SB_WAIT_DUALREAD_ISSUE: begin
+          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_dualread_instr)) begin
+            if (!xif_issue_accept) begin
+              sb_fail("MXDUALREAD_TEST instruction was not accepted at issue");
+            end else if (!xif_issue_wb) begin
+              sb_fail("MXDUALREAD_TEST issue_resp.writeback was not asserted");
+            end else if (!xif_issue_dr) begin
+              sb_fail("MXDUALREAD_TEST issue_resp.dualread was not asserted");
+            end else if (xif_issue_rs0_wide !== {exp_dualread_hi, exp_dualread_lo}) begin
+              sb_fail($sformatf("MXDUALREAD_TEST paired rs1 mismatch at issue: got 0x%0h (expected {hi=0x%0h,lo=0x%0h})",
+                                 xif_issue_rs0_wide, exp_dualread_hi, exp_dualread_lo));
+            end else begin
+              expected_id <= xif_issue_id;
+              $display("[%0t] DUALREAD ISSUE ok: id=%0d rs1={hi=0x%0h,lo=0x%0h}",
+                        $time, xif_issue_id, xif_issue_rs0_wide[63:32], xif_issue_rs0_wide[31:0]);
+              sb_state <= SB_WAIT_DUALREAD_COMMIT;
+            end
+          end
+        end
+
+        SB_WAIT_DUALREAD_COMMIT: begin
+          if (xif_commit_valid) begin
+            if (xif_commit_id !== expected_id) begin
+              sb_fail($sformatf("MXDUALREAD_TEST commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
+            end else if (xif_commit_kill) begin
+              sb_fail("MXDUALREAD_TEST instruction was killed at commit (unexpected for this program)");
+            end else begin
+              $display("[%0t] DUALREAD COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
+              sb_state <= SB_WAIT_DUALREAD_RESULT;
+            end
+          end
+        end
+
+        SB_WAIT_DUALREAD_RESULT: begin
+          if (xif_result_valid && xif_result_ready) begin
+            if (xif_result_id !== expected_id) begin
+              sb_fail($sformatf("MXDUALREAD_TEST result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
+            end else if (xif_result_rd !== exp_dualread_rd) begin
+              sb_fail($sformatf("MXDUALREAD_TEST result rd mismatch: got %0d expected %0d", xif_result_rd, exp_dualread_rd));
+            end else if (!xif_result_we) begin
+              sb_fail("MXDUALREAD_TEST result.we was not asserted");
+            end else if (xif_result_data !== exp_dualread_data) begin
+              sb_fail($sformatf("MXDUALREAD_TEST result.data unexpected: got 0x%0h, expected 0x%0h (x11's value) - dual-read mechanism did not assemble the paired read correctly",
+                                 xif_result_data, exp_dualread_data));
+            end else begin
+              $display("[%0t] DUALREAD RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
+                        $time, xif_result_id, xif_result_rd, xif_result_data, xif_result_we);
+              sb_state <= SB_WAIT_DUALREAD_WB;
+            end
+          end
+        end
+
+        SB_WAIT_DUALREAD_WB: begin
+          if (wb_seen2_q) begin
+            if (wb_data2_q !== exp_dualread_data) begin
+              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_dualread_rd, wb_data2_q, exp_dualread_data));
+            end else begin
+              $display("[%0t] DUALREAD WB     ok: x%0d <= 0x%0h", $time, exp_dualread_rd, wb_data2_q);
+              sb_state <= SB_WAIT_RDOTP_ISSUE;
+            end
+          end
+        end
+
+        //----------------------------------------------------------------
+        // MX_FMT_MXFP4_RESIDUAL: k=16, with residue. Same funct3 codes as
+        // the k=8 datapath (MX_FUNCT3_DOTP/MX_FUNCT3_FINAL), dispatched by
+        // mx_format instead - see instr_rom.sv header for the full
+        // algorithm and hand/Python-derived expected value.
+        //----------------------------------------------------------------
+
+        SB_WAIT_RDOTP_ISSUE: begin
+          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_rdotp_instr)) begin
+            if (!xif_issue_accept) begin
+              sb_fail("MXDOTP(residual) instruction was not accepted at issue");
+            end else if (xif_issue_wb) begin
+              sb_fail("MXDOTP(residual) issue_resp.writeback was asserted (expected 0)");
+            end else if (!xif_issue_dr) begin
+              sb_fail("MXDOTP(residual) issue_resp.dualread was not asserted");
+            end else if (xif_issue_rs0_wide !== exp_ra_val) begin
+              sb_fail($sformatf("MXDOTP(residual) A mismatch at issue: got 0x%0h expected 0x%0h",
+                                 xif_issue_rs0_wide, exp_ra_val));
+            end else if (xif_issue_rs1_wide !== exp_rb_val) begin
+              sb_fail($sformatf("MXDOTP(residual) B mismatch at issue: got 0x%0h expected 0x%0h",
+                                 xif_issue_rs1_wide, exp_rb_val));
+            end else if (xif_issue_rs2_wide !== exp_rar_val) begin
+              sb_fail($sformatf("MXDOTP(residual) AR mismatch at issue: got 0x%0h expected 0x%0h",
+                                 xif_issue_rs2_wide, exp_rar_val));
+            end else begin
+              expected_id <= xif_issue_id;
+              $display("[%0t] RDOTP ISSUE  ok: id=%0d A=0x%0h B=0x%0h AR=0x%0h",
+                        $time, xif_issue_id, xif_issue_rs0_wide, xif_issue_rs1_wide, xif_issue_rs2_wide);
+              sb_state <= SB_WAIT_RDOTP_COMMIT;
+            end
+          end
+        end
+
+        SB_WAIT_RDOTP_COMMIT: begin
+          if (xif_commit_valid) begin
+            if (xif_commit_id !== expected_id) begin
+              sb_fail($sformatf("MXDOTP(residual) commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
+            end else if (xif_commit_kill) begin
+              sb_fail("MXDOTP(residual) instruction was killed at commit (unexpected for this program)");
+            end else begin
+              $display("[%0t] RDOTP COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
+              sb_state <= SB_WAIT_RDOTP_RESULT;
+            end
+          end
+        end
+
+        SB_WAIT_RDOTP_RESULT: begin
+          if (xif_result_valid && xif_result_ready) begin
+            if (xif_result_id !== expected_id) begin
+              sb_fail($sformatf("MXDOTP(residual) result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
+            end else if (xif_result_we) begin
+              sb_fail("MXDOTP(residual) result.we was asserted (expected 0 - no architectural result)");
+            end else begin
+              $display("[%0t] RDOTP RESULT ok: id=%0d we=%0d (no writeback, as expected)",
+                        $time, xif_result_id, xif_result_we);
+              sb_state <= SB_WAIT_RFINAL_ISSUE;
+            end
+          end
+        end
+
+        SB_WAIT_RFINAL_ISSUE: begin
+          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_rfinal_instr)) begin
+            if (!xif_issue_accept) begin
+              sb_fail("MXFINAL(residual) instruction was not accepted at issue");
+            end else if (!xif_issue_wb) begin
+              sb_fail("MXFINAL(residual) issue_resp.writeback was not asserted");
+            end else if (xif_issue_dr) begin
+              sb_fail("MXFINAL(residual) issue_resp.dualread was asserted (expected 0 - scales/old_acc are plain 32-bit reads)");
+            end else if ((xif_issue_rs0 !== exp_rscales) || (xif_issue_rs1 !== exp_rold_acc)) begin
+              sb_fail($sformatf("MXFINAL(residual) operand mismatch at issue: scales=0x%0h old_acc=0x%0h (expected 0x%0h,0x%0h)",
+                                 xif_issue_rs0, xif_issue_rs1, exp_rscales, exp_rold_acc));
+            end else begin
+              expected_id <= xif_issue_id;
+              $display("[%0t] RFINAL ISSUE ok: id=%0d scales=0x%0h old_acc=0x%0h",
+                        $time, xif_issue_id, xif_issue_rs0, xif_issue_rs1);
+              sb_state <= SB_WAIT_RFINAL_COMMIT;
+            end
+          end
+        end
+
+        SB_WAIT_RFINAL_COMMIT: begin
+          if (xif_commit_valid) begin
+            if (xif_commit_id !== expected_id) begin
+              sb_fail($sformatf("MXFINAL(residual) commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
+            end else if (xif_commit_kill) begin
+              sb_fail("MXFINAL(residual) instruction was killed at commit (unexpected for this program)");
+            end else begin
+              $display("[%0t] RFINAL COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
+              sb_state <= SB_WAIT_RFINAL_RESULT;
+            end
+          end
+        end
+
+        SB_WAIT_RFINAL_RESULT: begin
+          if (xif_result_valid && xif_result_ready) begin
+            if (xif_result_id !== expected_id) begin
+              sb_fail($sformatf("MXFINAL(residual) result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
+            end else if (xif_result_rd !== exp_rfinal_rd) begin
+              sb_fail($sformatf("MXFINAL(residual) result rd mismatch: got %0d expected %0d", xif_result_rd, exp_rfinal_rd));
+            end else if (!xif_result_we) begin
+              sb_fail("MXFINAL(residual) result.we was not asserted");
+            end else if (xif_result_data !== exp_rfinal_data) begin
+              sb_fail($sformatf("MXFINAL(residual) result.data unexpected: got 0x%0h, expected 0x%0h",
+                                 xif_result_data, exp_rfinal_data));
+            end else begin
+              $display("[%0t] RFINAL RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
+                        $time, xif_result_id, xif_result_rd, xif_result_data, xif_result_we);
+              sb_state <= SB_WAIT_RFINAL_WB;
+            end
+          end
+        end
+
+        SB_WAIT_RFINAL_WB: begin
+          if (wb_seen3_q) begin
+            if (wb_data3_q !== exp_rfinal_data) begin
+              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_rfinal_rd, wb_data3_q, exp_rfinal_data));
+            end else begin
+              $display("[%0t] RFINAL WB    ok: x%0d <= 0x%0h", $time, exp_rfinal_rd, wb_data3_q);
               $display("=====================================================");
-              $display(" PASS: MXDOTP -> MXFINAL traversed Issue -> Commit -> Result -> WB");
+              $display(" PASS: MXDOTP -> MXFINAL -> MXDUALREAD_TEST -> MXDOTP(residual) -> MXFINAL(residual) all traversed");
               $display("=====================================================");
               pass_count++;
               sb_state <= SB_DONE;

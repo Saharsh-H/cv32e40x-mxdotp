@@ -44,7 +44,8 @@ TB_SRCS := \
 MXDOTP_SRCS := \
 	$(RTL_DIR)/mxdotp/mxdotp_pkg.sv \
 	$(RTL_DIR)/mxdotp/mxdotp_decoder.sv \
-	$(RTL_DIR)/mxdotp/mxdotp_execute.sv \
+	$(RTL_DIR)/mxdotp/mxdotp_dotp_engine.sv \
+	$(RTL_DIR)/mxdotp/mxdotp_final_engine.sv \
 	$(RTL_DIR)/mxdotp/mxdotp_xif.sv \
 	$(RTL_DIR)/mxdotp/mxdotp_core_top.sv
 
