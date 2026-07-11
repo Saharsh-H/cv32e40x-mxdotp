@@ -17,35 +17,39 @@
 //   rationale (XSim time-0 crash avoidance).
 //
 //------------------------------------------------------------------------------
-// Test vectors for this milestone: the fused fast-path engine for plain
-// (non-residue) formats (see mxdotp_pkg.sv's MX_SLOT_FUSED milestone header
-// for the full rationale). The ISA is now split by NEED, not unified:
-//   MXFUSED (funct3=MX_FUNCT3_FUSED, PLAIN formats only): rs1=A, rs2=B -
-//            64-bit dual-read, MX_K=16 elements each - rs3={reserved[15:0],
-//            b_scale[7:0],a_scale[7:0]} (upper 32) / old FP32 accumulator
-//            (lower 32) - ALSO 64-bit dual-read. One instruction, writes rd
-//            directly - no mailbox, no second instruction.
-//   MXDOTP/MXFINAL (RESIDUE-STYLE formats only): unchanged two-instruction
-//            convention - rs1=A, rs2=B, rs3=AR (all 64-bit dual-read) for
-//            MXDOTP; rs1=scales, rs2=old_acc (both plain 32-bit) for
-//            MXFINAL. MXFINAL now always includes the residue/p2
-//            contribution unconditionally (no format mask any more - see
-//            mxdotp_final_engine.sv) since only residue-style formats ever
-//            reach it post-split.
+// Test vectors for this milestone: true overlap for the MXFUSED slot (see
+// mxdotp_fused_engine.sv / mxdotp_xif.sv's own milestone headers). Every
+// prior test in this program only ever had ONE instruction of any given
+// kind outstanding at a time - which is exactly the case that already
+// worked before this milestone, and proves nothing new about it. Test 1
+// below is rebuilt to actually exercise overlap: three MXFUSED instructions
+// (P, Q, R) issued back-to-back, with no intervening instructions between
+// them, so that by the time Q is issued, P is still mid-flight through the
+// engine's own pipeline - and likewise for R.
 //
-// Four tests run in sequence:
+// Five tests run in sequence:
 //
-//   1) MXFUSED, MX_FMT_MXFP4 (plain, no residue - the fast path):
-//        A = B = {1.0 x16} (nibble 0x2 each)
-//        a_scale = b_scale = 1.0 (E8M0 raw 127)
-//        old accumulator = 0.0
-//        p1 = sum(code(A_i)*code(B_i), i=0..15) = 16*(2*2) = 64
-//        contrib1 = p1/4 = 16.0 (the /4 is fp4_to_code's baked-in *4 per
-//        raw product - see mxdotp_pkg.sv).
-//        Result = 0.0 + 16.0 = 16.0 -> FP32 0x41800000. Same math the old
-//        two-instruction MX_FMT_MXFP4 test used to check (see git history)
-//        - now reached via ONE instruction instead of two, with no AR
-//        operand present at all (there was nothing to mask any more).
+//   1) MXFUSED x3, back-to-back, MX_FMT_MXFP4 (plain, no residue):
+//        P: A = B = {1.0 x16}, scales = 1.0/1.0, old_acc = 0.0
+//           p1 = 16*(2*2) = 64, contrib1 = 64/4 = 16.0
+//           Result = 16.0 -> 0x41800000 (same math the very first single-
+//           instruction MXFUSED test used - see git history).
+//        Q: A = B = {0.5 x16} (nibble 0x1), scales = 1.0/1.0, old_acc = 0.0
+//           p1 = 16*(1*1) = 16, contrib1 = 16/4 = 4.0
+//           Result = 4.0 -> 0x40800000.
+//        R: A = {1.0 x16} (reuses P's A), B = {0.5 x16} (reuses Q's B),
+//           scales = 1.0/1.0, old_acc = 100.0 (0x42C80000)
+//           p1 = 16*(2*1) = 32, contrib1 = 32/4 = 8.0
+//           Result = 100.0 + 8.0 = 108.0 -> 0x42D80000.
+//        P/Q/R deliberately use three different destination registers and
+//        three different operand combinations specifically so a mix-up
+//        between simultaneously in-flight instructions (wrong id/rd, or -
+//        the bug this milestone's own design review caught before writing
+//        any RTL - a stale rs3 read belonging to a different instruction
+//        than the one it's paired with) would show up as a wrong result,
+//        not just a wrong result that happens to look right by coincidence.
+//        All three expected values cross-checked against a Python port of
+//        the exact bit-level algorithm, same as every other test here.
 //
 //   2) MX_FUNCT3_DUALREAD_TEST (validation-only, not part of the real
 //      MXDOTP ISA - see mxdotp_execute.sv/mxdotp_pkg.sv): proves the core's
@@ -74,7 +78,7 @@ module instr_rom
     import tb_pkg::*;
     import mxdotp_pkg::*;
 #(
-  parameter int unsigned NUM_WORDS = 64  // power of 2 - instr_rdata_o's address decode
+  parameter int unsigned NUM_WORDS = 128 // power of 2 - instr_rdata_o's address decode
                                           // (addr_q[$clog2(NUM_WORDS)+1:2]) assumes that;
                                           // a non-power-of-2 NUM_WORDS would let that index
                                           // run past rom[]'s actual bound
@@ -96,33 +100,59 @@ module instr_rom
   //----------------------------------------------------------------------------
 
   //----------------------------------------------------------------------------
-  // Test 1: MXFUSED, MX_FMT_MXFP4 (plain, no residue - the fast path)
-  // register assignment
+  // Test 1: MXFUSED x3 back-to-back (P, Q, R), MX_FMT_MXFP4 (plain, no
+  // residue - the fast path). Register assignment below; see file header
+  // for the math each one checks.
   //----------------------------------------------------------------------------
-  localparam logic [4:0] REG_FA_BASE   = 5'd1;  // x1 (lo) / x2 (hi): A
-  localparam logic [4:0] REG_FB_BASE   = 5'd3;  // x3 (lo) / x4 (hi): B
-  localparam logic [4:0] REG_FRS3_BASE = 5'd5;  // x5 (lo)=old_acc / x6 (hi)={reserved,b_scale,a_scale}
-  localparam logic [4:0] REG_FRESULT   = 5'd9;  // x9: MXFUSED rd
+  localparam logic [4:0] REG_FA_BASE   = 5'd1;  // x1 (lo) / x2 (hi): P's A (reused as R's A)
+  localparam logic [4:0] REG_FB_BASE   = 5'd3;  // x3 (lo) / x4 (hi): P's B
+  localparam logic [4:0] REG_FRS3_BASE = 5'd5;  // x5 (lo)=old_acc / x6 (hi)={reserved,b_scale,a_scale}: P's rs3 (reused as Q's rs3 - same old_acc=0.0/scales=1.0)
+  localparam logic [4:0] REG_FRESULT   = 5'd9;  // x9: P's rd
+
+  localparam logic [4:0] REG_QA_BASE   = 5'd22; // x22 (lo) / x23 (hi): Q's A
+  localparam logic [4:0] REG_QB_BASE   = 5'd24; // x24 (lo) / x25 (hi): Q's B (reused as R's B)
+  localparam logic [4:0] REG_QRESULT   = 5'd28; // x28: Q's rd
+
+  localparam logic [4:0] REG_RRS3_BASE = 5'd29; // x29 (lo) / x30 (hi): R's rs3 (different old_acc, needs its own)
+  localparam logic [4:0] REG_RRESULT   = 5'd31; // x31: R's rd
 
   localparam logic [3:0]  MXFP4_ONE  = 4'h2; // E2M1 encoding of 1.0 (sign=0,exp=01,mant=0)
-  localparam logic [63:0] A_VAL      = {16{MXFP4_ONE}};  // 16x 1.0 -> 0x2222222222222222
-  localparam logic [63:0] B_VAL      = {16{MXFP4_ONE}};  // 16x 1.0 -> 0x2222222222222222
-  localparam logic [7:0]  E8M0_SCALE_ONE = 8'd127;       // 2^0 = 1.0
+  localparam logic [3:0]  MXFP4_HALF = 4'h1; // E2M1 encoding of 0.5 (sign=0,exp=00,mant=1)
+  localparam logic [63:0] A_VAL      = {16{MXFP4_ONE}};   // 16x 1.0 -> 0x2222222222222222
+  localparam logic [63:0] B_VAL      = {16{MXFP4_ONE}};   // 16x 1.0 -> 0x2222222222222222
+  localparam logic [63:0] QA_VAL     = {16{MXFP4_HALF}};  // 16x 0.5 -> 0x1111111111111111
+  localparam logic [63:0] QB_VAL     = {16{MXFP4_HALF}};  // 16x 0.5 -> 0x1111111111111111
+  localparam logic [7:0]  E8M0_SCALE_ONE = 8'd127;        // 2^0 = 1.0
 
   // rs3 packing (see mxdotp_pkg.sv's MXFUSED funct3 comment): lower 32 bits
-  // (base reg, x5) = old_acc; upper 32 bits (companion reg, x6) =
-  // {reserved[15:0],b_scale[7:0],a_scale[7:0]}.
-  localparam logic [31:0] F_OLD_ACC_VAL   = 32'h0000_0000;  // 0.0f
+  // (base reg) = old_acc; upper 32 bits (companion reg) =
+  // {reserved[15:0],b_scale[7:0],a_scale[7:0]}. Scales are 1.0/1.0 for all
+  // of P/Q/R, so F_SCALES_HI_VAL is shared across all three rs3 values.
+  localparam logic [31:0] F_OLD_ACC_VAL   = 32'h0000_0000;  // 0.0f - P's and Q's old_acc
   localparam logic [31:0] F_SCALES_HI_VAL = {16'd0, E8M0_SCALE_ONE, E8M0_SCALE_ONE}; // {reserved,b_scale,a_scale}
-  localparam logic [63:0] FRS3_VAL        = {F_SCALES_HI_VAL, F_OLD_ACC_VAL};        // {hi,lo}
+  localparam logic [63:0] FRS3_VAL        = {F_SCALES_HI_VAL, F_OLD_ACC_VAL};        // {hi,lo} - P's rs3, reused by Q
+
+  localparam logic [31:0] R_OLD_ACC_VAL = 32'h42C8_0000;  // 100.0f - R's old_acc, the one thing
+                                                            // that actually differs from P/Q's rs3
+  localparam logic [63:0] RRS3_VAL      = {F_SCALES_HI_VAL, R_OLD_ACC_VAL};
 
   // Hand-computed, Python-cross-checked (see header) - not yet a full golden-model suite.
-  // Same math the old two-instruction MX_FMT_MXFP4 test used - see header.
-  localparam logic [31:0] MXFP4_FUSED_EXPECTED = 32'h4180_0000;  // 16.0f
+  // P: same math the very first single-instruction MXFUSED test used - see header.
+  localparam logic [31:0] MXFP4_FUSED_EXPECTED   = 32'h4180_0000;  // 16.0f (P)
+  localparam logic [31:0] MXFP4_FUSED_Q_EXPECTED = 32'h4080_0000;  //  4.0f (Q)
+  localparam logic [31:0] MXFP4_FUSED_R_EXPECTED = 32'h42D8_0000;  // 108.0f (R)
 
   localparam logic [31:0] INSTR_MXFUSED = encode_r4(
     MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP4,
     REG_FRESULT, REG_FA_BASE, REG_FB_BASE, REG_FRS3_BASE
+  );
+  localparam logic [31:0] INSTR_MXFUSED_Q = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP4,
+    REG_QRESULT, REG_QA_BASE, REG_QB_BASE, REG_FRS3_BASE  // reuses P's rs3 registers - same value
+  );
+  localparam logic [31:0] INSTR_MXFUSED_R = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP4,
+    REG_RRESULT, REG_FA_BASE, REG_QB_BASE, REG_RRS3_BASE  // reuses P's A and Q's B registers
   );
 
   //----------------------------------------------------------------------------
@@ -154,9 +184,9 @@ module instr_rom
   localparam logic [4:0] REG_RAR_BASE = 5'd17; // x17 (lo) / x18 (hi): AR (residue, used)
   localparam logic [4:0] REG_RSCALES  = 5'd19; // x19: {a_scale,ar_scale,b_scale,reserved}
   localparam logic [4:0] REG_ROLD_ACC = 5'd20; // x20: old FP32 accumulator
-  localparam logic [4:0] REG_RRESULT  = 5'd21; // x21: MXFINAL rd
+  localparam logic [4:0] REG_RRESULT_FINAL = 5'd21; // x21: MXFINAL rd (residual test - distinct
+                                                      // name from Test 1's REG_RRESULT above)
 
-  localparam logic [3:0]  MXFP4_HALF   = 4'h1; // E2M1 encoding of 0.5 (sign=0,exp=00,mant=1)
   localparam logic [63:0] RA_VAL       = {16{MXFP4_ONE}};   // 16x 1.0 -> 0x2222222222222222
   localparam logic [63:0] RB_VAL       = {16{MXFP4_ONE}};   // 16x 1.0 -> 0x2222222222222222
   localparam logic [63:0] RAR_VAL      = {16{MXFP4_HALF}};  // 16x 0.5 -> 0x1111111111111111
@@ -173,7 +203,70 @@ module instr_rom
 
   localparam logic [31:0] INSTR_MXFINAL_RESIDUAL = encode_r4(
     MX_OPCODE, MX_FUNCT3_FINAL, MX_FMT_MXFP4_RESIDUAL,
-    REG_RRESULT, REG_RSCALES, REG_ROLD_ACC, 5'd0 /*rs3 unused*/
+    REG_RRESULT_FINAL, REG_RSCALES, REG_ROLD_ACC, 5'd0 /*rs3 unused*/
+  );
+
+  //----------------------------------------------------------------------------
+  // Test 3: MXFP8 fast path (E4M3 + E5M2) AND cross-engine overlap. Three
+  // back-to-back MXFUSED instructions of MIXED element formats, no gap:
+  //   S: MXFP8 E4M3 (rs3[48]=0) -> the fp8 engine (order-queue slot FUSED8)
+  //   M: MXFP4              -> the fp4 engine (order-queue slot FUSED)
+  //   T: MXFP8 E5M2 (rs3[48]=1) -> the fp8 engine (order-queue slot FUSED8)
+  // S and T run on the fp8 engine, M on the fp4 engine, concurrently - so this
+  // exercises BOTH the MXFP8 arithmetic (E4M3 and E5M2) AND the two-slot order
+  // queue interleaving results from two different engines back into program
+  // order (S, then M, then T). Destinations x7/x8/x26 are written ONLY by
+  // S/M/T (no load targets them), so the scoreboard's ordering monitor sees
+  // exactly these three writebacks and nothing else.
+  //
+  //   S (E4M3): A = {4.0, 0.5, 1,1,1,1,1,1}, B = {1.0 x8}, scales 1.0/1.0,
+  //             old_acc 0.0 -> 4 + 0.5 + 6 = 10.5 -> 0x41280000
+  //   M (MXFP4): A = B = {1.0 x16}, scales 1.0/1.0, old_acc 0.0
+  //              -> 16*(2*2)/4 = 16.0 -> 0x41800000
+  //   T (E5M2): A = B = {1.0 x8}, scales 1.0/1.0, old_acc 0.0
+  //             -> 8*(1*1) = 8.0 -> 0x41000000
+  // All three cross-checked against a Python port of the exact bit-level
+  // datapath (per-element decode -> product -> place_in_acc -> acc_finalize).
+  //
+  // Byte packing (fp8 engine unpacks rs1[8*i +: 8] for element i, so element 0
+  // is the LOW byte): E4M3 1.0=0x38, 0.5=0x30, 4.0=0x48; E5M2 1.0=0x3C.
+  //----------------------------------------------------------------------------
+  localparam logic [4:0] REG_F8S_A_BASE  = 5'd1;  // x1/x2 : S's A (E4M3, mixed exponents)
+  localparam logic [4:0] REG_F8S_B_BASE  = 5'd3;  // x3/x4 : S's B (E4M3, all 1.0)
+  localparam logic [4:0] REG_F8_E4_RS3   = 5'd5;  // x5/x6 : rs3 for E4M3 (bit48=0); shared by M
+  localparam logic [4:0] REG_F4M_AB_BASE = 5'd13; // x13/x14: M's A=B (MXFP4, all 1.0)
+  localparam logic [4:0] REG_F8T_AB_BASE = 5'd22; // x22/x23: T's A=B (E5M2, all 1.0)
+  localparam logic [4:0] REG_F8_E5_RS3   = 5'd24; // x24/x25: rs3 for E5M2 (bit48=1)
+
+  localparam logic [4:0] REG_F8S_RESULT  = 5'd7;  // x7 : S's rd (MXFP8 E4M3)
+  localparam logic [4:0] REG_F4M_RESULT  = 5'd8;  // x8 : M's rd (MXFP4)
+  localparam logic [4:0] REG_F8T_RESULT  = 5'd26; // x26: T's rd (MXFP8 E5M2)
+
+  localparam logic [63:0] F8S_A_VAL     = 64'h3838_3838_3838_3048; // elem0=4.0,elem1=0.5,elem2-7=1.0
+  localparam logic [63:0] F8S_B_VAL     = 64'h3838_3838_3838_3838; // 8x 1.0 (E4M3)
+  localparam logic [63:0] F8_E4_RS3_VAL = 64'h0000_7F7F_0000_0000; // {rsvd=0,b=127,a=127}/old_acc=0 -> bit48=0
+  localparam logic [63:0] F4M_AB_VAL    = {16{MXFP4_ONE}};          // 16x 1.0 (MXFP4) = 0x2222...2222
+  localparam logic [63:0] F8T_AB_VAL    = 64'h3C3C_3C3C_3C3C_3C3C;  // 8x 1.0 (E5M2)
+  localparam logic [63:0] F8_E5_RS3_VAL = 64'h0001_7F7F_0000_0000; // rsvd[0]=1 -> bit48=1 -> E5M2
+
+  // Hand-computed, Python-cross-checked (see header) - not yet a golden suite.
+  localparam logic [31:0] MXFP8_S_EXPECTED = 32'h4128_0000;  // 10.5f (E4M3, mixed exponents)
+  localparam logic [31:0] MXFP4_M_EXPECTED = 32'h4180_0000;  // 16.0f (MXFP4)
+  localparam logic [31:0] MXFP8_T_EXPECTED = 32'h4100_0000;  //  8.0f (E5M2)
+
+  localparam logic [31:0] INSTR_MXFUSED_F8S = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP8,
+    REG_F8S_RESULT, REG_F8S_A_BASE, REG_F8S_B_BASE, REG_F8_E4_RS3
+  );
+  localparam logic [31:0] INSTR_MXFUSED_F4M = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP4,
+    // A=B=x13 (same reg pair - both read {x14,x13}); rs3 shares S's E4M3 word,
+    // which is fine because the MXFP4 engine ignores rs3[48].
+    REG_F4M_RESULT, REG_F4M_AB_BASE, REG_F4M_AB_BASE, REG_F8_E4_RS3
+  );
+  localparam logic [31:0] INSTR_MXFUSED_F8T = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP8,
+    REG_F8T_RESULT, REG_F8T_AB_BASE, REG_F8T_AB_BASE, REG_F8_E5_RS3  // A=B=x22
   );
 
   localparam logic [31:0] INSTR_JAL_SELF = encode_j(OPCODE_JAL, 5'd0, 21'd0); // infinite self-loop
@@ -186,11 +279,21 @@ module instr_rom
     logic [31:0] lui_a_lo, addi_a_lo, lui_a_hi, addi_a_hi;
     logic [31:0] lui_b_lo, addi_b_lo, lui_b_hi, addi_b_hi;
     logic [31:0] lui_frs3_lo, addi_frs3_lo, lui_frs3_hi, addi_frs3_hi;
+    logic [31:0] lui_qa_lo, addi_qa_lo, lui_qa_hi, addi_qa_hi;
+    logic [31:0] lui_qb_lo, addi_qb_lo, lui_qb_hi, addi_qb_hi;
+    logic [31:0] lui_rrs3_lo, addi_rrs3_lo, lui_rrs3_hi, addi_rrs3_hi;
     logic [31:0] lui_dr_lo, addi_dr_lo, lui_dr_hi, addi_dr_hi;
     logic [31:0] lui_ra_lo, addi_ra_lo, lui_ra_hi, addi_ra_hi;
     logic [31:0] lui_rb_lo, addi_rb_lo, lui_rb_hi, addi_rb_hi;
     logic [31:0] lui_rar_lo, addi_rar_lo, lui_rar_hi, addi_rar_hi;
     logic [31:0] lui_rscales, addi_rscales, lui_racc, addi_racc;
+    // Test 3 (MXFP8 + overlap) operand loads
+    logic [31:0] lui_f8sa_lo, addi_f8sa_lo, lui_f8sa_hi, addi_f8sa_hi;
+    logic [31:0] lui_f8sb_lo, addi_f8sb_lo, lui_f8sb_hi, addi_f8sb_hi;
+    logic [31:0] lui_f8e4_lo, addi_f8e4_lo, lui_f8e4_hi, addi_f8e4_hi;
+    logic [31:0] lui_f4m_lo,  addi_f4m_lo,  lui_f4m_hi,  addi_f4m_hi;
+    logic [31:0] lui_f8t_lo,  addi_f8t_lo,  lui_f8t_hi,  addi_f8t_hi;
+    logic [31:0] lui_f8e5_lo, addi_f8e5_lo, lui_f8e5_hi, addi_f8e5_hi;
 
     for (i = 0; i < NUM_WORDS; i++) rom[i] = INSTR_NOP;
 
@@ -200,6 +303,14 @@ module instr_rom
     encode_li32(REG_FB_BASE + 5'd1, B_VAL[63:32], lui_b_hi,  addi_b_hi);
     encode_li32(REG_FRS3_BASE,        FRS3_VAL[31:0],  lui_frs3_lo, addi_frs3_lo);
     encode_li32(REG_FRS3_BASE + 5'd1, FRS3_VAL[63:32], lui_frs3_hi, addi_frs3_hi);
+
+    encode_li32(REG_QA_BASE,        QA_VAL[31:0],  lui_qa_lo, addi_qa_lo);
+    encode_li32(REG_QA_BASE + 5'd1, QA_VAL[63:32], lui_qa_hi, addi_qa_hi);
+    encode_li32(REG_QB_BASE,        QB_VAL[31:0],  lui_qb_lo, addi_qb_lo);
+    encode_li32(REG_QB_BASE + 5'd1, QB_VAL[63:32], lui_qb_hi, addi_qb_hi);
+
+    encode_li32(REG_RRS3_BASE,        RRS3_VAL[31:0],  lui_rrs3_lo, addi_rrs3_lo);
+    encode_li32(REG_RRS3_BASE + 5'd1, RRS3_VAL[63:32], lui_rrs3_hi, addi_rrs3_hi);
 
     encode_li32(REG_DR_BASE,        DUALREAD_LO_VAL, lui_dr_lo, addi_dr_lo);
     encode_li32(REG_DR_BASE + 5'd1, DUALREAD_HI_VAL, lui_dr_hi, addi_dr_hi);
@@ -213,26 +324,55 @@ module instr_rom
     encode_li32(REG_RSCALES,  RSCALES_VAL,  lui_rscales, addi_rscales);
     encode_li32(REG_ROLD_ACC, ROLD_ACC_VAL, lui_racc,    addi_racc);
 
-    // --- Test 1: MXFUSED, MX_FMT_MXFP4 (plain, no residue) ---
-    // Not deliberately hazard-tight (rs3/dual-read EX-forwarding was already proven by the
-    // dedicated dualread test and the earlier rs3-forwarding test) - this test is purely
-    // about algorithmic correctness of the single-instruction fast path. Half the
-    // instruction count of the old two-instruction MX_FMT_MXFP4 test (no AR load, no
-    // second issue/commit/result round trip) - the direct, measurable effect of this
-    // milestone.
+    // Test 3 operands (loaded fresh - earlier tests have consumed their own).
+    encode_li32(REG_F8S_A_BASE,        F8S_A_VAL[31:0],     lui_f8sa_lo, addi_f8sa_lo);
+    encode_li32(REG_F8S_A_BASE + 5'd1, F8S_A_VAL[63:32],    lui_f8sa_hi, addi_f8sa_hi);
+    encode_li32(REG_F8S_B_BASE,        F8S_B_VAL[31:0],     lui_f8sb_lo, addi_f8sb_lo);
+    encode_li32(REG_F8S_B_BASE + 5'd1, F8S_B_VAL[63:32],    lui_f8sb_hi, addi_f8sb_hi);
+    encode_li32(REG_F8_E4_RS3,         F8_E4_RS3_VAL[31:0], lui_f8e4_lo, addi_f8e4_lo);
+    encode_li32(REG_F8_E4_RS3 + 5'd1,  F8_E4_RS3_VAL[63:32],lui_f8e4_hi, addi_f8e4_hi);
+    encode_li32(REG_F4M_AB_BASE,        F4M_AB_VAL[31:0],   lui_f4m_lo,  addi_f4m_lo);
+    encode_li32(REG_F4M_AB_BASE + 5'd1, F4M_AB_VAL[63:32],  lui_f4m_hi,  addi_f4m_hi);
+    encode_li32(REG_F8T_AB_BASE,        F8T_AB_VAL[31:0],   lui_f8t_lo,  addi_f8t_lo);
+    encode_li32(REG_F8T_AB_BASE + 5'd1, F8T_AB_VAL[63:32],  lui_f8t_hi,  addi_f8t_hi);
+    encode_li32(REG_F8_E5_RS3,         F8_E5_RS3_VAL[31:0], lui_f8e5_lo, addi_f8e5_lo);
+    encode_li32(REG_F8_E5_RS3 + 5'd1,  F8_E5_RS3_VAL[63:32],lui_f8e5_hi, addi_f8e5_hi);
+
+    // --- Test 1: MXFUSED x3 back-to-back (P, Q, R) ---
+    // ALL operands for P, Q, and R are loaded FIRST, before any of the three
+    // FUSED instructions issue - this is deliberate: once P/Q/R start
+    // issuing, nothing else is interspersed between them, so they reach
+    // the core back-to-back with minimal gap, giving P's, Q's, and R's own
+    // journeys through mxdotp_fused_engine.sv's pipeline every opportunity
+    // to genuinely overlap rather than being serialized by unrelated
+    // instructions in between.
     rom[0]  = lui_a_lo;
-    rom[1]  = addi_a_lo;      // x1 <- A[31:0]
+    rom[1]  = addi_a_lo;      // x1 <- P/R's A[31:0]
     rom[2]  = lui_a_hi;
-    rom[3]  = addi_a_hi;      // x2 <- A[63:32]
+    rom[3]  = addi_a_hi;      // x2 <- P/R's A[63:32]
     rom[4]  = lui_b_lo;
-    rom[5]  = addi_b_lo;      // x3 <- B[31:0]
+    rom[5]  = addi_b_lo;      // x3 <- P's B[31:0]
     rom[6]  = lui_b_hi;
-    rom[7]  = addi_b_hi;      // x4 <- B[63:32]
+    rom[7]  = addi_b_hi;      // x4 <- P's B[63:32]
     rom[8]  = lui_frs3_lo;
-    rom[9]  = addi_frs3_lo;   // x5 <- old_acc (0.0)
+    rom[9]  = addi_frs3_lo;   // x5 <- P/Q's old_acc (0.0)
     rom[10] = lui_frs3_hi;
-    rom[11] = addi_frs3_hi;   // x6 <- {reserved,b_scale,a_scale}
-    rom[12] = INSTR_MXFUSED;
+    rom[11] = addi_frs3_hi;   // x6 <- P/Q's {reserved,b_scale,a_scale}
+    rom[12] = lui_qa_lo;
+    rom[13] = addi_qa_lo;     // x22 <- Q's A[31:0]
+    rom[14] = lui_qa_hi;
+    rom[15] = addi_qa_hi;     // x23 <- Q's A[63:32]
+    rom[16] = lui_qb_lo;
+    rom[17] = addi_qb_lo;     // x24 <- Q/R's B[31:0]
+    rom[18] = lui_qb_hi;
+    rom[19] = addi_qb_hi;     // x25 <- Q/R's B[63:32]
+    rom[20] = lui_rrs3_lo;
+    rom[21] = addi_rrs3_lo;   // x29 <- R's old_acc (100.0)
+    rom[22] = lui_rrs3_hi;
+    rom[23] = addi_rrs3_hi;   // x30 <- R's {reserved,b_scale,a_scale}
+    rom[24] = INSTR_MXFUSED;    // P: rd=x9,  expect 16.0
+    rom[25] = INSTR_MXFUSED_Q;  // Q: rd=x28, expect  4.0 - issued immediately after P, no gap
+    rom[26] = INSTR_MXFUSED_R;  // R: rd=x31, expect 108.0 - issued immediately after Q, no gap
 
     // --- Dual-read validation: MX_FUNCT3_DUALREAD_TEST ---
     // x10 (lo) is written well before the test instruction - port 0 just reads the regfile
@@ -242,36 +382,56 @@ module instr_rom
     // for the rs1+1 companion port (operand_a_hi_fw_mux_sel == SEL_FW_EX). If the companion-
     // port address generation, read-enable gating, or forwarding is wrong, x12 will end up
     // with something other than DUALREAD_HI_VAL instead.
-    rom[13] = lui_dr_lo;
-    rom[14] = addi_dr_lo;  // x10 <- 0xAAAAAAAA (lo half; not the value under test)
-    rom[15] = lui_dr_hi;
-    rom[16] = addi_dr_hi;  // x11 <- 0xBBBBBBBB; MXDUALREAD_TEST immediately follows, no NOP
-    rom[17] = INSTR_MXDUALREAD_TEST;
+    rom[27] = lui_dr_lo;
+    rom[28] = addi_dr_lo;  // x10 <- 0xAAAAAAAA (lo half; not the value under test)
+    rom[29] = lui_dr_hi;
+    rom[30] = addi_dr_hi;  // x11 <- 0xBBBBBBBB; MXDUALREAD_TEST immediately follows, no NOP
+    rom[31] = INSTR_MXDUALREAD_TEST;
 
     // --- Test 2: MXDOTP/MXFINAL, MX_FMT_MXFP4_RESIDUAL (k=16, with residue) ---
-    rom[18] = lui_ra_lo;
-    rom[19] = addi_ra_lo;   // x13 <- A[31:0]
-    rom[20] = lui_ra_hi;
-    rom[21] = addi_ra_hi;   // x14 <- A[63:32]
-    rom[22] = lui_rb_lo;
-    rom[23] = addi_rb_lo;   // x15 <- B[31:0]
-    rom[24] = lui_rb_hi;
-    rom[25] = addi_rb_hi;   // x16 <- B[63:32]
-    rom[26] = lui_rar_lo;
-    rom[27] = addi_rar_lo;  // x17 <- AR[31:0]
-    rom[28] = lui_rar_hi;
-    rom[29] = addi_rar_hi;  // x18 <- AR[63:32]
-    rom[30] = INSTR_MXDOTP_RESIDUAL;
-    rom[31] = lui_rscales;
-    rom[32] = addi_rscales; // x19 <- scales
-    rom[33] = lui_racc;
-    rom[34] = addi_racc;    // x20 <- old accumulator (0.0)
-    rom[35] = INSTR_MXFINAL_RESIDUAL;
+    rom[32] = lui_ra_lo;
+    rom[33] = addi_ra_lo;   // x13 <- A[31:0]
+    rom[34] = lui_ra_hi;
+    rom[35] = addi_ra_hi;   // x14 <- A[63:32]
+    rom[36] = lui_rb_lo;
+    rom[37] = addi_rb_lo;   // x15 <- B[31:0]
+    rom[38] = lui_rb_hi;
+    rom[39] = addi_rb_hi;   // x16 <- B[63:32]
+    rom[40] = lui_rar_lo;
+    rom[41] = addi_rar_lo;  // x17 <- AR[31:0]
+    rom[42] = lui_rar_hi;
+    rom[43] = addi_rar_hi;  // x18 <- AR[63:32]
+    rom[44] = INSTR_MXDOTP_RESIDUAL;
+    rom[45] = lui_rscales;
+    rom[46] = addi_rscales; // x19 <- scales
+    rom[47] = lui_racc;
+    rom[48] = addi_racc;    // x20 <- old accumulator (0.0)
+    rom[49] = INSTR_MXFINAL_RESIDUAL;
 
-    rom[36] = INSTR_JAL_SELF;
+    // --- Test 3: MXFP8 (E4M3 + E5M2) + cross-engine overlap (S, M, T) ---
+    // All Test-3 operands loaded FIRST, then the three MXFUSED instructions
+    // issue back-to-back with nothing between them, so S (fp8), M (fp4) and
+    // T (fp8) genuinely overlap across the two engines.
+    rom[50] = lui_f8sa_lo;  rom[51] = addi_f8sa_lo;   // x1  <- S's A[31:0]
+    rom[52] = lui_f8sa_hi;  rom[53] = addi_f8sa_hi;   // x2  <- S's A[63:32]
+    rom[54] = lui_f8sb_lo;  rom[55] = addi_f8sb_lo;   // x3  <- S's B[31:0]
+    rom[56] = lui_f8sb_hi;  rom[57] = addi_f8sb_hi;   // x4  <- S's B[63:32]
+    rom[58] = lui_f8e4_lo;  rom[59] = addi_f8e4_lo;   // x5  <- E4M3 rs3[31:0] (old_acc)
+    rom[60] = lui_f8e4_hi;  rom[61] = addi_f8e4_hi;   // x6  <- E4M3 rs3[63:32] (scales, bit48=0)
+    rom[62] = lui_f4m_lo;   rom[63] = addi_f4m_lo;    // x13 <- M's A=B[31:0]
+    rom[64] = lui_f4m_hi;   rom[65] = addi_f4m_hi;    // x14 <- M's A=B[63:32]
+    rom[66] = lui_f8t_lo;   rom[67] = addi_f8t_lo;    // x22 <- T's A=B[31:0]
+    rom[68] = lui_f8t_hi;   rom[69] = addi_f8t_hi;    // x23 <- T's A=B[63:32]
+    rom[70] = lui_f8e5_lo;  rom[71] = addi_f8e5_lo;   // x24 <- E5M2 rs3[31:0] (old_acc)
+    rom[72] = lui_f8e5_hi;  rom[73] = addi_f8e5_hi;   // x25 <- E5M2 rs3[63:32] (scales, bit48=1)
+    rom[74] = INSTR_MXFUSED_F8S;   // S: MXFP8 E4M3, rd=x7,  expect 10.5
+    rom[75] = INSTR_MXFUSED_F4M;   // M: MXFP4,      rd=x8,  expect 16.0 - right after S, no gap
+    rom[76] = INSTR_MXFUSED_F8T;   // T: MXFP8 E5M2, rd=x26, expect  8.0 - right after M, no gap
+
+    rom[77] = INSTR_JAL_SELF;
 
     // Add further instructions here, e.g.:
-    //   rom[37] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
+    //   rom[78] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
   end
 
   //----------------------------------------------------------------------------

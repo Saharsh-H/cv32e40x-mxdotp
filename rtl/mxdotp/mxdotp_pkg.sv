@@ -284,18 +284,60 @@ package mxdotp_pkg;
   //==============================================================================
 
   // --- Order-delivery queue: tags which slot produced each outstanding
-  //     instruction, in the order they were accepted. Depth exactly matches
-  //     the number of independent slots (DOTP, FINAL, DUALREAD_TEST, FUSED)
-  //     since each slot can have at most one instruction outstanding at a
-  //     time by construction - four is a real bound, not a heuristic. ---
-  localparam int MX_NUM_SLOTS  = 4;
-  localparam int MX_ORDER_DEPTH = MX_NUM_SLOTS;
+  //     instruction, in the order they were accepted.
+  //
+  //     MILESTONE (current): true overlap for the FUSED slot only (DOTP/
+  //     FINAL/DUALREAD_TEST are UNCHANGED - still at most one outstanding
+  //     each, by construction, exactly as before). FUSED can now have
+  //     multiple instructions outstanding simultaneously: up to
+  //     MX_FUSED_PENDING_DEPTH waiting for their own commit (a small FIFO -
+  //     see mxdotp_xif.sv's fused pending-commit queue), plus up to
+  //     MX_FUSED_INFLIGHT_DEPTH already committed and moving through
+  //     mxdotp_fused_engine.sv's own internal pipeline. MX_FUSED_INFLIGHT_DEPTH
+  //     is NOT a tunable - it's the fixed number of register points in that
+  //     engine's pipeline (input capture, contrib_q, sum_q, lead_q,
+  //     result_data_q = 5), so it can hold at most 5 instructions
+  //     concurrently by hard structural fact, not by choice.
+  //
+  //     MX_FUSED_PENDING_DEPTH=2 is a deliberately conservative starting
+  //     guess (not yet measured against CV32E40X's real issue-to-commit
+  //     latency) - mxdotp_xif.sv's pending-commit queue asserts if this
+  //     is ever too small, rather than silently dropping an entry. Sized
+  //     small on purpose: if the assertion never fires in simulation, 2
+  //     was enough; if it does fire, that's real evidence a deeper queue
+  //     is actually needed, rather than a guess baked in from day one.
+  //==============================================================================
 
-  typedef enum logic [1:0] {
+  localparam int MX_NUM_SLOTS  = 5;  // DOTP, FINAL, DUALREAD_TEST, FUSED (MXFP4),
+                                      // FUSED8 (MXFP8) - five distinct SLOT TYPES.
+                                      // Counts kinds of work, not how many of one
+                                      // kind can be outstanding at once. FUSED and
+                                      // FUSED8 are the two many-outstanding slots.
+
+  localparam int MX_FUSED_PENDING_DEPTH  = 2;  // see milestone header above
+  localparam int MX_FUSED_INFLIGHT_DEPTH = 5;  // fixed - EACH fused engine's own
+                                                 // register-point count, not a knob
+                                                 // (input capture, prod/contrib_q,
+                                                 // sum_q, lead_q, result_data_q).
+  // The MXFP4 and MXFP8 fused engines SHARE one pending-commit queue (an
+  // accepted FUSED instruction of either element format waits there for its
+  // own commit), but each has its OWN MX_FUSED_INFLIGHT_DEPTH pipeline. So the
+  // most FUSED-family instructions outstanding at once is the shared pending
+  // depth plus BOTH engines' inflight depths (not one engine's).
+  localparam int MX_FUSED_MAX_OUTSTANDING = MX_FUSED_PENDING_DEPTH + 2*MX_FUSED_INFLIGHT_DEPTH;
+
+  // DOTP + FINAL + DUALREAD_TEST (one each, unchanged) + the FUSED family's max
+  // simultaneous outstanding across both element-format engines. MX_NUM_SLOTS-2
+  // = the three single-outstanding slots (FUSED and FUSED8 are the two that the
+  // MX_FUSED_MAX_OUTSTANDING term already fully accounts for).
+  localparam int MX_ORDER_DEPTH = (MX_NUM_SLOTS - 2) + MX_FUSED_MAX_OUTSTANDING;
+
+  typedef enum logic [2:0] {
     MX_SLOT_DOTP,
     MX_SLOT_FINAL,
     MX_SLOT_DUALREAD,
-    MX_SLOT_FUSED
+    MX_SLOT_FUSED,
+    MX_SLOT_FUSED8
   } mx_slot_e;
 
   //==============================================================================
@@ -600,39 +642,78 @@ package mxdotp_pkg;
   endfunction
 
   //----------------------------------------------------------------------------
-  // acc_to_fp32: normalize + single round-to-nearest-even of the final wide
-  // fixed-point sum back down to FP32 - the *only* rounding step in the
-  // whole datapath (matching the "single rounding" property of both
-  // reference papers). Takes the full ACC_FULL_WIDTH (ACC_WIDTH+GUARD_BITS)
-  // value directly - callers should never narrow to ACC_WIDTH before this
-  // call. The exponent clamp near the end (over/underflow to the FP32
-  // representable range) is the *only* range-limiting step in the whole
-  // datapath, and it's the legitimate final one, not an early one.
+  // mx_lead_result_t: the contract between acc_find_lead (leading-one scan)
+  // and acc_finalize (mantissa extract + round + clamp) - the exact split
+  // point identified from Vivado's own timing report as the highest-leverage
+  // single pipeline cut in the whole back-end (see mxdotp_fused_engine.sv /
+  // mxdotp_final_engine.sv's BACK2/BACK3 stages). lead_pos is signed and
+  // sized to hold the -1 sentinel (acc was exactly zero) through
+  // ACC_FULL_WIDTH-1 (the maximum valid bit position) with room to spare -
+  // 9 bits comfortably covers -256..255 against an actual range of -1..97.
   //----------------------------------------------------------------------------
-  function automatic logic [31:0] acc_to_fp32(input logic signed [ACC_FULL_WIDTH-1:0] acc);
-    logic                       sign;
-    logic [ACC_FULL_WIDTH-1:0]  mag;
-    int                         lead_pos;
-    int                         i;
-    logic [22:0]                mant_out;
-    logic [7:0]                 exp_out;
-    mx_exp_t                    unbiased_exp;
-    logic                       round_bit, sticky_bit;
-    logic [23:0]                mant_ext;
-    begin
-      if (acc == '0) return 32'd0;
+  typedef struct packed {
+    logic                      sign;
+    logic signed [8:0]         lead_pos;
+    logic [ACC_FULL_WIDTH-1:0] mag;
+  } mx_lead_result_t;
 
+  //----------------------------------------------------------------------------
+  // acc_find_lead / acc_finalize: acc_to_fp32 (below) split at its leading-
+  // one-scan boundary. This is Vivado's OWN evidence, not a guess: the
+  // report_timing critical path ran unbroken from rs3_q (an operand
+  // register) through place_in_acc/fp32_to_acc, the wide sum, the leading-
+  // one scan, and the mantissa/round/clamp logic - 79 logic levels, zero
+  // registers - because nothing in the original single-function
+  // acc_to_fp32 gave a caller anywhere to put one. Splitting the FUNCTION
+  // is what makes a real register possible at the call site: a caller now
+  // registers acc_find_lead's result (mx_lead_result_t) before calling
+  // acc_finalize on it, instead of the whole chain running in one
+  // unbroken combinational cycle.
+  //----------------------------------------------------------------------------
+
+  // First half: two's-complement -> sign/magnitude, then the leading-one
+  // scan (a simple descending priority scan - unchanged algorithm from
+  // before this split; only its position in the pipeline changed).
+  function automatic mx_lead_result_t acc_find_lead(input logic signed [ACC_FULL_WIDTH-1:0] acc);
+    logic                      sign;
+    logic [ACC_FULL_WIDTH-1:0] mag;
+    int                        lead_pos;
+    int                        i;
+    mx_lead_result_t           result;
+    begin
       sign = acc[ACC_FULL_WIDTH-1];
       mag  = sign ? (-acc) : acc;  // two's-complement negation, reinterpreted as
                                     // unsigned magnitude via same-width assignment
-
-      // Leading-one detection (simple descending scan - fine for a first,
-      // correctness-focused pass; a leading-zero anticipator would replace
-      // this for timing once synthesis is a concern).
       lead_pos = -1;
       for (i = ACC_FULL_WIDTH-1; i >= 0; i--) begin
         if (lead_pos == -1 && mag[i]) lead_pos = i;
       end
+      result.sign     = sign;
+      result.lead_pos = 9'(lead_pos);  // sign-extends -1 correctly into the signed field
+      result.mag      = mag;
+      return result;
+    end
+  endfunction
+
+  // Second half: mantissa extraction, sticky/round, exponent clamp - takes
+  // an ALREADY-COMPUTED sign/lead_pos/mag (e.g. from a registered
+  // acc_find_lead call one cycle earlier) instead of recomputing them from
+  // acc directly. Includes the acc==0 special case (here: lead_pos==-1, the
+  // sentinel acc_find_lead produces for that input - mag==0 iff acc==0 for
+  // a two's-complement value, and the leading-one loop only ever fails to
+  // set lead_pos when mag is entirely zero, so this is exactly equivalent
+  // to the original function's `if (acc == '0) return 32'd0;`).
+  function automatic logic [31:0] acc_finalize(input mx_lead_result_t lr);
+    int          lead_pos;
+    mx_exp_t     unbiased_exp;
+    logic [22:0] mant_out;
+    logic        round_bit, sticky_bit;
+    logic [23:0] mant_ext;
+    logic [7:0]  exp_out;
+    int          i;
+    begin
+      lead_pos = int'(lr.lead_pos);
+      if (lead_pos == -1) return 32'd0;
 
       unbiased_exp = mx_exp_t'(lead_pos) - mx_exp_t'(ACC_ANCHOR);
 
@@ -640,26 +721,20 @@ package mxdotp_pkg;
       round_bit  = 1'b0;
       sticky_bit = 1'b0;
       for (i = 0; i < 23; i++) begin
-        if (lead_pos - 1 - i >= 0) mant_out[22-i] = mag[lead_pos-1-i];
+        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
       end
-      if (lead_pos - 24 >= 0) round_bit = mag[lead_pos-24];
+      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
       // Fixed-bound loop (ACC_FULL_WIDTH is a compile-time constant), guarded
       // by a data-dependent `if` - the same pattern the mant_out loop just
-      // above already uses, not a new one. lead_pos-24 was the loop's actual
-      // trip count before this rewrite (data-dependent, since lead_pos comes
-      // from the leading-one scan above) - Vivado cannot statically unroll a
-      // variable trip count ([Synth 8-3380] "loop condition does not
-      // converge"), so the bound is widened to the provably-safe constant
-      // ACC_FULL_WIDTH (mag's own bit range is 0..ACC_FULL_WIDTH-1, so no
-      // valid i is ever excluded) and the original bound is enforced inside
-      // as a guard instead. Semantically identical: every i that the old
-      // loop would have visited (0 <= i < lead_pos-24) still contributes;
-      // every additional i this loop now visits (lead_pos-24 <= i <
-      // ACC_FULL_WIDTH) is guarded off and contributes nothing, exactly as
-      // if the loop had stopped there - not an approximation, the same
-      // boolean OR-reduction, just expressed with a synthesizable trip count.
+      // above uses. lead_pos-24 alone was a data-dependent trip count that
+      // Vivado couldn't statically unroll ([Synth 8-3380] "loop condition
+      // does not converge") - the bound is widened to the provably-safe
+      // constant ACC_FULL_WIDTH (mag's own bit range is 0..ACC_FULL_WIDTH-1,
+      // so no valid i is ever excluded) and the original bound enforced as a
+      // guard instead. Semantically identical, not an approximation: every i
+      // beyond the original bound is guarded off and contributes nothing.
       for (i = 0; i < ACC_FULL_WIDTH; i++) begin
-        if (i < lead_pos-24 && mag[i]) sticky_bit = 1'b1;
+        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
       end
 
       mant_ext = {1'b0, mant_out};
@@ -674,20 +749,35 @@ package mxdotp_pkg;
         mant_out = mant_ext[22:0];
       end
 
-      // This is the ONE legitimate range clamp in the whole datapath -
-      // saturating an FP32 result to its representable exponent range is
-      // required IEEE-754-style behavior for any finite format, not an
-      // early precision-losing step.
       if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
-        exp_out = 8'd0; mant_out = '0;              // underflow -> flush to zero
+        exp_out = 8'd0; mant_out = '0;
       end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
-        exp_out = 8'hFE; mant_out = 23'h7FFFFF;      // saturate to max finite (no Inf here)
+        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
       end else begin
         exp_out = 8'(unbiased_exp + mx_exp_t'(127));
       end
 
-      return {sign, exp_out, mant_out};
+      return {lr.sign, exp_out, mant_out};
     end
+  endfunction
+
+  //----------------------------------------------------------------------------
+  // acc_to_fp32: normalize + single round-to-nearest-even of the final wide
+  // fixed-point sum back down to FP32 - the *only* rounding step in the
+  // whole datapath (matching the "single rounding" property of both
+  // reference papers). Takes the full ACC_FULL_WIDTH (ACC_WIDTH+GUARD_BITS)
+  // value directly - callers should never narrow to ACC_WIDTH before this
+  // call. The exponent clamp near the end (over/underflow to the FP32
+  // representable range) is the *only* range-limiting step in the whole
+  // datapath, and it's the legitimate final one, not an early one.
+  //
+  // Now just a thin composition of acc_find_lead + acc_finalize above (kept
+  // for any caller that doesn't need a pipeline cut here - neither
+  // mxdotp_final_engine.sv nor mxdotp_fused_engine.sv call this directly
+  // any more; both call the split halves with a real register in between).
+  //----------------------------------------------------------------------------
+  function automatic logic [31:0] acc_to_fp32(input logic signed [ACC_FULL_WIDTH-1:0] acc);
+    return acc_finalize(acc_find_lead(acc));
   endfunction
 
 endpackage

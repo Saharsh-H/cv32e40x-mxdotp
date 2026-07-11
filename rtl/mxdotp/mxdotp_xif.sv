@@ -17,12 +17,23 @@
 //   id field specifically to let multiple offloaded instructions be
 //   outstanding at once.
 //
+//   MILESTONE (current): true overlap for the FUSED slot specifically (DOTP/
+//   FINAL/DUALREAD_TEST are UNCHANGED by this milestone - still exactly one
+//   outstanding each, by construction, same mxdotp_state_t FSM as before).
+//   FUSED no longer has a single mxdotp_state_t register at all: it's
+//   replaced by (1) a small pending-commit FIFO (fused_pending_q -
+//   mxdotp_pkg.sv's MX_FUSED_PENDING_DEPTH) holding instructions that have
+//   been accepted at issue but not yet resolved by commit, and (2)
+//   mxdotp_fused_engine.sv's own internal 5-register-point pipeline, which
+//   can now hold multiple committed instructions simultaneously at
+//   different stages of computing (see that file's own milestone header).
+//   issue_ready for FUSED now reflects the pending-commit queue's own
+//   fullness, not a single-instruction busy bit.
+//
 //   MXDOTP/MXFINAL are RESIDUE-STYLE FORMATS ONLY as of the fused-fast-path
 //   milestone (see mxdotp_pkg.sv's MX_SLOT_FUSED milestone header): plain
 //   (non-residue) MXFP4/MXFP8 never reach those two slots any more - they go
-//   exclusively through the new FUSED slot below, which is self-contained
-//   (one instruction, one engine, no mailbox - mxdotp_fused_engine.sv does
-//   its own internal front-end/back-end hand-off privately).
+//   exclusively through the FUSED slot.
 //
 //   A single-entry mailbox (mailbox_valid_q/mailbox_p1_q/mailbox_p2_q)
 //   carries MXDOTP's raw p1/p2 to MXFINAL: MXDOTP's engine posts into it once
@@ -35,12 +46,14 @@
 //   either), the second one simply stalls in COMPUTE until the mailbox is
 //   freed, rather than overwriting an unconsumed result.
 //
-//   Because up to four instructions (one per slot) can be outstanding at
-//   once, but CV32E40X retires strictly in program order, results are
-//   delivered through a small in-order queue (see mx_slot_e/MX_ORDER_DEPTH
-//   in mxdotp_pkg.sv): only the oldest still-outstanding instruction's slot
-//   may present result_valid, even if a more-recently-issued slot's engine
-//   finished computing first.
+//   Results are delivered through a small in-order queue (see mx_slot_e/
+//   MX_ORDER_DEPTH in mxdotp_pkg.sv): only the oldest still-outstanding
+//   instruction's slot may present result_valid, even if a more-recently-
+//   issued slot's engine finished computing first. MX_ORDER_DEPTH is now
+//   sized for DOTP+FINAL+DUALREAD_TEST (one each, unchanged) PLUS however
+//   many FUSED instructions can genuinely be outstanding at once - no
+//   longer a flat MX_NUM_SLOTS, since one slot (FUSED) can now contribute
+//   many simultaneous entries instead of at most one.
 //
 //==============================================================================
 
@@ -123,19 +136,16 @@ module mxdotp_xif
     mxdotp_state_t dotp_state_q,  dotp_state_d;
     mxdotp_state_t final_state_q, final_state_d;
     mxdotp_state_t dr_state_q,    dr_state_d;
-    mxdotp_state_t fused_state_q, fused_state_d;
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
             dotp_state_q  <= MX_IDLE;
             final_state_q <= MX_IDLE;
             dr_state_q    <= MX_IDLE;
-            fused_state_q <= MX_IDLE;
         end else begin
             dotp_state_q  <= dotp_state_d;
             final_state_q <= final_state_d;
             dr_state_q    <= dr_state_d;
-            fused_state_q <= fused_state_d;
         end
     end
 
@@ -156,7 +166,7 @@ module mxdotp_xif
         (mx_operation == MX_FUNCT3_DOTP)           ? (dotp_state_q  == MX_IDLE) :
         (mx_operation == MX_FUNCT3_FINAL)          ? (final_state_q == MX_IDLE) :
         (mx_operation == MX_FUNCT3_DUALREAD_TEST)  ? (dr_state_q    == MX_IDLE) :
-        (mx_operation == MX_FUNCT3_FUSED)          ? (fused_state_q == MX_IDLE) :
+        (mx_operation == MX_FUNCT3_FUSED)          ? !fused_pending_full :
         1'b1;
 
     always_comb begin
@@ -269,30 +279,133 @@ module mxdotp_xif
         end
     end
 
-    // MXFUSED: rs1=A, rs2=B, rs3={scales,old_acc} (all three dual-read - see
-    // issue_resp.dualread above). Needs saved_rd (architectural destination)
-    // and saved_format (element format - MX_FMT_MXFP4 implemented,
-    // MX_FMT_MXFP8 stubbed - see mxdotp_fused_engine.sv).
-    logic [X_ID_WIDTH-1:0]  fused_saved_id;
-    logic [4:0]             fused_saved_rd;
-    logic [1:0]             fused_saved_format;
-    logic [X_RFR_WIDTH-1:0] fused_saved_rs1, fused_saved_rs2, fused_saved_rs3;
+    //--------------------------------------------------------------------------
+    // FUSED pending-commit queue: holds instructions accepted at issue but
+    // not yet resolved by commit (proceed vs kill) - see mxdotp_pkg.sv's
+    // MX_FUSED_PENDING_DEPTH milestone comment for sizing rationale, and
+    // mxdotp_fused_engine.sv's own header for why this stays a SEPARATE
+    // structure from that engine's internal pipeline rather than folded
+    // into one: this queue's occupancy time is inherently variable (bounded
+    // by however long commit takes to arrive), while the engine's own
+    // stages are now fixed-1-cycle-each - mixing the two would reintroduce
+    // the non-uniform timing this whole effort has been removing.
+    //
+    // A plain FIFO, not id-matched per entry: CV32E40X commits strictly in
+    // program order, and accept_fused pushes in program order too, so an
+    // incoming commit_valid always resolves the CURRENT HEAD entry - never
+    // any other entry in the queue. This is why no per-entry id search is
+    // needed, only a head-pointer check.
+    //--------------------------------------------------------------------------
+
+    typedef enum logic [1:0] { FUSED_PENDING, FUSED_COMMIT_OK, FUSED_COMMIT_KILL } fused_commit_status_e;
+
+    typedef struct packed {
+        logic [X_ID_WIDTH-1:0]  id;
+        logic [4:0]             rd;
+        logic [1:0]             format;
+        logic [X_RFR_WIDTH-1:0] rs1;
+        logic [X_RFR_WIDTH-1:0] rs2;
+        logic [X_RFR_WIDTH-1:0] rs3;
+        fused_commit_status_e   status;
+    } fused_pending_entry_t;
+
+    localparam int MX_FUSED_PENDING_PTR_WIDTH =
+        (MX_FUSED_PENDING_DEPTH <= 1) ? 1 : $clog2(MX_FUSED_PENDING_DEPTH);
+    localparam int MX_FUSED_PENDING_CNT_WIDTH = $clog2(MX_FUSED_PENDING_DEPTH + 1);
+
+    fused_pending_entry_t fused_pending_q [0:MX_FUSED_PENDING_DEPTH-1];
+    logic [MX_FUSED_PENDING_PTR_WIDTH-1:0] fused_pending_head_ptr, fused_pending_tail_ptr;
+    logic [MX_FUSED_PENDING_CNT_WIDTH-1:0] fused_pending_count;
+
+    wire fused_pending_empty = (fused_pending_count == '0);
+    wire fused_pending_full  = (fused_pending_count == MX_FUSED_PENDING_DEPTH);
+    wire fused_pending_head_valid = !fused_pending_empty;
+
+    // Resolving fresh THIS cycle (commit_valid arrives for a still-PENDING
+    // head) reacts combinationally, same cycle, same low latency the old
+    // single-register design had - not delayed a cycle waiting for a
+    // registered status update. The registered status field only matters
+    // for remembering a resolution that couldn't be immediately handed to
+    // the engine (engine not ready that exact cycle) across to a later one.
+    wire fused_pending_head_committed_now =
+        fused_pending_head_valid && commit_if.commit_valid &&
+        (commit_if.commit.id == fused_pending_q[fused_pending_head_ptr].id) &&
+        (fused_pending_q[fused_pending_head_ptr].status == FUSED_PENDING);
+
+    wire fused_pending_head_ok =
+        fused_pending_head_valid &&
+        ((fused_pending_q[fused_pending_head_ptr].status == FUSED_COMMIT_OK) ||
+         (fused_pending_head_committed_now && !commit_if.commit.commit_kill));
+
+    wire fused_pending_head_kill =
+        fused_pending_head_valid &&
+        ((fused_pending_q[fused_pending_head_ptr].status == FUSED_COMMIT_KILL) ||
+         (fused_pending_head_committed_now && commit_if.commit.commit_kill));
+
+    // fused_pending_push/pop drive the shared queue's tail/head. The pop
+    // condition forward-references the two engines' start signals (defined in
+    // the FUSED engine section below); both are pure combinational, so the
+    // forward reference is safe - same style already used for order_head_tag.
+    wire fused_pending_push = accept_fused;
+    // Which engine the head belongs to, by its element format: MXFP8 -> the fp8
+    // engine, everything else -> the MXFP4 engine.
+    wire head_is_fp8 = fused_pending_head_valid &&
+                       (fused_pending_q[fused_pending_head_ptr].format == MX_FMT_MXFP8);
+    // fused4_engine_start / fused8_engine_start are defined in the FUSED engine
+    // section below; both are pure combinational (start derives from ready,
+    // ready comes straight from an engine instance), so this forward reference
+    // is safe - same style already used for order_head_tag elsewhere.
+    wire fused_pending_pop  = fused_pending_head_kill ||
+                              fused4_engine_start || fused8_engine_start;
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
-            fused_saved_id     <= '0;
-            fused_saved_rd     <= '0;
-            fused_saved_format <= '0;
-            fused_saved_rs1    <= '0;
-            fused_saved_rs2    <= '0;
-            fused_saved_rs3    <= '0;
-        end else if (accept_fused) begin
-            fused_saved_id     <= issue_if.issue_req.id;
-            fused_saved_rd     <= rd;
-            fused_saved_format <= mx_format;
-            fused_saved_rs1    <= issue_if.issue_req.rs[0];
-            fused_saved_rs2    <= issue_if.issue_req.rs[1];
-            fused_saved_rs3    <= issue_if.issue_req.rs[2];
+            fused_pending_head_ptr <= '0;
+            fused_pending_tail_ptr <= '0;
+            fused_pending_count    <= '0;
+        end else begin
+            if (fused_pending_push) begin
+                fused_pending_tail_ptr <= (fused_pending_tail_ptr == MX_FUSED_PENDING_DEPTH-1) ?
+                                           '0 : fused_pending_tail_ptr + 1'b1;
+            end
+            if (fused_pending_pop) begin
+                fused_pending_head_ptr <= (fused_pending_head_ptr == MX_FUSED_PENDING_DEPTH-1) ?
+                                           '0 : fused_pending_head_ptr + 1'b1;
+            end
+            unique case ({fused_pending_push, fused_pending_pop})
+                2'b10:   fused_pending_count <= fused_pending_count + 1'b1;
+                2'b01:   fused_pending_count <= fused_pending_count - 1'b1;
+                default: fused_pending_count <= fused_pending_count;
+            endcase
+        end
+    end
+
+    integer fp_i;
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            for (fp_i = 0; fp_i < MX_FUSED_PENDING_DEPTH; fp_i++) fused_pending_q[fp_i] <= '0;
+        end else begin
+            if (fused_pending_push) begin
+                // synthesis translate_off
+                assert (!fused_pending_full) else
+                    $error("mxdotp_xif: FUSED pending-commit queue overflowed (depth=%0d) - MX_FUSED_PENDING_DEPTH in mxdotp_pkg.sv is too small for this workload's actual issue-to-commit latency; deepen it there, not here.",
+                            MX_FUSED_PENDING_DEPTH);
+                // synthesis translate_on
+                fused_pending_q[fused_pending_tail_ptr].id     <= issue_if.issue_req.id;
+                fused_pending_q[fused_pending_tail_ptr].rd     <= rd;
+                fused_pending_q[fused_pending_tail_ptr].format <= mx_format;
+                fused_pending_q[fused_pending_tail_ptr].rs1    <= issue_if.issue_req.rs[0];
+                fused_pending_q[fused_pending_tail_ptr].rs2    <= issue_if.issue_req.rs[1];
+                fused_pending_q[fused_pending_tail_ptr].rs3    <= issue_if.issue_req.rs[2];
+                fused_pending_q[fused_pending_tail_ptr].status <= FUSED_PENDING;
+            end
+            // Latch a fresh resolution ONLY if it couldn't be handed off to
+            // the engine this same cycle (fused_pending_pop already covers
+            // the "handed off now" case - see fused_pending_pop above).
+            if (fused_pending_head_committed_now && !fused_pending_pop) begin
+                fused_pending_q[fused_pending_head_ptr].status <=
+                    commit_if.commit.commit_kill ? FUSED_COMMIT_KILL : FUSED_COMMIT_OK;
+            end
         end
     end
 
@@ -559,80 +672,125 @@ module mxdotp_xif
     end
 
     //--------------------------------------------------------------------------
-    // FUSED slot: engine, FSM. Self-contained - no mailbox, no cross-
-    // instruction data dependency (unlike FINAL, which must wait on DOTP's
-    // mailbox). Its start condition is therefore a single-disjunct
-    // expression, structurally identical to DOTP's own engine_start above,
-    // not FINAL's two-disjunct one.
+    // FUSED slot: the shared pending-commit queue (above) feeds TWO engines -
+    // mxdotp_fused_engine.sv (MXFP4) and mxdotp_fp8_fused_engine.sv (MXFP8) -
+    // routed by the head entry's element format. No per-slot mxdotp_state_t FSM
+    // (see file header). The matching engine's start fires the instant the
+    // queue's head is resolved OK (this cycle or latched from an earlier one)
+    // AND that engine has room; fused_pending_pop (defined above) advances the
+    // queue in lockstep with whichever engine took the head, plus the kill
+    // case, which pops unconditionally without touching either engine. The two
+    // engines occupy two distinct order-queue slots (MX_SLOT_FUSED / _FUSED8),
+    // so results from the two interleave back into program order correctly.
     //--------------------------------------------------------------------------
 
-    logic fused_engine_start, fused_engine_busy, fused_engine_done;
-    logic [X_RFW_WIDTH-1:0] fused_result_data;
+    logic fused4_engine_start, fused4_engine_ready;
+    logic fused4_result_valid, fused4_result_ready;
+    logic [X_ID_WIDTH-1:0]  fused4_result_id;
+    logic [4:0]             fused4_result_rd;
+    logic [X_RFW_WIDTH-1:0] fused4_result_data;
 
+    logic fused8_engine_start, fused8_engine_ready;
+    logic fused8_result_valid, fused8_result_ready;
+    logic [X_ID_WIDTH-1:0]  fused8_result_id;
+    logic [4:0]             fused8_result_rd;
+    logic [X_RFW_WIDTH-1:0] fused8_result_data;
+
+    // Only the engine whose element format matches the pending-queue head is
+    // started this cycle; the other ignores its (deasserted) start_i. The
+    // shared pending queue pops when EITHER engine takes the head (or on kill -
+    // see fused_pending_pop above). Head-of-line: if the head is MXFP8 but the
+    // fp8 engine isn't ready, the head waits rather than letting a younger
+    // MXFP4 instruction behind it jump ahead - this preserves strict
+    // program-order handoff, so each engine's own result stream stays in
+    // program order within its own order-queue slot.
+    assign fused4_engine_start = fused_pending_head_ok && !head_is_fp8 && fused4_engine_ready;
+    assign fused8_engine_start = fused_pending_head_ok &&  head_is_fp8 && fused8_engine_ready;
+
+    // MXFP4 fused engine (plain E2M1 fast path).
     mxdotp_fused_engine #(
+        .X_ID_WIDTH  (X_ID_WIDTH),
         .X_RFR_WIDTH (X_RFR_WIDTH),
         .X_RFW_WIDTH (X_RFW_WIDTH)
     ) fused_engine_i (
-        .clk_i       (clk_i),
-        .rst_ni      (rst_ni),
-        .start_i     (fused_engine_start),
-        .busy_o      (fused_engine_busy),
-        .done_o      (fused_engine_done),
-        .rs1_i       (fused_saved_rs1),
-        .rs2_i       (fused_saved_rs2),
-        .rs3_i       (fused_saved_rs3),
-        .mx_format_i (fused_saved_format),
-        .result_data (fused_result_data)
+        .clk_i          (clk_i),
+        .rst_ni         (rst_ni),
+        .start_i        (fused4_engine_start),
+        .ready_o        (fused4_engine_ready),
+        .id_i           (fused_pending_q[fused_pending_head_ptr].id),
+        .rd_i           (fused_pending_q[fused_pending_head_ptr].rd),
+        .rs1_i          (fused_pending_q[fused_pending_head_ptr].rs1),
+        .rs2_i          (fused_pending_q[fused_pending_head_ptr].rs2),
+        .rs3_i          (fused_pending_q[fused_pending_head_ptr].rs3),
+        .mx_format_i    (fused_pending_q[fused_pending_head_ptr].format),
+        .result_valid_o (fused4_result_valid),
+        .result_ready_i (fused4_result_ready),
+        .result_id_o    (fused4_result_id),
+        .result_rd_o    (fused4_result_rd),
+        .result_data_o  (fused4_result_data)
     );
 
-    assign fused_engine_start = (fused_state_q == MX_WAIT_COMMIT) &&
-                                 commit_if.commit_valid &&
-                                 (commit_if.commit.id == fused_saved_id) &&
-                                 !commit_if.commit.commit_kill;
+    // MXFP8 fused engine (E4M3/E5M2, sub-format selected by rs3[48]). A
+    // deliberately separate engine - see mxdotp_fp8_fused_engine.sv's header
+    // for why its front-end/BACK1 differ (per-element exponent placement /
+    // early accumulation, not MXFP4's integer sum-then-place).
+    mxdotp_fp8_fused_engine #(
+        .X_ID_WIDTH  (X_ID_WIDTH),
+        .X_RFR_WIDTH (X_RFR_WIDTH),
+        .X_RFW_WIDTH (X_RFW_WIDTH)
+    ) fused8_engine_i (
+        .clk_i          (clk_i),
+        .rst_ni         (rst_ni),
+        .start_i        (fused8_engine_start),
+        .ready_o        (fused8_engine_ready),
+        .id_i           (fused_pending_q[fused_pending_head_ptr].id),
+        .rd_i           (fused_pending_q[fused_pending_head_ptr].rd),
+        .rs1_i          (fused_pending_q[fused_pending_head_ptr].rs1),
+        .rs2_i          (fused_pending_q[fused_pending_head_ptr].rs2),
+        .rs3_i          (fused_pending_q[fused_pending_head_ptr].rs3),
+        .mx_format_i    (fused_pending_q[fused_pending_head_ptr].format),
+        .result_valid_o (fused8_result_valid),
+        .result_ready_i (fused8_result_ready),
+        .result_id_o    (fused8_result_id),
+        .result_rd_o    (fused8_result_rd),
+        .result_data_o  (fused8_result_data)
+    );
 
-    always_comb begin
-        fused_state_d = fused_state_q;
-        unique case (fused_state_q)
-            MX_IDLE: begin
-                if (accept_fused) fused_state_d = MX_WAIT_COMMIT;
-            end
-            MX_WAIT_COMMIT: begin
-                if (commit_if.commit_valid && (commit_if.commit.id == fused_saved_id)) begin
-                    fused_state_d = commit_if.commit.commit_kill ? MX_IDLE : MX_COMPUTE;
-                end
-            end
-            MX_COMPUTE: begin
-                if (fused_engine_done) fused_state_d = MX_RESULT;
-            end
-            MX_RESULT: begin
-                if ((order_head_tag == MX_SLOT_FUSED) && result_if.result_valid && result_if.result_ready)
-                    fused_state_d = MX_IDLE;
-            end
-            default: fused_state_d = MX_IDLE;
-        endcase
-    end
+    // Each engine presents its result only when its OWN slot is at the order
+    // queue head. Each engine delivers its own results in program order; the
+    // order queue interleaves the two engines' (and the other slots') streams
+    // back into global program order. Same gating rationale as the single-
+    // engine design, just one instance of it per engine/slot - the engines
+    // have no visibility into the shared order queue, so this must live here.
+    assign fused4_result_ready = (order_head_tag == MX_SLOT_FUSED)  && result_if.result_ready;
+    assign fused8_result_ready = (order_head_tag == MX_SLOT_FUSED8) && result_if.result_ready;
 
     //--------------------------------------------------------------------------
     // In-order result delivery queue
     //--------------------------------------------------------------------------
     //
     // Tags which slot produced each outstanding instruction, in the order
-    // they were accepted. Depth exactly matches the number of independent
-    // slots (MX_NUM_SLOTS == MX_ORDER_DEPTH == 4) since each slot can have
-    // at most one instruction outstanding at a time by construction - four
-    // is a real bound, not a heuristic. Only the head entry's slot may
-    // present result_valid, so results reach the core in acceptance order
-    // even though the four slots can finish computing in any order.
+    // they were accepted. Only the head entry's slot may present
+    // result_valid, so results reach the core in acceptance order even
+    // though slots can finish computing in any order.
+    //
+    // Depth is no longer a flat MX_NUM_SLOTS: DOTP/FINAL/DUALREAD_TEST are
+    // still at most one outstanding each (unchanged), but FUSED can now
+    // have MX_FUSED_MAX_OUTSTANDING simultaneously (see mxdotp_pkg.sv's
+    // MX_ORDER_DEPTH derivation) - pointer/count widths are sized generically
+    // from MX_ORDER_DEPTH via $clog2 rather than hardcoded, since that depth
+    // is no longer a small fixed constant.
     //--------------------------------------------------------------------------
 
+    localparam int MX_ORDER_PTR_WIDTH   = (MX_ORDER_DEPTH <= 1) ? 1 : $clog2(MX_ORDER_DEPTH);
+    localparam int MX_ORDER_CNT_WIDTH   = $clog2(MX_ORDER_DEPTH + 1);
+
     mx_slot_e order_q [0:MX_ORDER_DEPTH-1];
-    logic [1:0] order_head_ptr, order_tail_ptr;
-    logic [2:0] order_count;  // must represent 0..MX_NUM_SLOTS (4) inclusive - [1:0]
-                              // (0..3) was one bit short once a fourth slot could be
-                              // simultaneously outstanding.
+    logic [MX_ORDER_PTR_WIDTH-1:0] order_head_ptr, order_tail_ptr;
+    logic [MX_ORDER_CNT_WIDTH-1:0] order_count;
 
     wire mx_slot_e order_head_tag = order_q[order_head_ptr];
-    wire           order_empty    = (order_count == 3'd0);
+    wire           order_empty    = (order_count == '0);
 
     logic push_any;
     assign push_any = accept_dotp || accept_final || accept_dr || accept_fused;  // mutually exclusive
@@ -652,15 +810,16 @@ module mxdotp_xif
                 order_q[order_tail_ptr] <= accept_dotp  ? MX_SLOT_DOTP  :
                                             accept_final ? MX_SLOT_FINAL :
                                             accept_dr    ? MX_SLOT_DUALREAD :
+                                            (accept_fused && (mx_format == MX_FMT_MXFP8)) ? MX_SLOT_FUSED8 :
                                                             MX_SLOT_FUSED;
-                order_tail_ptr <= (order_tail_ptr == MX_ORDER_DEPTH-1) ? 2'd0 : order_tail_ptr + 2'd1;
+                order_tail_ptr <= (order_tail_ptr == MX_ORDER_DEPTH-1) ? '0 : order_tail_ptr + 1'b1;
             end
             if (pop_any) begin
-                order_head_ptr <= (order_head_ptr == MX_ORDER_DEPTH-1) ? 2'd0 : order_head_ptr + 2'd1;
+                order_head_ptr <= (order_head_ptr == MX_ORDER_DEPTH-1) ? '0 : order_head_ptr + 1'b1;
             end
             unique case ({push_any, pop_any})
-                2'b10:   order_count <= order_count + 3'd1;
-                2'b01:   order_count <= order_count - 3'd1;
+                2'b10:   order_count <= order_count + 1'b1;
+                2'b01:   order_count <= order_count - 1'b1;
                 default: order_count <= order_count;  // 00 (no change) or 11 (push and pop net to no change)
             endcase
         end
@@ -668,8 +827,10 @@ module mxdotp_xif
 
     //--------------------------------------------------------------------------
     // Result Interface: driven by whichever slot is at the head of the
-    // order queue, and only once that specific slot has actually reached
-    // its own MX_RESULT state.
+    // order queue, and only once that specific slot actually has a result
+    // ready - DOTP/FINAL/DUALREAD_TEST via their own MX_RESULT state
+    // (unchanged), FUSED via the engine's own result_valid_o directly
+    // (no per-slot state left to check - see FUSED slot section above).
     //--------------------------------------------------------------------------
 
     always_comb begin
@@ -706,12 +867,21 @@ module mxdotp_xif
                     end
                 end
                 MX_SLOT_FUSED: begin
-                    if (fused_state_q == MX_RESULT) begin
+                    if (fused4_result_valid) begin
                         result_if.result_valid = 1'b1;
-                        result_if.result.id    = fused_saved_id;
-                        result_if.result.rd    = fused_saved_rd;
+                        result_if.result.id    = fused4_result_id;
+                        result_if.result.rd    = fused4_result_rd;
                         result_if.result.we    = 1'b1;
-                        result_if.result.data  = fused_result_data;
+                        result_if.result.data  = fused4_result_data;
+                    end
+                end
+                MX_SLOT_FUSED8: begin
+                    if (fused8_result_valid) begin
+                        result_if.result_valid = 1'b1;
+                        result_if.result.id    = fused8_result_id;
+                        result_if.result.rd    = fused8_result_rd;
+                        result_if.result.we    = 1'b1;
+                        result_if.result.data  = fused8_result_data;
                     end
                 end
                 default: ;  // result_valid stays 0

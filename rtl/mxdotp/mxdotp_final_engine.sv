@@ -31,6 +31,32 @@
 //   same cycle - this engine has no visibility into "is the mailbox valid",
 //   it just captures whatever is on p1_i/p2_i the cycle it is told to start.
 //
+//   MILESTONE (current): back-end pipelining for timing closure - see
+//   mxdotp_fused_engine.sv's matching milestone header for the full
+//   rationale (Vivado OOC synthesis measured this engine's own critical
+//   path at ~28.55ns against a 10ns target, the identical root cause: one
+//   unbroken combinational cloud from p1_q/p2_q/rs1_q/rs2_q all the way to
+//   result_data_q, because acc_to_fp32 was a single monolithic function
+//   with nowhere for a caller to put a register). This is "Option 2"
+//   (balanced) applied here exactly as in mxdotp_fused_engine.sv: what used
+//   to be one combinational stage (LATENCY_CYCLES-gated, but really just
+//   one cycle's worth of logic regardless of the counter value) is now
+//   THREE real stages:
+//     - BACK1: decode scales, place_in_acc x2 (contrib1, contrib2) +
+//       fp32_to_acc (acc_contrib), sum all three -> registers sum_q (the
+//       X|Y cut).
+//     - BACK2: mxdotp_pkg.sv's acc_find_lead (leading-one scan) on sum_q ->
+//       registers lead_q (the Y|Z cut - the single highest-leverage cut
+//       identified from Vivado's timing report).
+//     - BACK3: mxdotp_pkg.sv's acc_finalize (mantissa extract + sticky +
+//       round + clamp) on lead_q -> result_data_q.
+//   Each stage is a REAL single cycle now, not an artificial wait - the old
+//   LATENCY_CYCLES parameter is gone, replaced by the genuine 3-stage
+//   depth. Net latency: was LATENCY_CYCLES(2, placeholder wait around one
+//   real combinational cycle) -> now 3 (three REAL 1-cycle stages) - a net
+//   +1 cycle, not +3, since the old parameter was already "spending" one
+//   cycle on a wait that didn't correspond to real pipeline depth.
+//
 //   Applies scale_exp(a_scale,b_scale) to the captured p1 via place_in_acc
 //   (with the -2 exponent correction fp4_to_code's fixed-point convention
 //   needs - see mxdotp_pkg.sv) - always. Applies scale_exp(ar_scale,b_scale)
@@ -38,7 +64,8 @@
 //   no mask, since p2/AR is meaningful for every format that ever reaches
 //   this engine now. Brings in the old accumulator via fp32_to_acc, sums at
 //   full ACC_FULL_WIDTH precision (no intermediate narrowing), and performs
-//   the single final round-to-nearest-even via acc_to_fp32.
+//   the single final round-to-nearest-even across the BACK2/BACK3 split
+//   above.
 //==============================================================================
 
 module mxdotp_final_engine
@@ -52,10 +79,7 @@ module mxdotp_final_engine
     // header) and would work correctly at 32 too. No elaboration-time
     // guard needed here for that reason.
     parameter int X_RFR_WIDTH    = 64,
-    parameter int X_RFW_WIDTH    = 32,
-    parameter int LATENCY_CYCLES = 2   // must be >= 1; not yet re-tuned for the
-                                        // real datapath's actual critical path -
-                                        // correctness-first, timing later.
+    parameter int X_RFW_WIDTH    = 32
 )
 (
     input  logic                   clk_i,
@@ -82,47 +106,66 @@ module mxdotp_final_engine
   logic signed [PSUM_WIDTH-1:0] p1_q, p2_q;
 
   //----------------------------------------------------------------------------
-  // Latency counter / busy tracking
+  // Three-phase busy tracking: BACK1 (scale+accumulate) -> BACK2 (leading-
+  // one scan) -> BACK3 (mantissa/round/clamp) - see file header. Each is a
+  // REAL single cycle by construction; no counter needed (unlike this
+  // engine's previous single-phase LATENCY_CYCLES placeholder, now removed
+  // entirely since it no longer means anything true).
   //----------------------------------------------------------------------------
 
-  localparam int CNT_WIDTH = (LATENCY_CYCLES <= 1) ? 1 : $clog2(LATENCY_CYCLES + 1);
+  typedef enum logic [1:0] { FINAL_BACK1, FINAL_BACK2, FINAL_BACK3 } final_phase_e;
+  final_phase_e phase_q;
 
-  logic [CNT_WIDTH-1:0] cycle_cnt_q;
-  logic                 busy_q;
+  logic busy_q;
+
+  logic signed [ACC_FULL_WIDTH-1:0] sum_q;   // BACK1 -> BACK2 hand-off (NEW - the X|Y cut)
+  mx_lead_result_t                  lead_q;  // BACK2 -> BACK3 hand-off (NEW - the Y|Z cut)
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      busy_q      <= 1'b0;
-      cycle_cnt_q <= '0;
-      rs1_q       <= '0;
-      rs2_q       <= '0;
-      p1_q        <= '0;
-      p2_q        <= '0;
+      busy_q  <= 1'b0;
+      phase_q <= FINAL_BACK1;
+      rs1_q   <= '0;
+      rs2_q   <= '0;
+      p1_q    <= '0;
+      p2_q    <= '0;
+      sum_q   <= '0;
+      lead_q  <= '0;
     end else if (start_i && !busy_q) begin
-      busy_q      <= 1'b1;
-      cycle_cnt_q <= CNT_WIDTH'(LATENCY_CYCLES - 1);
-      rs1_q       <= rs1_i;
-      rs2_q       <= rs2_i;
-      p1_q        <= p1_i;
-      p2_q        <= p2_i;
-    end else if (busy_q) begin
-      if (cycle_cnt_q == '0)
-        busy_q <= 1'b0;
-      else
-        cycle_cnt_q <= cycle_cnt_q - 1'b1;
+      busy_q  <= 1'b1;
+      phase_q <= FINAL_BACK1;
+      rs1_q   <= rs1_i;
+      rs2_q   <= rs2_i;
+      p1_q    <= p1_i;
+      p2_q    <= p2_i;
+    end else if (busy_q && (phase_q == FINAL_BACK1)) begin
+      // X|Y cut: register the raw fixed-point sum before the leading-one
+      // scan runs on it.
+      sum_q   <= back1_sum_comb;
+      phase_q <= FINAL_BACK2;
+    end else if (busy_q && (phase_q == FINAL_BACK2)) begin
+      // Y|Z cut: register the leading-one scan's result before mantissa
+      // extraction/round/clamp run on it - the single highest-leverage cut
+      // identified from Vivado's timing report (see file header).
+      lead_q  <= back2_lead_comb;
+      phase_q <= FINAL_BACK3;
+    end else if (busy_q && (phase_q == FINAL_BACK3)) begin
+      busy_q <= 1'b0;
     end
   end
 
   assign busy_o = busy_q;
-  assign done_o = busy_q && (cycle_cnt_q == '0);
+  assign done_o = busy_q && (phase_q == FINAL_BACK3);
 
   //----------------------------------------------------------------------------
-  // Datapath: decode rs1_q=scales / rs2_q=old_acc, apply each scale pair to
+  // BACK1: decode rs1_q=scales / rs2_q=old_acc, apply each scale pair to
   // the captured p1_q/p2_q via place_in_acc, bring in the old accumulator
   // via fp32_to_acc, and sum at full ACC_FULL_WIDTH precision. p2/residue's
-  // contribution is now UNCONDITIONAL - no format check anywhere in this
+  // contribution is UNCONDITIONAL - no format check anywhere in this
   // engine - since only residue-style formats ever reach it post-split (see
-  // file header / mxdotp_pkg.sv's MX_SLOT_FUSED milestone header).
+  // file header / mxdotp_pkg.sv's MX_SLOT_FUSED milestone header). Feeds
+  // sum_q (the X|Y cut) rather than continuing straight into the leading-
+  // one scan.
   //----------------------------------------------------------------------------
 
   logic [7:0]  a_scale, ar_scale, b_scale;
@@ -133,11 +176,11 @@ module mxdotp_final_engine
   logic        p1_sign, p2_sign;
   logic [PSUM_WIDTH-1:0] p1_mag, p2_mag;  // same-width unsigned magnitude -
                                             // same reinterpret-via-assignment
-                                            // pattern acc_to_fp32 uses for `mag`
+                                            // pattern acc_finalize uses for `mag`
 
   logic signed [ACC_WIDTH-1:0]      contrib1, contrib2, acc_contrib;
   logic signed [ACC_FULL_WIDTH-1:0] contrib1_wide, contrib2_wide, acc_contrib_wide;
-  logic signed [ACC_FULL_WIDTH-1:0] final_sum_wide;
+  logic signed [ACC_FULL_WIDTH-1:0] back1_sum_comb;
 
   always_comb begin
     a_scale  = rs1_q[31:24];
@@ -166,15 +209,34 @@ module mxdotp_final_engine
     acc_contrib_wide = acc_contrib;
 
     // p2/residue's contribution is always included now - see header.
-    final_sum_wide = contrib1_wide + contrib2_wide + acc_contrib_wide;
+    back1_sum_comb = contrib1_wide + contrib2_wide + acc_contrib_wide;
   end
 
   //----------------------------------------------------------------------------
-  // Result data: latched into a register on the done_o edge, not exposed as
-  // a live combinational function of captured state - same discipline (and
-  // same original bug it avoids) as mxdotp_execute.sv's result_data_q used
-  // to follow.
+  // BACK2: leading-one scan (mxdotp_pkg.sv's acc_find_lead) on the
+  // registered sum. Feeds lead_q (the Y|Z cut) rather than continuing
+  // straight into mantissa extraction.
   //----------------------------------------------------------------------------
+
+  mx_lead_result_t back2_lead_comb;
+
+  always_comb begin
+    back2_lead_comb = acc_find_lead(sum_q);
+  end
+
+  //----------------------------------------------------------------------------
+  // BACK3: mantissa extraction + sticky + round + exponent clamp
+  // (mxdotp_pkg.sv's acc_finalize) on the registered leading-one-scan
+  // result. Result latched into result_data_q on the done_o edge, same
+  // discipline as before - never a live combinational function of captured
+  // state exposed on the output port.
+  //----------------------------------------------------------------------------
+
+  logic [31:0] back3_result_comb;
+
+  always_comb begin
+    back3_result_comb = acc_finalize(lead_q);
+  end
 
   logic [X_RFW_WIDTH-1:0] result_data_q;
 
@@ -182,7 +244,7 @@ module mxdotp_final_engine
     if (!rst_ni) begin
       result_data_q <= '0;
     end else if (done_o) begin
-      result_data_q <= acc_to_fp32(final_sum_wide);
+      result_data_q <= back3_result_comb;
     end
   end
 

@@ -11,15 +11,26 @@
 //                    current program but protocol-correct if that changes
 //     dut          - mxdotp_core_top.sv (cv32e40x_core + if_xif + mxdotp_xif)
 //
-//   Scoreboard tracks a single MXFUSED instruction (the fused fast path for
-//   PLAIN MX_FMT_MXFP4 - see mxdotp_pkg.sv's MX_SLOT_FUSED milestone header:
-//   rs1=A, rs2=B, rs3={scales,old_acc}, all three 64-bit dual-read, one
-//   instruction, writes rd directly), then a second, unrelated
-//   MX_FUNCT3_DUALREAD_TEST instruction (validation-only, not part of the
-//   real MXDOTP ISA - proves the core's dual-read mechanism in isolation),
-//   then an MXDOTP/MXFINAL pair exercising MX_FMT_MXFP4_RESIDUAL (k=16, with
-//   residue - the only format these two instructions serve any more,
-//   post-split), each through:
+//   Scoreboard tracks three back-to-back MXFUSED instructions (P, Q, R -
+//   the fused fast path for PLAIN MX_FMT_MXFP4, see mxdotp_pkg.sv's
+//   MX_SLOT_FUSED milestone header: rs1=A, rs2=B, rs3={scales,old_acc}, all
+//   three 64-bit dual-read, one instruction each, writes rd directly),
+//   issued with no gap between them specifically to exercise
+//   mxdotp_fused_engine.sv/mxdotp_xif.sv's overlap milestone - see
+//   instr_rom.sv's header for the full rationale and the exact math each
+//   one checks. Checked by PHASE (all three issues, then all three
+//   commits, then all three results, then all three writebacks) rather
+//   than end-to-end per instruction, since that's what actually requires
+//   them to be simultaneously in flight rather than merely three single-
+//   instruction tests run back-to-back in the program.
+//
+//   Then a fourth, unrelated MX_FUNCT3_DUALREAD_TEST instruction
+//   (validation-only, not part of the real MXDOTP ISA - proves the core's
+//   dual-read mechanism in isolation), then an MXDOTP/MXFINAL pair
+//   exercising MX_FMT_MXFP4_RESIDUAL (k=16, with residue - the only format
+//   these two instructions serve any more, post-split; still exactly one
+//   instruction of each kind outstanding at a time, unaffected by the
+//   overlap milestone), each through:
 //     Issue -> Commit -> Result -> Register file writeback
 //   reading expected id/operand/destination values hierarchically from
 //   u_instr_rom, so editing the program in instr_rom.sv keeps the checks in
@@ -41,7 +52,7 @@ module tb_mxdotp_core;
   //----------------------------------------------------------------------------
 
   localparam time         CLK_PERIOD      = 10ns;
-  localparam int unsigned TIMEOUT_CYCLES  = 500;
+  localparam int unsigned TIMEOUT_CYCLES  = 800;  // raised from 500 for the added Test 3 (MXFP8) program
 
   logic clk_i;
   logic rst_ni;
@@ -273,25 +284,39 @@ module tb_mxdotp_core;
   wire [4:0]  rf_waddr_wb_o = dut.core_i.rf_waddr_wb;
   wire [31:0] rf_wdata_wb_o = dut.core_i.rf_wdata_wb;
 
-  // Expected values for Test 1 (MXFUSED, MX_FMT_MXFP4) under test, read
-  // hierarchically from instr_rom.sv - edit the program there, not here.
-  // A/B/rs3 (={scales,old_acc}) are all 64-bit dual-read - see
-  // mxdotp_pkg.sv's MX_SLOT_FUSED milestone header. There is no AR operand
-  // in this instruction's encoding at all any more.
+  // Expected values for Test 1 (MXFUSED x3 back-to-back, P/Q/R, MX_FMT_MXFP4)
+  // under test, read hierarchically from instr_rom.sv - edit the program
+  // there, not here. A/B/rs3 (={scales,old_acc}) are all 64-bit dual-read -
+  // see mxdotp_pkg.sv's MX_SLOT_FUSED milestone header. There is no AR
+  // operand in this instruction's encoding at all any more.
+  //
+  // Three separate instructions now, not one - see instr_rom.sv's header
+  // for why: this is the overlap milestone's own test, specifically built
+  // so P/Q/R are simultaneously at different stages of
+  // mxdotp_fused_engine.sv's pipeline, not just three sequential single-
+  // instruction runs.
   wire [31:0] exp_fused_instr = u_instr_rom.INSTR_MXFUSED;
   wire [63:0] exp_fa_val      = u_instr_rom.A_VAL;
   wire [63:0] exp_fb_val      = u_instr_rom.B_VAL;
   wire [63:0] exp_frs3_val    = u_instr_rom.FRS3_VAL;
   wire [4:0]  exp_fused_rd    = u_instr_rom.REG_FRESULT;
-
-  // Hand-computed expected MXFUSED result (see instr_rom.sv header) - not
-  // yet golden-model-derived; this is a sanity vector (all-1.0 elements,
-  // unit scale, zero old accumulator -> 16.0), not the rigorous test suite.
-  // Cross-checked against a Python port of the exact bit-level algorithm.
-  // Same numeric result the old two-instruction MX_FMT_MXFP4 test used to
-  // check - this milestone changed how many instructions it takes to get
-  // there, not the arithmetic itself.
   wire [31:0] exp_fused_data  = u_instr_rom.MXFP4_FUSED_EXPECTED;
+
+  wire [31:0] exp_fused_q_instr = u_instr_rom.INSTR_MXFUSED_Q;
+  wire [63:0] exp_qa_val        = u_instr_rom.QA_VAL;
+  wire [63:0] exp_qb_val        = u_instr_rom.QB_VAL;
+  wire [63:0] exp_frs3_q_val    = u_instr_rom.FRS3_VAL;  // Q reuses P's rs3 registers - same value
+  wire [4:0]  exp_fused_q_rd    = u_instr_rom.REG_QRESULT;
+  wire [31:0] exp_fused_q_data  = u_instr_rom.MXFP4_FUSED_Q_EXPECTED;
+
+  wire [31:0] exp_fused_r_instr = u_instr_rom.INSTR_MXFUSED_R;
+  wire [63:0] exp_ra_val_ovl    = u_instr_rom.A_VAL;   // R reuses P's A registers - same value
+                                                         // (named _ovl to avoid clashing with the
+                                                         // residual test's own exp_ra_val below)
+  wire [63:0] exp_rb_val_ovl    = u_instr_rom.QB_VAL;  // R reuses Q's B registers - same value
+  wire [63:0] exp_rrs3_val      = u_instr_rom.RRS3_VAL;
+  wire [4:0]  exp_fused_r_rd    = u_instr_rom.REG_RRESULT;
+  wire [31:0] exp_fused_r_data  = u_instr_rom.MXFP4_FUSED_R_EXPECTED;
 
   // Dual-read validation test (MX_FUNCT3_DUALREAD_TEST) expected values - see
   // instr_rom.sv header for the full rationale.
@@ -312,10 +337,20 @@ module tb_mxdotp_core;
   wire [63:0] exp_rar_val      = u_instr_rom.RAR_VAL;
 
   wire [31:0] exp_rfinal_instr = u_instr_rom.INSTR_MXFINAL_RESIDUAL;
-  wire [4:0]  exp_rfinal_rd    = u_instr_rom.REG_RRESULT;
+  wire [4:0]  exp_rfinal_rd    = u_instr_rom.REG_RRESULT_FINAL;  // renamed in instr_rom.sv to
+                                                                    // avoid clashing with Test 1's
+                                                                    // own REG_RRESULT (R's rd)
   wire [31:0] exp_rscales      = u_instr_rom.RSCALES_VAL;
   wire [31:0] exp_rold_acc     = u_instr_rom.ROLD_ACC_VAL;
   wire [31:0] exp_rfinal_data  = u_instr_rom.MXFP4_RESIDUAL_EXPECTED;
+
+  // Test 3: MXFP8 (E4M3 S / E5M2 T) + MXFP4 (M), cross-engine overlap.
+  wire [4:0]  exp_f8s_rd    = u_instr_rom.REG_F8S_RESULT;   // x7
+  wire [31:0] exp_f8s_data  = u_instr_rom.MXFP8_S_EXPECTED;  // 10.5
+  wire [4:0]  exp_f4m_rd    = u_instr_rom.REG_F4M_RESULT;   // x8
+  wire [31:0] exp_f4m_data  = u_instr_rom.MXFP4_M_EXPECTED;  // 16.0
+  wire [4:0]  exp_f8t_rd    = u_instr_rom.REG_F8T_RESULT;   // x26
+  wire [31:0] exp_f8t_data  = u_instr_rom.MXFP8_T_EXPECTED;  // 8.0
 
   //----------------------------------------------------------------------------
   // Protocol assertion: once result_valid is asserted without being accepted
@@ -336,10 +371,18 @@ module tb_mxdotp_core;
   //----------------------------------------------------------------------------
 
   typedef enum logic [4:0] {
-    SB_WAIT_FUSED_ISSUE,
-    SB_WAIT_FUSED_COMMIT,
-    SB_WAIT_FUSED_RESULT,
-    SB_WAIT_FUSED_WB,
+    SB_WAIT_P_ISSUE,
+    SB_WAIT_Q_ISSUE,
+    SB_WAIT_R_ISSUE,
+    SB_WAIT_P_COMMIT,
+    SB_WAIT_Q_COMMIT,
+    SB_WAIT_R_COMMIT,
+    SB_WAIT_P_RESULT,
+    SB_WAIT_Q_RESULT,
+    SB_WAIT_R_RESULT,
+    SB_WAIT_P_WB,
+    SB_WAIT_Q_WB,
+    SB_WAIT_R_WB,
     SB_WAIT_DUALREAD_ISSUE,
     SB_WAIT_DUALREAD_COMMIT,
     SB_WAIT_DUALREAD_RESULT,
@@ -351,12 +394,15 @@ module tb_mxdotp_core;
     SB_WAIT_RFINAL_COMMIT,
     SB_WAIT_RFINAL_RESULT,
     SB_WAIT_RFINAL_WB,
+    SB_WAIT_F8S_WB,
+    SB_WAIT_F8M_WB,
+    SB_WAIT_F8T_WB,
     SB_DONE,
     SB_FAIL
   } sb_state_e;
 
   sb_state_e   sb_state;
-  logic [3:0]  expected_id;
+
   int unsigned pass_count;
   int unsigned fail_count;
 
@@ -365,11 +411,220 @@ module tb_mxdotp_core;
   string       sb_fail_msg;
 
   initial begin
-    sb_state            = SB_WAIT_FUSED_ISSUE;
+    sb_state            = SB_WAIT_P_ISSUE;
     pass_count          = 0;
     fail_count          = 0;
     sb_fail_this_cycle  = 1'b0;
     sb_fail_msg         = "";
+  end
+
+  //----------------------------------------------------------------------------
+  // P/Q/R (Test 1's overlap sequence) issue/commit/result capture -
+  // independent of sb_state, for exactly the same reason the RF writeback
+  // capture just below is independent of sb_state (see that section's own
+  // header, written for an entirely different race but describing the
+  // identical underlying problem).
+  //
+  // The first real overlap run exposed this precisely: P/Q/R issued
+  // correctly back-to-back (385000/395000/405000), but the scoreboard's
+  // first observed commit carried id=2 (R's) - P's and Q's own commits had
+  // already fired, unseen, while the scoreboard was still sequentially
+  // watching for ISSUE events, not COMMIT events. xif_commit_valid (and
+  // xif_result_valid) are transient, one-shot pulses on the XIF bus, same
+  // as rf_we_wb_o below - a scoreboard state that only watches for one
+  // while parked in a DIFFERENT state will silently miss it, and with true
+  // overlap, commits and results can legitimately arrive while the
+  // scoreboard is still processing an earlier phase (unlike the fully
+  // sequential single-instruction tests elsewhere in this file, where nothing
+  // else is happening concurrently to race against).
+  //
+  // Issue capture is matched by INSTRUCTION WORD (P/Q/R's are distinct),
+  // continuously, per instruction - safe because a single-issue in-order
+  // core cannot present them out of program order regardless of timing.
+  //
+  // Commit and result capture are POSITIONAL instead (the 1st/2nd/3rd
+  // commit_valid, or result_valid&&result_ready, pulse observed anywhere in
+  // the program) - deliberately NOT id-matched like issue: matching by id
+  // would make it impossible to ever notice if the DUT delivered them out
+  // of order, since each id-matched latch would just fire whenever its own
+  // id eventually appeared, however late. Positional capture, cross-checked
+  // against each instruction's own issue-captured id in the polling states
+  // further down, is what keeps the "commits/results must arrive in P,Q,R
+  // program order" property actually checked, not just assumed. Capture
+  // stops after 3 (idx==3) - later tests in this program use the ordinary
+  // live single-instruction watching pattern in their own untouched states,
+  // unaffected by this.
+  //----------------------------------------------------------------------------
+
+  logic        p_issue_seen_q, q_issue_seen_q, r_issue_seen_q;
+  logic [3:0]  p_issue_id_q,   q_issue_id_q,   r_issue_id_q;
+  logic [63:0] p_issue_a_q,    q_issue_a_q,    r_issue_a_q;
+  logic [63:0] p_issue_b_q,    q_issue_b_q,    r_issue_b_q;
+  logic [63:0] p_issue_rs3_q,  q_issue_rs3_q,  r_issue_rs3_q;
+  logic        p_issue_accept_q, q_issue_accept_q, r_issue_accept_q;
+  logic        p_issue_wb_q,     q_issue_wb_q,     r_issue_wb_q;
+  logic        p_issue_dr_q,     q_issue_dr_q,     r_issue_dr_q;
+  time         p_issue_time_q,   q_issue_time_q,   r_issue_time_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      p_issue_seen_q <= 1'b0; q_issue_seen_q <= 1'b0; r_issue_seen_q <= 1'b0;
+      p_issue_id_q <= '0; q_issue_id_q <= '0; r_issue_id_q <= '0;
+      p_issue_a_q <= '0; q_issue_a_q <= '0; r_issue_a_q <= '0;
+      p_issue_b_q <= '0; q_issue_b_q <= '0; r_issue_b_q <= '0;
+      p_issue_rs3_q <= '0; q_issue_rs3_q <= '0; r_issue_rs3_q <= '0;
+      p_issue_accept_q <= 1'b0; q_issue_accept_q <= 1'b0; r_issue_accept_q <= 1'b0;
+      p_issue_wb_q <= 1'b0; q_issue_wb_q <= 1'b0; r_issue_wb_q <= 1'b0;
+      p_issue_dr_q <= 1'b0; q_issue_dr_q <= 1'b0; r_issue_dr_q <= 1'b0;
+      p_issue_time_q <= '0; q_issue_time_q <= '0; r_issue_time_q <= '0;
+    end else begin
+      if (!p_issue_seen_q && xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_fused_instr)) begin
+        p_issue_seen_q   <= 1'b1;
+        p_issue_id_q     <= xif_issue_id;
+        p_issue_a_q      <= xif_issue_rs0_wide;
+        p_issue_b_q      <= xif_issue_rs1_wide;
+        p_issue_rs3_q    <= xif_issue_rs2_wide;
+        p_issue_accept_q <= xif_issue_accept;
+        p_issue_wb_q     <= xif_issue_wb;
+        p_issue_dr_q     <= xif_issue_dr;
+        p_issue_time_q   <= $time;
+      end
+      if (!q_issue_seen_q && xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_fused_q_instr)) begin
+        q_issue_seen_q   <= 1'b1;
+        q_issue_id_q     <= xif_issue_id;
+        q_issue_a_q      <= xif_issue_rs0_wide;
+        q_issue_b_q      <= xif_issue_rs1_wide;
+        q_issue_rs3_q    <= xif_issue_rs2_wide;
+        q_issue_accept_q <= xif_issue_accept;
+        q_issue_wb_q     <= xif_issue_wb;
+        q_issue_dr_q     <= xif_issue_dr;
+        q_issue_time_q   <= $time;
+      end
+      if (!r_issue_seen_q && xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_fused_r_instr)) begin
+        r_issue_seen_q   <= 1'b1;
+        r_issue_id_q     <= xif_issue_id;
+        r_issue_a_q      <= xif_issue_rs0_wide;
+        r_issue_b_q      <= xif_issue_rs1_wide;
+        r_issue_rs3_q    <= xif_issue_rs2_wide;
+        r_issue_accept_q <= xif_issue_accept;
+        r_issue_wb_q     <= xif_issue_wb;
+        r_issue_dr_q     <= xif_issue_dr;
+        r_issue_time_q   <= $time;
+      end
+    end
+  end
+
+  // Depth 6: P, Q, R, DUALREAD_TEST, RDOTP, RFINAL - every offloaded
+  // instruction in the program, not just the three FUSED ones. Originally
+  // this stopped at 3, with the downstream tests still watching live
+  // signals from their own states - but the overlap run showed the DUT
+  // free-runs far ahead of this scoreboard (which burns one cycle per
+  // polling state), so the DUALREAD/RDOTP/RFINAL pulses can also fire
+  // while the scoreboard is still chewing through earlier phases. Same
+  // missed-pulse race, same fix: capture everything continuously,
+  // positionally, and let the states poll at their own pace.
+  localparam int SB_NUM_OFFLOADS = 6;
+  logic [2:0] commit_capture_idx_q;  // 0..6; saturates at SB_NUM_OFFLOADS
+  logic [3:0] commit_capture_id_q   [0:SB_NUM_OFFLOADS-1];
+  logic       commit_capture_kill_q [0:SB_NUM_OFFLOADS-1];
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      commit_capture_idx_q <= 3'd0;
+      for (int ci = 0; ci < SB_NUM_OFFLOADS; ci++) begin
+        commit_capture_id_q[ci]   <= '0;
+        commit_capture_kill_q[ci] <= 1'b0;
+      end
+    end else if ((commit_capture_idx_q < 3'(SB_NUM_OFFLOADS)) && xif_commit_valid) begin
+      commit_capture_id_q[commit_capture_idx_q]   <= xif_commit_id;
+      commit_capture_kill_q[commit_capture_idx_q] <= xif_commit_kill;
+      commit_capture_idx_q <= commit_capture_idx_q + 3'd1;
+    end
+  end
+
+  logic [2:0]  result_capture_idx_q;  // 0..6; saturates at SB_NUM_OFFLOADS
+  logic [3:0]  result_capture_id_q   [0:SB_NUM_OFFLOADS-1];
+  logic [4:0]  result_capture_rd_q   [0:SB_NUM_OFFLOADS-1];
+  logic [31:0] result_capture_data_q [0:SB_NUM_OFFLOADS-1];
+  logic        result_capture_we_q   [0:SB_NUM_OFFLOADS-1];
+  time         result_capture_time_q [0:SB_NUM_OFFLOADS-1];
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      result_capture_idx_q <= 3'd0;
+      for (int ri = 0; ri < SB_NUM_OFFLOADS; ri++) begin
+        result_capture_id_q[ri]   <= '0;
+        result_capture_rd_q[ri]   <= '0;
+        result_capture_data_q[ri] <= '0;
+        result_capture_we_q[ri]   <= 1'b0;
+        result_capture_time_q[ri] <= '0;
+      end
+    end else if ((result_capture_idx_q < 3'(SB_NUM_OFFLOADS)) && xif_result_valid && xif_result_ready) begin
+      result_capture_id_q[result_capture_idx_q]   <= xif_result_id;
+      result_capture_rd_q[result_capture_idx_q]   <= xif_result_rd;
+      result_capture_data_q[result_capture_idx_q] <= xif_result_data;
+      result_capture_we_q[result_capture_idx_q]   <= xif_result_we;
+      result_capture_time_q[result_capture_idx_q] <= $time;
+      result_capture_idx_q <= result_capture_idx_q + 3'd1;
+    end
+  end
+
+  // Issue captures for the three downstream tests - same instruction-word-
+  // matched, always-on pattern as P/Q/R's above, and needed for exactly the
+  // same reason (see the depth-6 comment on the commit capture above).
+  logic        dr_issue_seen_q, rdotp_issue_seen_q, rfinal_issue_seen_q;
+  logic [3:0]  dr_issue_id_q,   rdotp_issue_id_q,   rfinal_issue_id_q;
+  logic [63:0] dr_issue_rs1w_q;
+  logic [63:0] rdotp_issue_a_q, rdotp_issue_b_q, rdotp_issue_ar_q;
+  logic [31:0] rfinal_issue_scales_q, rfinal_issue_oldacc_q;
+  logic        dr_issue_accept_q, rdotp_issue_accept_q, rfinal_issue_accept_q;
+  logic        dr_issue_wb_q,     rdotp_issue_wb_q,     rfinal_issue_wb_q;
+  logic        dr_issue_dr_q,     rdotp_issue_dr_q,     rfinal_issue_dr_q;
+  time         dr_issue_time_q,   rdotp_issue_time_q,   rfinal_issue_time_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      dr_issue_seen_q <= 1'b0; rdotp_issue_seen_q <= 1'b0; rfinal_issue_seen_q <= 1'b0;
+      dr_issue_id_q <= '0; rdotp_issue_id_q <= '0; rfinal_issue_id_q <= '0;
+      dr_issue_rs1w_q <= '0;
+      rdotp_issue_a_q <= '0; rdotp_issue_b_q <= '0; rdotp_issue_ar_q <= '0;
+      rfinal_issue_scales_q <= '0; rfinal_issue_oldacc_q <= '0;
+      dr_issue_accept_q <= 1'b0; rdotp_issue_accept_q <= 1'b0; rfinal_issue_accept_q <= 1'b0;
+      dr_issue_wb_q <= 1'b0; rdotp_issue_wb_q <= 1'b0; rfinal_issue_wb_q <= 1'b0;
+      dr_issue_dr_q <= 1'b0; rdotp_issue_dr_q <= 1'b0; rfinal_issue_dr_q <= 1'b0;
+      dr_issue_time_q <= '0; rdotp_issue_time_q <= '0; rfinal_issue_time_q <= '0;
+    end else begin
+      if (!dr_issue_seen_q && xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_dualread_instr)) begin
+        dr_issue_seen_q   <= 1'b1;
+        dr_issue_id_q     <= xif_issue_id;
+        dr_issue_rs1w_q   <= xif_issue_rs0_wide;
+        dr_issue_accept_q <= xif_issue_accept;
+        dr_issue_wb_q     <= xif_issue_wb;
+        dr_issue_dr_q     <= xif_issue_dr;
+        dr_issue_time_q   <= $time;
+      end
+      if (!rdotp_issue_seen_q && xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_rdotp_instr)) begin
+        rdotp_issue_seen_q   <= 1'b1;
+        rdotp_issue_id_q     <= xif_issue_id;
+        rdotp_issue_a_q      <= xif_issue_rs0_wide;
+        rdotp_issue_b_q      <= xif_issue_rs1_wide;
+        rdotp_issue_ar_q     <= xif_issue_rs2_wide;
+        rdotp_issue_accept_q <= xif_issue_accept;
+        rdotp_issue_wb_q     <= xif_issue_wb;
+        rdotp_issue_dr_q     <= xif_issue_dr;
+        rdotp_issue_time_q   <= $time;
+      end
+      if (!rfinal_issue_seen_q && xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_rfinal_instr)) begin
+        rfinal_issue_seen_q   <= 1'b1;
+        rfinal_issue_id_q     <= xif_issue_id;
+        rfinal_issue_scales_q <= xif_issue_rs0;
+        rfinal_issue_oldacc_q <= xif_issue_rs1;
+        rfinal_issue_accept_q <= xif_issue_accept;
+        rfinal_issue_wb_q     <= xif_issue_wb;
+        rfinal_issue_dr_q     <= xif_issue_dr;
+        rfinal_issue_time_q   <= $time;
+      end
+    end
   end
 
   //----------------------------------------------------------------------------
@@ -444,6 +699,99 @@ module tb_mxdotp_core;
     end
   end
 
+  // Fourth and fifth instances of the same latch pattern, for Q's and R's destination
+  // registers (Test 1's back-to-back MXFUSED overlap test - see instr_rom.sv header).
+  // Same rationale as wb_seen2_q/wb_seen3_q above, and doubly important here: P/Q/R can
+  // be simultaneously in flight, so each one's writeback genuinely needs its own
+  // independent, decoupled capture - reusing one latch across overlapping instructions
+  // would be exactly the aliasing hazard this pattern exists to avoid.
+  logic        wb_seen4_q;
+  logic [31:0] wb_data4_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen4_q <= 1'b0;
+      wb_data4_q <= '0;
+    end else if (!wb_seen4_q && rf_we_wb_o && (rf_waddr_wb_o == exp_fused_q_rd)) begin
+      wb_seen4_q <= 1'b1;
+      wb_data4_q <= rf_wdata_wb_o;
+    end
+  end
+
+  logic        wb_seen5_q;
+  logic [31:0] wb_data5_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen5_q <= 1'b0;
+      wb_data5_q <= '0;
+    end else if (!wb_seen5_q && rf_we_wb_o && (rf_waddr_wb_o == exp_fused_r_rd)) begin
+      wb_seen5_q <= 1'b1;
+      wb_data5_q <= rf_wdata_wb_o;
+    end
+  end
+
+  // Sixth/seventh/eighth latch instances - Test 3's S (MXFP8 E4M3), M (MXFP4)
+  // and T (MXFP8 E5M2) destinations. Same decoupled-per-instruction rationale
+  // as the P/Q/R latches above; S/M/T can be simultaneously in flight across
+  // the two fused engines, so each needs its own independent capture.
+  logic        wb_seen6_q;  logic [31:0] wb_data6_q;
+  logic        wb_seen7_q;  logic [31:0] wb_data7_q;
+  logic        wb_seen8_q;  logic [31:0] wb_data8_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen6_q <= 1'b0; wb_data6_q <= '0;
+    end else if (!wb_seen6_q && rf_we_wb_o && (rf_waddr_wb_o == exp_f8s_rd)) begin
+      wb_seen6_q <= 1'b1; wb_data6_q <= rf_wdata_wb_o;
+    end
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen7_q <= 1'b0; wb_data7_q <= '0;
+    end else if (!wb_seen7_q && rf_we_wb_o && (rf_waddr_wb_o == exp_f4m_rd)) begin
+      wb_seen7_q <= 1'b1; wb_data7_q <= rf_wdata_wb_o;
+    end
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen8_q <= 1'b0; wb_data8_q <= '0;
+    end else if (!wb_seen8_q && rf_we_wb_o && (rf_waddr_wb_o == exp_f8t_rd)) begin
+      wb_seen8_q <= 1'b1; wb_data8_q <= rf_wdata_wb_o;
+    end
+  end
+
+  //----------------------------------------------------------------------------
+  // Cross-engine ordering monitor (Test 3). S/M/T issue back-to-back in that
+  // program order but run on two different engines (S,T -> fp8; M -> fp4)
+  // concurrently. The two-slot order queue must still retire their writebacks
+  // in program order: S (x7), then M (x8), then T (x26). Because those three
+  // destination registers are written ONLY by S/M/T (no load targets them),
+  // watching every rf_we_wb_o to one of them yields exactly the delivery
+  // sequence - any out-of-order retirement sets f8_ord_bad, checked at the end.
+  //----------------------------------------------------------------------------
+  typedef enum logic [1:0] { F8ORD_S, F8ORD_M, F8ORD_T, F8ORD_DONE } f8_ord_e;
+  f8_ord_e f8_ord_q;
+  logic    f8_ord_bad;
+
+  wire f8_wb_hit = rf_we_wb_o && ((rf_waddr_wb_o == exp_f8s_rd) ||
+                                  (rf_waddr_wb_o == exp_f4m_rd) ||
+                                  (rf_waddr_wb_o == exp_f8t_rd));
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      f8_ord_q   <= F8ORD_S;
+      f8_ord_bad <= 1'b0;
+    end else if (f8_wb_hit) begin
+      unique case (f8_ord_q)
+        F8ORD_S: if (rf_waddr_wb_o == exp_f8s_rd) f8_ord_q <= F8ORD_M; else f8_ord_bad <= 1'b1;
+        F8ORD_M: if (rf_waddr_wb_o == exp_f4m_rd) f8_ord_q <= F8ORD_T; else f8_ord_bad <= 1'b1;
+        F8ORD_T: if (rf_waddr_wb_o == exp_f8t_rd) f8_ord_q <= F8ORD_DONE; else f8_ord_bad <= 1'b1;
+        default: f8_ord_bad <= 1'b1;  // an extra write to one of these after all three - unexpected
+      endcase
+    end
+  end
+
   task automatic sb_fail(string msg);
     $display("[%0t] FAIL: %s", $time, msg);
     fail_count++;
@@ -453,7 +801,7 @@ module tb_mxdotp_core;
 
   always_ff @(posedge clk_i) begin
     if (!rst_ni) begin
-      sb_state <= SB_WAIT_FUSED_ISSUE;
+      sb_state <= SB_WAIT_P_ISSUE;
     end else begin
       // If a failure was flagged this cycle, transition to SB_FAIL and hold.
       if (sb_fail_this_cycle) begin
@@ -462,70 +810,235 @@ module tb_mxdotp_core;
         unique case (sb_state)
 
         //----------------------------------------------------------------
-        // MXFUSED (MX_FMT_MXFP4, plain fast path): rs1=A, rs2=B, rs3=
-        // {scales,old_acc} - ALL THREE 64-bit dual-read (see mxdotp_pkg.sv's
-        // MX_SLOT_FUSED milestone header). One instruction, one
-        // Issue->Commit->Result round trip, writes rd directly - no second
-        // instruction, no mailbox, no AR operand to check at all.
+        // MXFUSED x3 back-to-back (P, Q, R) - the overlap milestone's own
+        // test (see instr_rom.sv header). Structured by PHASE, not by
+        // instruction: all three ISSUEs are checked first, then all three
+        // COMMITs, then all three RESULTs, then all three WBs - unlike
+        // every other test in this file, which fully completes one
+        // instruction's issue->commit->result->wb before starting the
+        // next. That's deliberate: this phase-interleaved structure is
+        // what actually requires Q to be issued while P is still mid-
+        // flight, rather than merely running three single-instruction
+        // tests back-to-back in the program (which would prove nothing
+        // new about overlap - see instr_rom.sv's header for why the old
+        // single-instruction test doesn't exercise this at all).
+        //
+        // Every state below POLLS an already-captured latch (declared
+        // earlier, alongside the RF writeback capture) rather than watching
+        // a live XIF signal directly - the first real overlap run showed
+        // why that distinction matters: with true overlap, P's/Q's own
+        // commit can arrive while the scoreboard is still working through
+        // an EARLIER phase, and a transient pulse not watched for at the
+        // moment it fires is simply gone. See that capture section's own
+        // header for the full story.
         //----------------------------------------------------------------
 
-        SB_WAIT_FUSED_ISSUE: begin
-          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_fused_instr)) begin
-            if (!xif_issue_accept) begin
-              sb_fail("MXFUSED instruction was not accepted at issue");
-            end else if (!xif_issue_wb) begin
-              sb_fail("MXFUSED issue_resp.writeback was not asserted");
-            end else if (!xif_issue_dr) begin
-              sb_fail("MXFUSED issue_resp.dualread was not asserted");
-            end else if ((xif_issue_rs0_wide !== exp_fa_val) || (xif_issue_rs1_wide !== exp_fb_val) || (xif_issue_rs2_wide !== exp_frs3_val)) begin
-              sb_fail($sformatf("MXFUSED operand mismatch at issue: A=0x%0h B=0x%0h RS3=0x%0h (expected 0x%0h,0x%0h,0x%0h)",
-                                 xif_issue_rs0_wide, xif_issue_rs1_wide, xif_issue_rs2_wide, exp_fa_val, exp_fb_val, exp_frs3_val));
+        SB_WAIT_P_ISSUE: begin
+          if (p_issue_seen_q) begin
+            if (!p_issue_accept_q) begin
+              sb_fail("MXFUSED(P) instruction was not accepted at issue");
+            end else if (!p_issue_wb_q) begin
+              sb_fail("MXFUSED(P) issue_resp.writeback was not asserted");
+            end else if (!p_issue_dr_q) begin
+              sb_fail("MXFUSED(P) issue_resp.dualread was not asserted");
+            end else if ((p_issue_a_q !== exp_fa_val) || (p_issue_b_q !== exp_fb_val) || (p_issue_rs3_q !== exp_frs3_val)) begin
+              sb_fail($sformatf("MXFUSED(P) operand mismatch at issue: A=0x%0h B=0x%0h RS3=0x%0h (expected 0x%0h,0x%0h,0x%0h)",
+                                 p_issue_a_q, p_issue_b_q, p_issue_rs3_q, exp_fa_val, exp_fb_val, exp_frs3_val));
             end else begin
-              expected_id <= xif_issue_id;
-              $display("[%0t] FUSED ISSUE  ok: id=%0d A=0x%0h B=0x%0h RS3=0x%0h",
-                        $time, xif_issue_id, xif_issue_rs0_wide, xif_issue_rs1_wide, xif_issue_rs2_wide);
-              sb_state <= SB_WAIT_FUSED_COMMIT;
+              $display("[%0t] FUSED(P) ISSUE  ok: id=%0d A=0x%0h B=0x%0h RS3=0x%0h",
+                        p_issue_time_q, p_issue_id_q, p_issue_a_q, p_issue_b_q, p_issue_rs3_q);
+              sb_state <= SB_WAIT_Q_ISSUE;
             end
           end
         end
 
-        SB_WAIT_FUSED_COMMIT: begin
-          if (xif_commit_valid) begin
-            if (xif_commit_id !== expected_id) begin
-              sb_fail($sformatf("MXFUSED commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
-            end else if (xif_commit_kill) begin
-              sb_fail("MXFUSED instruction was killed at commit (unexpected for this program)");
+        SB_WAIT_Q_ISSUE: begin
+          if (q_issue_seen_q) begin
+            if (!q_issue_accept_q) begin
+              sb_fail("MXFUSED(Q) instruction was not accepted at issue - check MX_FUSED_PENDING_DEPTH/issue_ready if this fires");
+            end else if (!q_issue_wb_q) begin
+              sb_fail("MXFUSED(Q) issue_resp.writeback was not asserted");
+            end else if (!q_issue_dr_q) begin
+              sb_fail("MXFUSED(Q) issue_resp.dualread was not asserted");
+            end else if ((q_issue_a_q !== exp_qa_val) || (q_issue_b_q !== exp_qb_val) || (q_issue_rs3_q !== exp_frs3_q_val)) begin
+              sb_fail($sformatf("MXFUSED(Q) operand mismatch at issue: A=0x%0h B=0x%0h RS3=0x%0h (expected 0x%0h,0x%0h,0x%0h)",
+                                 q_issue_a_q, q_issue_b_q, q_issue_rs3_q, exp_qa_val, exp_qb_val, exp_frs3_q_val));
             end else begin
-              $display("[%0t] FUSED COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
-              sb_state <= SB_WAIT_FUSED_RESULT;
+              $display("[%0t] FUSED(Q) ISSUE  ok: id=%0d A=0x%0h B=0x%0h RS3=0x%0h",
+                        q_issue_time_q, q_issue_id_q, q_issue_a_q, q_issue_b_q, q_issue_rs3_q);
+              sb_state <= SB_WAIT_R_ISSUE;
             end
           end
         end
 
-        SB_WAIT_FUSED_RESULT: begin
-          if (xif_result_valid && xif_result_ready) begin
-            if (xif_result_id !== expected_id) begin
-              sb_fail($sformatf("MXFUSED result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
-            end else if (xif_result_rd !== exp_fused_rd) begin
-              sb_fail($sformatf("MXFUSED result rd mismatch: got %0d expected %0d", xif_result_rd, exp_fused_rd));
-            end else if (!xif_result_we) begin
-              sb_fail("MXFUSED result.we was not asserted");
-            end else if (xif_result_data !== exp_fused_data) begin
-              sb_fail($sformatf("MXFUSED result.data unexpected: got 0x%0h, expected 0x%0h", xif_result_data, exp_fused_data));
+        SB_WAIT_R_ISSUE: begin
+          if (r_issue_seen_q) begin
+            if (!r_issue_accept_q) begin
+              sb_fail("MXFUSED(R) instruction was not accepted at issue - check MX_FUSED_PENDING_DEPTH/issue_ready if this fires");
+            end else if (!r_issue_wb_q) begin
+              sb_fail("MXFUSED(R) issue_resp.writeback was not asserted");
+            end else if (!r_issue_dr_q) begin
+              sb_fail("MXFUSED(R) issue_resp.dualread was not asserted");
+            end else if ((r_issue_a_q !== exp_ra_val_ovl) || (r_issue_b_q !== exp_rb_val_ovl) || (r_issue_rs3_q !== exp_rrs3_val)) begin
+              sb_fail($sformatf("MXFUSED(R) operand mismatch at issue: A=0x%0h B=0x%0h RS3=0x%0h (expected 0x%0h,0x%0h,0x%0h)",
+                                 r_issue_a_q, r_issue_b_q, r_issue_rs3_q, exp_ra_val_ovl, exp_rb_val_ovl, exp_rrs3_val));
             end else begin
-              $display("[%0t] FUSED RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
-                        $time, xif_result_id, xif_result_rd, xif_result_data, xif_result_we);
-              sb_state <= SB_WAIT_FUSED_WB;
+              $display("[%0t] FUSED(R) ISSUE  ok: id=%0d A=0x%0h B=0x%0h RS3=0x%0h",
+                        r_issue_time_q, r_issue_id_q, r_issue_a_q, r_issue_b_q, r_issue_rs3_q);
+              sb_state <= SB_WAIT_P_COMMIT;
             end
           end
         end
 
-        SB_WAIT_FUSED_WB: begin
+        // Commit capture (declared earlier, alongside issue/result capture)
+        // is POSITIONAL (1st/2nd/3rd commit_valid pulse seen anywhere),
+        // cross-checked here against each instruction's own issue-captured
+        // id - that comparison is what keeps "commits must arrive in P,Q,R
+        // program order" a real, checked property rather than an assumption.
+
+        SB_WAIT_P_COMMIT: begin
+          if (commit_capture_idx_q > 2'd0) begin
+            if (commit_capture_id_q[0] !== p_issue_id_q) begin
+              sb_fail($sformatf("MXFUSED(P) commit id mismatch: got %0d expected %0d - commits must arrive in P,Q,R program order", commit_capture_id_q[0], p_issue_id_q));
+            end else if (commit_capture_kill_q[0]) begin
+              sb_fail("MXFUSED(P) instruction was killed at commit (unexpected for this program)");
+            end else begin
+              $display("[%0t] FUSED(P) COMMIT ok: id=%0d, commit_kill=0", $time, commit_capture_id_q[0]);
+              sb_state <= SB_WAIT_Q_COMMIT;
+            end
+          end
+        end
+
+        SB_WAIT_Q_COMMIT: begin
+          if (commit_capture_idx_q > 2'd1) begin
+            if (commit_capture_id_q[1] !== q_issue_id_q) begin
+              sb_fail($sformatf("MXFUSED(Q) commit id mismatch: got %0d expected %0d - commits must arrive in P,Q,R program order", commit_capture_id_q[1], q_issue_id_q));
+            end else if (commit_capture_kill_q[1]) begin
+              sb_fail("MXFUSED(Q) instruction was killed at commit (unexpected for this program)");
+            end else begin
+              $display("[%0t] FUSED(Q) COMMIT ok: id=%0d, commit_kill=0", $time, commit_capture_id_q[1]);
+              sb_state <= SB_WAIT_R_COMMIT;
+            end
+          end
+        end
+
+        SB_WAIT_R_COMMIT: begin
+          if (commit_capture_idx_q > 2'd2) begin
+            if (commit_capture_id_q[2] !== r_issue_id_q) begin
+              sb_fail($sformatf("MXFUSED(R) commit id mismatch: got %0d expected %0d - commits must arrive in P,Q,R program order", commit_capture_id_q[2], r_issue_id_q));
+            end else if (commit_capture_kill_q[2]) begin
+              sb_fail("MXFUSED(R) instruction was killed at commit (unexpected for this program)");
+            end else begin
+              $display("[%0t] FUSED(R) COMMIT ok: id=%0d, commit_kill=0", $time, commit_capture_id_q[2]);
+              sb_state <= SB_WAIT_P_RESULT;
+            end
+          end
+        end
+
+        // Results (and WBs below) MUST arrive in P, Q, R order - the shared
+        // order queue enforces program order regardless of which of the
+        // three actually finished computing first inside the engine (see
+        // mxdotp_xif.sv's milestone header) - so checking them in this
+        // fixed sequence is itself a real check, not just a convenient
+        // structure: if the engine or the order queue ever delivered them
+        // out of order, the id check below would catch it immediately
+        // (xif_result_id would be Q's or R's id when P's is still expected).
+
+        SB_WAIT_P_RESULT: begin
+          if (result_capture_idx_q > 2'd0) begin
+            if (result_capture_id_q[0] !== p_issue_id_q) begin
+              sb_fail($sformatf("MXFUSED(P) result id mismatch: got %0d expected %0d - results must arrive in P,Q,R program order", result_capture_id_q[0], p_issue_id_q));
+            end else if (result_capture_rd_q[0] !== exp_fused_rd) begin
+              sb_fail($sformatf("MXFUSED(P) result rd mismatch: got %0d expected %0d", result_capture_rd_q[0], exp_fused_rd));
+            end else if (!result_capture_we_q[0]) begin
+              sb_fail("MXFUSED(P) result.we was not asserted");
+            end else if (result_capture_data_q[0] !== exp_fused_data) begin
+              sb_fail($sformatf("MXFUSED(P) result.data unexpected: got 0x%0h, expected 0x%0h", result_capture_data_q[0], exp_fused_data));
+            end else begin
+              $display("[%0t] FUSED(P) RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
+                        result_capture_time_q[0], result_capture_id_q[0], result_capture_rd_q[0], result_capture_data_q[0], result_capture_we_q[0]);
+              sb_state <= SB_WAIT_Q_RESULT;
+            end
+          end
+        end
+
+        SB_WAIT_Q_RESULT: begin
+          if (result_capture_idx_q > 2'd1) begin
+            if (result_capture_id_q[1] !== q_issue_id_q) begin
+              sb_fail($sformatf("MXFUSED(Q) result id mismatch: got %0d expected %0d - results must arrive in P,Q,R program order", result_capture_id_q[1], q_issue_id_q));
+            end else if (result_capture_rd_q[1] !== exp_fused_q_rd) begin
+              sb_fail($sformatf("MXFUSED(Q) result rd mismatch: got %0d expected %0d", result_capture_rd_q[1], exp_fused_q_rd));
+            end else if (!result_capture_we_q[1]) begin
+              sb_fail("MXFUSED(Q) result.we was not asserted");
+            end else if (result_capture_data_q[1] !== exp_fused_q_data) begin
+              sb_fail($sformatf("MXFUSED(Q) result.data unexpected: got 0x%0h, expected 0x%0h", result_capture_data_q[1], exp_fused_q_data));
+            end else begin
+              $display("[%0t] FUSED(Q) RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
+                        result_capture_time_q[1], result_capture_id_q[1], result_capture_rd_q[1], result_capture_data_q[1], result_capture_we_q[1]);
+              sb_state <= SB_WAIT_R_RESULT;
+            end
+          end
+        end
+
+        SB_WAIT_R_RESULT: begin
+          if (result_capture_idx_q > 2'd2) begin
+            if (result_capture_id_q[2] !== r_issue_id_q) begin
+              sb_fail($sformatf("MXFUSED(R) result id mismatch: got %0d expected %0d - results must arrive in P,Q,R program order", result_capture_id_q[2], r_issue_id_q));
+            end else if (result_capture_rd_q[2] !== exp_fused_r_rd) begin
+              sb_fail($sformatf("MXFUSED(R) result rd mismatch: got %0d expected %0d", result_capture_rd_q[2], exp_fused_r_rd));
+            end else if (!result_capture_we_q[2]) begin
+              sb_fail("MXFUSED(R) result.we was not asserted");
+            end else if (result_capture_data_q[2] !== exp_fused_r_data) begin
+              sb_fail($sformatf("MXFUSED(R) result.data unexpected: got 0x%0h, expected 0x%0h", result_capture_data_q[2], exp_fused_r_data));
+            end else begin
+              $display("[%0t] FUSED(R) RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
+                        result_capture_time_q[2], result_capture_id_q[2], result_capture_rd_q[2], result_capture_data_q[2], result_capture_we_q[2]);
+              sb_state <= SB_WAIT_P_WB;
+            end
+          end
+        end
+
+        SB_WAIT_P_WB: begin
           if (wb_seen_q) begin
             if (wb_data_q !== exp_fused_data) begin
               sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_fused_rd, wb_data_q, exp_fused_data));
             end else begin
-              $display("[%0t] FUSED WB     ok: x%0d <= 0x%0h", $time, exp_fused_rd, wb_data_q);
+              $display("[%0t] FUSED(P) WB     ok: x%0d <= 0x%0h", $time, exp_fused_rd, wb_data_q);
+              sb_state <= SB_WAIT_Q_WB;
+            end
+          end
+        end
+
+        SB_WAIT_Q_WB: begin
+          if (wb_seen4_q) begin
+            if (wb_data4_q !== exp_fused_q_data) begin
+              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_fused_q_rd, wb_data4_q, exp_fused_q_data));
+            end else begin
+              $display("[%0t] FUSED(Q) WB     ok: x%0d <= 0x%0h", $time, exp_fused_q_rd, wb_data4_q);
+              sb_state <= SB_WAIT_R_WB;
+            end
+          end
+        end
+
+        SB_WAIT_R_WB: begin
+          if (wb_seen5_q) begin
+            if (wb_data5_q !== exp_fused_r_data) begin
+              sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_fused_r_rd, wb_data5_q, exp_fused_r_data));
+            end else begin
+              $display("[%0t] FUSED(R) WB     ok: x%0d <= 0x%0h", $time, exp_fused_r_rd, wb_data5_q);
+              // Overlap diagnostic - informational only, does not gate pass/fail. If Q was
+              // issued before P's result arrived (and likewise R before Q's), that's direct
+              // evidence multiple MXFUSED instructions really were simultaneously occupying
+              // different stages of mxdotp_fused_engine.sv's pipeline this run - the actual
+              // thing this test exists to exercise, not just "three correct results
+              // eventually showed up".
+              if ((q_issue_time_q < result_capture_time_q[0]) && (r_issue_time_q < result_capture_time_q[1])) begin
+                $display("[%0t] OVERLAP CONFIRMED: Q issued @%0t (before P resulted @%0t), R issued @%0t (before Q resulted @%0t)",
+                          $time, q_issue_time_q, result_capture_time_q[0], r_issue_time_q, result_capture_time_q[1]);
+              end else begin
+                $display("[%0t] NOTE: no overlap observed this run (Q issued @%0t, P resulted @%0t, R issued @%0t, Q resulted @%0t) - not a failure, but worth a second look if unexpected",
+                          $time, q_issue_time_q, result_capture_time_q[0], r_issue_time_q, result_capture_time_q[1]);
+              end
               sb_state <= SB_WAIT_DUALREAD_ISSUE;
             end
           end
@@ -539,52 +1052,51 @@ module tb_mxdotp_core;
         //----------------------------------------------------------------
 
         SB_WAIT_DUALREAD_ISSUE: begin
-          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_dualread_instr)) begin
-            if (!xif_issue_accept) begin
+          if (dr_issue_seen_q) begin
+            if (!dr_issue_accept_q) begin
               sb_fail("MXDUALREAD_TEST instruction was not accepted at issue");
-            end else if (!xif_issue_wb) begin
+            end else if (!dr_issue_wb_q) begin
               sb_fail("MXDUALREAD_TEST issue_resp.writeback was not asserted");
-            end else if (!xif_issue_dr) begin
+            end else if (!dr_issue_dr_q) begin
               sb_fail("MXDUALREAD_TEST issue_resp.dualread was not asserted");
-            end else if (xif_issue_rs0_wide !== {exp_dualread_hi, exp_dualread_lo}) begin
+            end else if (dr_issue_rs1w_q !== {exp_dualread_hi, exp_dualread_lo}) begin
               sb_fail($sformatf("MXDUALREAD_TEST paired rs1 mismatch at issue: got 0x%0h (expected {hi=0x%0h,lo=0x%0h})",
-                                 xif_issue_rs0_wide, exp_dualread_hi, exp_dualread_lo));
+                                 dr_issue_rs1w_q, exp_dualread_hi, exp_dualread_lo));
             end else begin
-              expected_id <= xif_issue_id;
               $display("[%0t] DUALREAD ISSUE ok: id=%0d rs1={hi=0x%0h,lo=0x%0h}",
-                        $time, xif_issue_id, xif_issue_rs0_wide[63:32], xif_issue_rs0_wide[31:0]);
+                        dr_issue_time_q, dr_issue_id_q, dr_issue_rs1w_q[63:32], dr_issue_rs1w_q[31:0]);
               sb_state <= SB_WAIT_DUALREAD_COMMIT;
             end
           end
         end
 
         SB_WAIT_DUALREAD_COMMIT: begin
-          if (xif_commit_valid) begin
-            if (xif_commit_id !== expected_id) begin
-              sb_fail($sformatf("MXDUALREAD_TEST commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
-            end else if (xif_commit_kill) begin
+          if (commit_capture_idx_q > 3'd3) begin
+            if (commit_capture_id_q[3] !== dr_issue_id_q) begin
+              sb_fail($sformatf("MXDUALREAD_TEST commit id mismatch: got %0d expected %0d", commit_capture_id_q[3], dr_issue_id_q));
+            end else if (commit_capture_kill_q[3]) begin
               sb_fail("MXDUALREAD_TEST instruction was killed at commit (unexpected for this program)");
             end else begin
-              $display("[%0t] DUALREAD COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
+              $display("[%0t] DUALREAD COMMIT ok: id=%0d, commit_kill=0", $time, commit_capture_id_q[3]);
               sb_state <= SB_WAIT_DUALREAD_RESULT;
             end
           end
         end
 
         SB_WAIT_DUALREAD_RESULT: begin
-          if (xif_result_valid && xif_result_ready) begin
-            if (xif_result_id !== expected_id) begin
-              sb_fail($sformatf("MXDUALREAD_TEST result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
-            end else if (xif_result_rd !== exp_dualread_rd) begin
-              sb_fail($sformatf("MXDUALREAD_TEST result rd mismatch: got %0d expected %0d", xif_result_rd, exp_dualread_rd));
-            end else if (!xif_result_we) begin
+          if (result_capture_idx_q > 3'd3) begin
+            if (result_capture_id_q[3] !== dr_issue_id_q) begin
+              sb_fail($sformatf("MXDUALREAD_TEST result id mismatch: got %0d expected %0d", result_capture_id_q[3], dr_issue_id_q));
+            end else if (result_capture_rd_q[3] !== exp_dualread_rd) begin
+              sb_fail($sformatf("MXDUALREAD_TEST result rd mismatch: got %0d expected %0d", result_capture_rd_q[3], exp_dualread_rd));
+            end else if (!result_capture_we_q[3]) begin
               sb_fail("MXDUALREAD_TEST result.we was not asserted");
-            end else if (xif_result_data !== exp_dualread_data) begin
+            end else if (result_capture_data_q[3] !== exp_dualread_data) begin
               sb_fail($sformatf("MXDUALREAD_TEST result.data unexpected: got 0x%0h, expected 0x%0h (x11's value) - dual-read mechanism did not assemble the paired read correctly",
-                                 xif_result_data, exp_dualread_data));
+                                 result_capture_data_q[3], exp_dualread_data));
             end else begin
               $display("[%0t] DUALREAD RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
-                        $time, xif_result_id, xif_result_rd, xif_result_data, xif_result_we);
+                        result_capture_time_q[3], result_capture_id_q[3], result_capture_rd_q[3], result_capture_data_q[3], result_capture_we_q[3]);
               sb_state <= SB_WAIT_DUALREAD_WB;
             end
           end
@@ -609,105 +1121,103 @@ module tb_mxdotp_core;
         //----------------------------------------------------------------
 
         SB_WAIT_RDOTP_ISSUE: begin
-          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_rdotp_instr)) begin
-            if (!xif_issue_accept) begin
+          if (rdotp_issue_seen_q) begin
+            if (!rdotp_issue_accept_q) begin
               sb_fail("MXDOTP(residual) instruction was not accepted at issue");
-            end else if (xif_issue_wb) begin
+            end else if (rdotp_issue_wb_q) begin
               sb_fail("MXDOTP(residual) issue_resp.writeback was asserted (expected 0)");
-            end else if (!xif_issue_dr) begin
+            end else if (!rdotp_issue_dr_q) begin
               sb_fail("MXDOTP(residual) issue_resp.dualread was not asserted");
-            end else if (xif_issue_rs0_wide !== exp_ra_val) begin
+            end else if (rdotp_issue_a_q !== exp_ra_val) begin
               sb_fail($sformatf("MXDOTP(residual) A mismatch at issue: got 0x%0h expected 0x%0h",
-                                 xif_issue_rs0_wide, exp_ra_val));
-            end else if (xif_issue_rs1_wide !== exp_rb_val) begin
+                                 rdotp_issue_a_q, exp_ra_val));
+            end else if (rdotp_issue_b_q !== exp_rb_val) begin
               sb_fail($sformatf("MXDOTP(residual) B mismatch at issue: got 0x%0h expected 0x%0h",
-                                 xif_issue_rs1_wide, exp_rb_val));
-            end else if (xif_issue_rs2_wide !== exp_rar_val) begin
+                                 rdotp_issue_b_q, exp_rb_val));
+            end else if (rdotp_issue_ar_q !== exp_rar_val) begin
               sb_fail($sformatf("MXDOTP(residual) AR mismatch at issue: got 0x%0h expected 0x%0h",
-                                 xif_issue_rs2_wide, exp_rar_val));
+                                 rdotp_issue_ar_q, exp_rar_val));
             end else begin
-              expected_id <= xif_issue_id;
               $display("[%0t] RDOTP ISSUE  ok: id=%0d A=0x%0h B=0x%0h AR=0x%0h",
-                        $time, xif_issue_id, xif_issue_rs0_wide, xif_issue_rs1_wide, xif_issue_rs2_wide);
+                        rdotp_issue_time_q, rdotp_issue_id_q, rdotp_issue_a_q, rdotp_issue_b_q, rdotp_issue_ar_q);
               sb_state <= SB_WAIT_RDOTP_COMMIT;
             end
           end
         end
 
         SB_WAIT_RDOTP_COMMIT: begin
-          if (xif_commit_valid) begin
-            if (xif_commit_id !== expected_id) begin
-              sb_fail($sformatf("MXDOTP(residual) commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
-            end else if (xif_commit_kill) begin
+          if (commit_capture_idx_q > 3'd4) begin
+            if (commit_capture_id_q[4] !== rdotp_issue_id_q) begin
+              sb_fail($sformatf("MXDOTP(residual) commit id mismatch: got %0d expected %0d", commit_capture_id_q[4], rdotp_issue_id_q));
+            end else if (commit_capture_kill_q[4]) begin
               sb_fail("MXDOTP(residual) instruction was killed at commit (unexpected for this program)");
             end else begin
-              $display("[%0t] RDOTP COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
+              $display("[%0t] RDOTP COMMIT ok: id=%0d, commit_kill=0", $time, commit_capture_id_q[4]);
               sb_state <= SB_WAIT_RDOTP_RESULT;
             end
           end
         end
 
         SB_WAIT_RDOTP_RESULT: begin
-          if (xif_result_valid && xif_result_ready) begin
-            if (xif_result_id !== expected_id) begin
-              sb_fail($sformatf("MXDOTP(residual) result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
-            end else if (xif_result_we) begin
+          if (result_capture_idx_q > 3'd4) begin
+            if (result_capture_id_q[4] !== rdotp_issue_id_q) begin
+              sb_fail($sformatf("MXDOTP(residual) result id mismatch: got %0d expected %0d", result_capture_id_q[4], rdotp_issue_id_q));
+            end else if (result_capture_we_q[4]) begin
               sb_fail("MXDOTP(residual) result.we was asserted (expected 0 - no architectural result)");
             end else begin
               $display("[%0t] RDOTP RESULT ok: id=%0d we=%0d (no writeback, as expected)",
-                        $time, xif_result_id, xif_result_we);
+                        result_capture_time_q[4], result_capture_id_q[4], result_capture_we_q[4]);
               sb_state <= SB_WAIT_RFINAL_ISSUE;
             end
           end
         end
 
         SB_WAIT_RFINAL_ISSUE: begin
-          if (xif_issue_valid && xif_issue_ready && (xif_issue_instr == exp_rfinal_instr)) begin
-            if (!xif_issue_accept) begin
+          if (rfinal_issue_seen_q) begin
+            if (!rfinal_issue_accept_q) begin
               sb_fail("MXFINAL(residual) instruction was not accepted at issue");
-            end else if (!xif_issue_wb) begin
+            end else if (!rfinal_issue_wb_q) begin
               sb_fail("MXFINAL(residual) issue_resp.writeback was not asserted");
-            end else if (xif_issue_dr) begin
+            end else if (rfinal_issue_dr_q) begin
               sb_fail("MXFINAL(residual) issue_resp.dualread was asserted (expected 0 - scales/old_acc are plain 32-bit reads)");
-            end else if ((xif_issue_rs0 !== exp_rscales) || (xif_issue_rs1 !== exp_rold_acc)) begin
+            end else if ((rfinal_issue_scales_q !== exp_rscales) || (rfinal_issue_oldacc_q !== exp_rold_acc)) begin
               sb_fail($sformatf("MXFINAL(residual) operand mismatch at issue: scales=0x%0h old_acc=0x%0h (expected 0x%0h,0x%0h)",
-                                 xif_issue_rs0, xif_issue_rs1, exp_rscales, exp_rold_acc));
+                                 rfinal_issue_scales_q, rfinal_issue_oldacc_q, exp_rscales, exp_rold_acc));
             end else begin
-              expected_id <= xif_issue_id;
               $display("[%0t] RFINAL ISSUE ok: id=%0d scales=0x%0h old_acc=0x%0h",
-                        $time, xif_issue_id, xif_issue_rs0, xif_issue_rs1);
+                        rfinal_issue_time_q, rfinal_issue_id_q, rfinal_issue_scales_q, rfinal_issue_oldacc_q);
               sb_state <= SB_WAIT_RFINAL_COMMIT;
             end
           end
         end
 
         SB_WAIT_RFINAL_COMMIT: begin
-          if (xif_commit_valid) begin
-            if (xif_commit_id !== expected_id) begin
-              sb_fail($sformatf("MXFINAL(residual) commit id mismatch: got %0d expected %0d", xif_commit_id, expected_id));
-            end else if (xif_commit_kill) begin
+          if (commit_capture_idx_q > 3'd5) begin
+            if (commit_capture_id_q[5] !== rfinal_issue_id_q) begin
+              sb_fail($sformatf("MXFINAL(residual) commit id mismatch: got %0d expected %0d", commit_capture_id_q[5], rfinal_issue_id_q));
+            end else if (commit_capture_kill_q[5]) begin
               sb_fail("MXFINAL(residual) instruction was killed at commit (unexpected for this program)");
             end else begin
-              $display("[%0t] RFINAL COMMIT ok: id=%0d, commit_kill=0", $time, xif_commit_id);
+              $display("[%0t] RFINAL COMMIT ok: id=%0d, commit_kill=0", $time, commit_capture_id_q[5]);
               sb_state <= SB_WAIT_RFINAL_RESULT;
             end
           end
         end
 
         SB_WAIT_RFINAL_RESULT: begin
-          if (xif_result_valid && xif_result_ready) begin
-            if (xif_result_id !== expected_id) begin
-              sb_fail($sformatf("MXFINAL(residual) result id mismatch: got %0d expected %0d", xif_result_id, expected_id));
-            end else if (xif_result_rd !== exp_rfinal_rd) begin
-              sb_fail($sformatf("MXFINAL(residual) result rd mismatch: got %0d expected %0d", xif_result_rd, exp_rfinal_rd));
-            end else if (!xif_result_we) begin
+          if (result_capture_idx_q > 3'd5) begin
+            if (result_capture_id_q[5] !== rfinal_issue_id_q) begin
+              sb_fail($sformatf("MXFINAL(residual) result id mismatch: got %0d expected %0d", result_capture_id_q[5], rfinal_issue_id_q));
+            end else if (result_capture_rd_q[5] !== exp_rfinal_rd) begin
+              sb_fail($sformatf("MXFINAL(residual) result rd mismatch: got %0d expected %0d", result_capture_rd_q[5], exp_rfinal_rd));
+            end else if (!result_capture_we_q[5]) begin
               sb_fail("MXFINAL(residual) result.we was not asserted");
-            end else if (xif_result_data !== exp_rfinal_data) begin
+            end else if (result_capture_data_q[5] !== exp_rfinal_data) begin
               sb_fail($sformatf("MXFINAL(residual) result.data unexpected: got 0x%0h, expected 0x%0h",
-                                 xif_result_data, exp_rfinal_data));
+                                 result_capture_data_q[5], exp_rfinal_data));
             end else begin
               $display("[%0t] RFINAL RESULT ok: id=%0d rd=%0d data=0x%0h we=%0d",
-                        $time, xif_result_id, xif_result_rd, xif_result_data, xif_result_we);
+                        result_capture_time_q[5], result_capture_id_q[5], result_capture_rd_q[5], result_capture_data_q[5], result_capture_we_q[5]);
               sb_state <= SB_WAIT_RFINAL_WB;
             end
           end
@@ -719,8 +1229,45 @@ module tb_mxdotp_core;
               sb_fail($sformatf("Register file write mismatch: x%0d = 0x%0h, expected 0x%0h", exp_rfinal_rd, wb_data3_q, exp_rfinal_data));
             end else begin
               $display("[%0t] RFINAL WB    ok: x%0d <= 0x%0h", $time, exp_rfinal_rd, wb_data3_q);
+              sb_state <= SB_WAIT_F8S_WB;
+            end
+          end
+        end
+
+        SB_WAIT_F8S_WB: begin
+          if (wb_seen6_q) begin
+            if (wb_data6_q !== exp_f8s_data) begin
+              sb_fail($sformatf("MXFP8(S,E4M3) result mismatch: x%0d = 0x%0h, expected 0x%0h", exp_f8s_rd, wb_data6_q, exp_f8s_data));
+            end else begin
+              $display("[%0t] FUSED8(S,E4M3) WB ok: x%0d <= 0x%0h", $time, exp_f8s_rd, wb_data6_q);
+              sb_state <= SB_WAIT_F8M_WB;
+            end
+          end
+        end
+
+        SB_WAIT_F8M_WB: begin
+          if (wb_seen7_q) begin
+            if (wb_data7_q !== exp_f4m_data) begin
+              sb_fail($sformatf("MXFP4(M) result mismatch: x%0d = 0x%0h, expected 0x%0h", exp_f4m_rd, wb_data7_q, exp_f4m_data));
+            end else begin
+              $display("[%0t] FUSED(M,MXFP4) WB ok: x%0d <= 0x%0h", $time, exp_f4m_rd, wb_data7_q);
+              sb_state <= SB_WAIT_F8T_WB;
+            end
+          end
+        end
+
+        SB_WAIT_F8T_WB: begin
+          if (wb_seen8_q) begin
+            if (wb_data8_q !== exp_f8t_data) begin
+              sb_fail($sformatf("MXFP8(T,E5M2) result mismatch: x%0d = 0x%0h, expected 0x%0h", exp_f8t_rd, wb_data8_q, exp_f8t_data));
+            end else if (f8_ord_bad) begin
+              sb_fail("Cross-engine ordering violation: S/M/T writebacks did not retire in program order (S,M,T) - two-slot order queue delivered out of order");
+            end else begin
+              $display("[%0t] FUSED8(T,E5M2) WB ok: x%0d <= 0x%0h", $time, exp_f8t_rd, wb_data8_q);
+              $display("[%0t] CROSS-ENGINE ORDER ok: S(x%0d,fp8) -> M(x%0d,fp4) -> T(x%0d,fp8) retired in program order",
+                        $time, exp_f8s_rd, exp_f4m_rd, exp_f8t_rd);
               $display("=====================================================");
-              $display(" PASS: MXFUSED -> MXDUALREAD_TEST -> MXDOTP(residual) -> MXFINAL(residual) all traversed");
+              $display(" PASS: MXFUSED(P,Q,R overlap) -> MXDUALREAD_TEST -> MXDOTP/MXFINAL(residual) -> MXFP8(E4M3,E5M2)+overlap all traversed");
               $display("=====================================================");
               pass_count++;
               sb_state <= SB_DONE;
