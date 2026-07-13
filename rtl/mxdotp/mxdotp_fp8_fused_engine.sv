@@ -32,14 +32,20 @@
 //   same cycle; ready_o is exactly !stall. Up to 5 instructions genuinely
 //   in flight at once.
 //
-//   rs3 alignment under overlap (same subtlety mxdotp_fused_engine.sv records):
-//   rs3 (scales + old_acc) is captured at the INPUT stage alongside rs1/rs2,
-//   but BACK1 doesn't consume it until one stage later, paired with prod_q.
-//   Under overlap the input stage is overwritten every cycle, so rs3 is carried
-//   forward one register of its own (rs3_q1) to stay aligned with prod_q. The
-//   E4M3/E5M2 sub-format select is read from rs3 in the FRONT stage (all three
-//   input-stage regs belong to the same instruction that cycle), so its result
-//   is baked into prod_q and does not need forwarding.
+//   rs3 handling under overlap: rs3 packs {reserved[15:0], b_scale, a_scale}
+//   in its upper 32 bits (from rs3+1) and old_acc in its lower 32, all captured
+//   at the INPUT stage alongside rs1/rs2. The scales AND the E4M3/E5M2 sub-format
+//   bit are consumed in the FRONT stage (all three input-stage regs belong to
+//   the same instruction that cycle): FRONT computes the block scale exponent
+//   scale_exp(a_scale,b_scale) and folds it - together with each element pair's
+//   own exponents - straight into prod_q[].exp, so each product carries its FULL
+//   place_in_acc shift amount forward. This deliberately keeps the scale_exp
+//   adder and the per-lane exponent adds OFF the BACK1 critical path (ASIC
+//   synthesis showed them as BACK1's serial prefix, feeding all 8 shift lanes -
+//   BACK1 was the critical stage). The only thing BACK1 still needs from rs3 is
+//   old_acc, so only old_acc[31:0] is carried forward one register (old_acc_q1)
+//   to stay aligned with prod_q; the scales/sub-format/reserved bits do not need
+//   forwarding, having already been consumed in FRONT.
 //
 //   k = 8 elements per 64-bit dual-read operand (8*8 = 64), NOT 16: this is
 //   the paper's own MXFP8/k=8 datapath, exactly what ACC_WIDTH=95 /
@@ -110,7 +116,7 @@ module mxdotp_fp8_fused_engine
 
   // Unused-signal lint suppression: mx_format_i is part of the shared engine
   // interface but the MXFP8 sub-select comes from rs3 (see header); rs3's
-  // reserved[15:1] bits (rs3_q1[63:49]) are, as their name says, reserved.
+  // reserved[15:1] bits (rs3_q[63:49]) are, as their name says, reserved.
   wire _unused = &{1'b0, mx_format_i};
 
   //----------------------------------------------------------------------------
@@ -138,8 +144,9 @@ module mxdotp_fp8_fused_engine
   logic [X_ID_WIDTH-1:0]  prod_id_q;
   logic [4:0]             prod_rd_q;
   fp8_prod_t              prod_q [0:MX_K8-1];
-  logic [X_RFR_WIDTH-1:0] rs3_q1;   // rs3 carried forward one stage to stay
-                                     // aligned with prod_q - see file header.
+  logic [31:0]            old_acc_q1;   // only old_acc carried forward one stage
+                                         // to stay aligned with prod_q; scales &
+                                         // sub-format consumed in FRONT - see header.
 
   logic                   sum_valid_q;
   logic [X_ID_WIDTH-1:0]  sum_id_q;
@@ -179,7 +186,7 @@ module mxdotp_fp8_fused_engine
 
       prod_valid_q <= 1'b0; prod_id_q <= '0; prod_rd_q <= '0;
       for (k = 0; k < MX_K8; k++) prod_q[k] <= '0;
-      rs3_q1 <= '0;
+      old_acc_q1 <= '0;
 
       sum_valid_q <= 1'b0; sum_id_q <= '0; sum_rd_q <= '0;
       sum_q <= '0;
@@ -213,7 +220,7 @@ module mxdotp_fp8_fused_engine
       prod_id_q    <= in_id_q;
       prod_rd_q    <= in_rd_q;
       for (k = 0; k < MX_K8; k++) prod_q[k] <= prod_comb[k];
-      rs3_q1       <= rs3_q;   // carry rs3 forward alongside prod_q - see header
+      old_acc_q1   <= rs3_q[31:0];  // forward old_acc alongside prod_q - see header
 
       in_valid_q  <= start_i;
       in_id_q     <= id_i;
@@ -285,6 +292,16 @@ module mxdotp_fp8_fused_engine
   logic sub_fmt_e5m2;
   assign sub_fmt_e5m2 = rs3_q[48];
 
+  // Block scale exponent, computed HERE (FRONT) instead of in BACK1. a_scale
+  // and b_scale live in the input-stage rs3_q (same instruction as rs1_q/rs2_q
+  // this cycle), so scale_exp can be evaluated a full stage early and folded
+  // straight into each product's exponent below. This keeps the scale_exp adder
+  // and the per-lane exponent adds OFF the BACK1 critical path - ASIC synthesis
+  // showed them as BACK1's serial prefix feeding all 8 place_in_acc shift lanes,
+  // and BACK1 was the critical stage. FRONT has ample slack to absorb them.
+  mx_exp_t se_front;
+  assign se_front = scale_exp(rs3_q[39:32], rs3_q[47:40]);
+
   logic       fe_a_sign [0:MX_K8-1];
   logic       fe_b_sign [0:MX_K8-1];
   mx_exp_t    fe_a_exp  [0:MX_K8-1];
@@ -303,52 +320,44 @@ module mxdotp_fp8_fused_engine
       fe_prod_mag[fi] = fe_a_mag[fi][7:0] * fe_b_mag[fi][7:0];
 
       prod_comb[fi].sign = fe_a_sign[fi] ^ fe_b_sign[fi];
-      prod_comb[fi].exp  = fe_a_exp[fi] + fe_b_exp[fi];   // block scale added in BACK1
+      // FULL place_in_acc shift amount: block scale + both element exponents.
+      // BACK1 places each product at this exponent directly - no further adds.
+      prod_comb[fi].exp  = se_front + fe_a_exp[fi] + fe_b_exp[fi];
       prod_comb[fi].mag  = {16'd0, fe_prod_mag[fi]};
     end
   end
 
   //----------------------------------------------------------------------------
-  // BACK1: apply the block scale, place EACH product into the wide accumulator
-  // at its own exponent, and sum all k=8 placements plus the old FP32
-  // accumulator. Operates on prod_q AND rs3_q1 (both stage-1 registers, same
-  // instruction - see header for why rs3 needs its own forwarded copy).
+  // BACK1: place EACH product into the wide accumulator at its own (already
+  // fully-computed) exponent, and sum all k=8 placements plus the old FP32
+  // accumulator. prod_q[bi].exp already carries the full shift amount
+  // (scale_exp + both element exponents, folded in FRONT), so this stage is
+  // pure shift + sum - the scale_exp adder and per-lane exponent adds that used
+  // to prefix this path have been hoisted into FRONT (see header). The only rs3
+  // field still needed here is old_acc, carried forward as old_acc_q1.
   //
   // ACC_FULL_WIDTH (98) is the paper's own sizing for exactly this: 8 products
   // plus the shifted accumulator. Realistic MXFP8 magnitudes land far below
   // the MAGW=94 saturation boundary, so the 9-term sum stays well within range
   // (same over-provisioned, not-re-derived stance as Known Limitation #1).
   //----------------------------------------------------------------------------
-  logic [7:0]  a_scale, b_scale;
-  logic [31:0] old_acc;
-  mx_exp_t     se;
-
   logic signed [ACC_WIDTH-1:0]      placed [0:MX_K8-1];
   logic signed [ACC_FULL_WIDTH-1:0] acc_sum;
 
   integer bi;
   always_comb begin
-    // rs3_q1 packing (see mxdotp_pkg.sv's MXFUSED funct3 comment):
-    // {reserved[15:0], b_scale[7:0], a_scale[7:0]} in the upper 32 bits,
-    // old_acc in the lower 32. rs3_q1[48] (the E4M3/E5M2 select) already
-    // consumed in FRONT; the rest of reserved[15:1] stays reserved.
-    a_scale = rs3_q1[39:32];
-    b_scale = rs3_q1[47:40];
-    old_acc = rs3_q1[31:0];
-
-    se = scale_exp(a_scale, b_scale);
-
-    acc_sum = ACC_FULL_WIDTH'(fp32_to_acc(old_acc));   // sign-extends ACC_WIDTH -> ACC_FULL_WIDTH
+    acc_sum = ACC_FULL_WIDTH'(fp32_to_acc(old_acc_q1));   // sign-extends ACC_WIDTH -> ACC_FULL_WIDTH
     for (bi = 0; bi < MX_K8; bi++) begin
-      placed[bi] = place_in_acc(prod_q[bi].sign, se + prod_q[bi].exp, prod_q[bi].mag);
+      placed[bi] = place_in_acc(prod_q[bi].sign, prod_q[bi].exp, prod_q[bi].mag);
       acc_sum    = acc_sum + ACC_FULL_WIDTH'(placed[bi]);
     end
     back1_sum_comb = acc_sum;
   end
 
-  // rs3_q1[63:48] unused in BACK1: bit 48 (E4M3/E5M2 select) was consumed a
-  // stage earlier from rs3_q in FRONT; bits [63:49] are reserved (see header).
-  wire _unused_rsvd = &{1'b0, rs3_q1[63:48]};
+  // rs3_q[63:49] unused: bits [47:32] (scales) and [48] (E4M3/E5M2 select) are
+  // consumed in FRONT, [31:0] (old_acc) is forwarded as old_acc_q1; [63:49] are
+  // reserved[15:1] (see header).
+  wire _unused_rsvd = &{1'b0, rs3_q[63:49]};
 
   //----------------------------------------------------------------------------
   // BACK2: leading-one scan (mxdotp_pkg.sv's acc_find_lead) on sum_q.

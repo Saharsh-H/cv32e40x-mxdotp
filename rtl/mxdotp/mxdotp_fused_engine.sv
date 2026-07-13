@@ -4,73 +4,67 @@
 //------------------------------------------------------------------------------
 // Description:
 //   Standalone MXFUSED arithmetic engine - the single-instruction fast path
-//   for PLAIN (non-residue) MX formats. See mxdotp_pkg.sv's "fused fast-path
-//   engine" milestone header for the full rationale: MXDOTP/MXFINAL are
-//   RESIDUE-STYLE FORMATS ONLY as of that milestone; plain MXFP4/MXFP8 never
-//   reach mxdotp_dotp_engine.sv or mxdotp_final_engine.sv at all - they come
-//   here instead.
+//   for PLAIN (non-residue) MXFP4. See mxdotp_pkg.sv's "fused fast-path
+//   engine" milestone header for the rationale: MXDOTP/MXFINAL are
+//   RESIDUE-STYLE FORMATS ONLY; plain MXFP4 comes here, plain MXFP8 goes to
+//   its sibling mxdotp_fp8_fused_engine.sv.
 //
-//   MILESTONE (current): true overlap. Every prior milestone on this engine
-//   (the fused fast path itself, then the BACK1/BACK2/BACK3 pipeline cuts
-//   for timing closure) still only ever had ONE instruction in the engine
-//   at a time - a single busy_q blocked a new one from entering until the
-//   old one fully drained through all stages AND was consumed by the core.
-//   Real ASIC synthesis (see mxdotp_pkg.sv's own milestone header) showed
-//   Fmax was already healthy; the actual throughput loss was serialization
-//   - up to 5 cycles per operation with nothing overlapping. This rewrite
-//   turns the engine into a genuine 5-register-point pipeline (input
-//   capture, contrib_q, sum_q, lead_q, result_data_q) where a NEW
-//   instruction can enter the moment there's room, while up to four OLDER
-//   ones are simultaneously at different stages of computing.
+//   MILESTONE (current): dedicated FP4 sliding-accumulator frame. The
+//   previous BACK1 shifted the sum-of-products by the block scales into the
+//   shared 95-bit/anchor-34 ABSOLUTE window (place_in_acc) and brought the
+//   FP32 accumulator in at its absolute position (fp32_to_acc) - two barrel
+//   shifters into 95 bits, a 98-bit add, and exactness only inside a fixed
+//   absolute scale/magnitude window. This milestone inverts that, mirroring
+//   the reference implementation's own datapath (see mxdotp_pkg.sv's
+//   FP4_FRAME_WIDTH milestone header for the full scheme and its exactness
+//   statement):
 //
-//   FRONT_LATENCY_CYCLES (a correctness-first placeholder wait, unrelated
-//   to the front-end's own real timing, which was never the bottleneck) is
-//   RETIRED by this milestone, not just left at its minimum: a uniform
-//   overlapping pipeline requires every stage to take the same fixed one
-//   cycle, so an artificial multi-cycle wait on any one stage isn't just
-//   unnecessary any more, it would break the whole design's timing model.
+//     result = s1*s2 * ( A.B + acc/(s1*s2) )
 //
-//   Every stage now carries its own valid bit plus the {id, rd} of whichever
-//   instruction (if any) currently occupies it - the same discipline the
-//   XIF's own commit/result interface already uses (id-tagged, in-order),
-//   just carried one level deeper, alongside the arithmetic data instead of
-//   externally in mxdotp_xif.sv's per-slot registers. This is what makes
-//   overlap possible without mxdotp_xif.sv having to track which physical
-//   stage each in-flight instruction is in - it only ever sees this
-//   engine's OWN oldest result, tagged with its own id/rd, the moment it's
-//   ready.
+//   - the SoP never moves: it IS the frame (13-bit signed integer straight
+//     from the front-end, zero shifters on the wide path for it);
+//   - only the ACCUMULATOR slides, by (acc_exp - combined_scale), with a
+//     24-bit 'remaining' capture + sticky below the 38-bit frame;
+//   - BACK2/BACK3 run on the 62-bit extended word (was 98 bits);
+//   - the scale re-enters on the final EXPONENT only (BACK3), never on the
+//     wide datapath;
+//   - the scale adder itself (scale_exp) is HOISTED into the front-end
+//     stage, the same move Phase 18 made in the FP8 engine's FRONT.
 //
-//   Backpressure is a single global stall, not per-stage decoupled skid
-//   buffers: `stall = result_valid_q && !result_ready_i` (the output stage
-//   holds a completed, not-yet-consumed result) freezes every register in
-//   the whole engine on that same cycle - nothing advances, nothing new is
-//   accepted (ready_o is exactly !stall). Every stage being fixed-1-cycle
-//   with no internal data-dependent stalls means the ONLY source of
-//   backpressure is the tail end waiting on the caller, so one shared
-//   freeze signal gets the full overlap benefit (multiple instructions
-//   genuinely computing at once) without the substantially larger
-//   verification surface of independent per-stage ready/valid handshakes.
-//   The cost: a stall freezes the whole pipe together rather than draining
-//   what it still could - a deliberate simplicity/throughput trade, not an
-//   oversight.
+//   The shared place_in_acc/fp32_to_acc/acc_find_lead/acc_finalize and the
+//   ACC_WIDTH/ACC_ANCHOR buffer are no longer used by this engine at all
+//   (mxdotp_final_engine.sv and the FP8 engine still use them);
+//   mx_raw_contrib_t is likewise retired here - it existed as a
+//   format-agnostic front/back contract, but this engine has been
+//   single-format since the FP8 engine became its own module, so the raw
+//   signed SoP is registered directly.
 //
-//   A subtlety worth recording because it's easy to get wrong under
-//   overlap and would have been invisible with only one instruction ever
-//   in flight: rs3 (scales + old accumulator) is captured at the INPUT
-//   stage alongside rs1/rs2, but BACK1 doesn't consume it until one stage
-//   later, paired with contrib_q. With only one instruction ever in the
-//   engine, that was harmless - rs3_q just sat unchanged for the whole
-//   journey. Under overlap, the input stage is overwritten by whatever's
-//   newly accepted every single cycle, so by the time BACK1 runs, a stale
-//   read of rs3_q could belong to a DIFFERENT, newer instruction than the
-//   one in contrib_q. rs3 is therefore threaded forward by exactly one
-//   register stage of its own (rs3_q1 below), staying aligned with
-//   contrib_q instead of being left behind in the input stage.
+//   Behavioral deltas vs the absolute-window version (all intended):
+//   results are exact-to-RNE for ANY E8M0 scale pair and ANY
+//   normal/subnormal FP32 accumulator (subnormal accumulators were
+//   previously flushed; scale_exp < 0 previously truncated SoP bits;
+//   |acc| outside ~[2^-11, 2^60] previously flushed/saturated), except the
+//   single bounded corner documented in mxdotp_pkg.sv. When the SoP cannot
+//   affect the accumulator (acc_shift > FP4_MAX_ACC_SHIFT, or SoP == 0
+//   with accumulator bits already dropped below the remaining field), the
+//   result is old_acc VERBATIM - proven exact, |SoP contribution| <
+//   ulp(acc)/2 strictly. Golden model: fp4_golden.py (227k+ vectors vs an
+//   exact-rational reference, 0 failures).
 //
-//   Everything else - the MXFP4/MXFP8 front-end, the BACK1/BACK2/BACK3
-//   arithmetic itself, the mx_raw_contrib_t/mx_lead_result_t contracts - is
-//   UNCHANGED from the previous milestone. This is a control/pipelining
-//   change, not an arithmetic one.
+//   OVERLAP MILESTONE (unchanged): genuine 5-register-point pipeline
+//   (input capture, sop_q/BACK1 inputs, sum_q, lead_q, result_data_q) with
+//   a single global stall - `stall = result_valid_q && !result_ready_i`
+//   freezes every register in the same cycle; ready_o is exactly !stall.
+//   Every stage is fixed-1-cycle; the only backpressure source is the tail
+//   waiting on the caller. Each stage carries its own valid/id/rd sideband.
+//
+//   The rs3-alignment subtlety from the overlap milestone still applies in
+//   spirit: operands consumed one stage after input capture must be
+//   threaded forward by their own register so they stay aligned with the
+//   instruction that owns them (the input stage is overwritten every cycle
+//   under overlap). What gets threaded has shrunk: only old_acc (32b) and
+//   the precomputed scale_exp (hoisted into the front-end stage) survive
+//   to BACK1; the raw 64-bit rs3_q1 copy is gone.
 //==============================================================================
 
 module mxdotp_fused_engine
@@ -131,8 +125,8 @@ module mxdotp_fused_engine
 
   //----------------------------------------------------------------------------
   // Five pipeline register points, each with its own valid/id/rd sideband.
-  // Naming pairs each sideband with the datapath register it travels
-  // alongside: in_* (input capture), contrib_* (post front-end), sum_*
+  // Naming pairs each sideband with the datapath registers it travels
+  // alongside: in_* (input capture), sop_* (post front-end), sum_*
   // (post BACK1), lead_* (post BACK2), result_* (post BACK3 / output).
   //----------------------------------------------------------------------------
 
@@ -142,22 +136,36 @@ module mxdotp_fused_engine
   logic [X_RFR_WIDTH-1:0] rs1_q, rs2_q, rs3_q;
   logic [1:0]             mx_format_q;
 
-  logic                   contrib_valid_q;
-  logic [X_ID_WIDTH-1:0]  contrib_id_q;
-  logic [4:0]             contrib_rd_q;
-  mx_raw_contrib_t        contrib_q;
-  logic [X_RFR_WIDTH-1:0] rs3_q1;   // rs3 carried forward one stage to stay
-                                     // aligned with contrib_q - see file header.
+  // Stage 1 (post front-end): the raw signed SoP plus everything BACK1
+  // needs, all belonging to the SAME instruction (see file header).
+  logic                          sop_valid_q;
+  logic [X_ID_WIDTH-1:0]         sop_id_q;
+  logic [4:0]                    sop_rd_q;
+  logic signed [PSUM_WIDTH-1:0]  sop_q;        // frame-resident SoP, never shifted
+  mx_exp_t                       sexp_q1;      // hoisted scale_exp(a,b)
+  logic [31:0]                   old_acc_q1;   // FP32 accumulator operand
 
-  logic                   sum_valid_q;
-  logic [X_ID_WIDTH-1:0]  sum_id_q;
-  logic [4:0]             sum_rd_q;
-  logic signed [ACC_FULL_WIDTH-1:0] sum_q;
+  // Stage 2 (post BACK1): the 62-bit extended word {frame38, remaining24}
+  // plus the flags/values BACK2/BACK3 need.
+  logic                              sum_valid_q;
+  logic [X_ID_WIDTH-1:0]             sum_id_q;
+  logic [4:0]                        sum_rd_q;
+  logic signed [FP4_LZC_WIDTH-1:0]   sum_q;
+  logic                              acc_sticky_q2;  // acc bits dropped below 'remaining'
+  logic                              neg_adj_q2;     // fp4_find_lead's sticky-negation adjust
+  logic                              is_acc_q2;      // result-is-accumulator bypass
+  mx_exp_t                           sexp_q2;
+  logic [31:0]                       old_acc_q2;
 
+  // Stage 3 (post BACK2).
   logic                   lead_valid_q;
   logic [X_ID_WIDTH-1:0]  lead_id_q;
   logic [4:0]             lead_rd_q;
-  mx_lead_result_t        lead_q;
+  fp4_lead_result_t       lead_q;
+  logic                   acc_sticky_q3;
+  logic                   is_acc_q3;
+  mx_exp_t                sexp_q3;
+  logic [31:0]            old_acc_q3;
 
   logic                   result_valid_q;
   logic [X_ID_WIDTH-1:0]  result_id_q;
@@ -172,51 +180,62 @@ module mxdotp_fused_engine
   //----------------------------------------------------------------------------
 
   wire stall = result_valid_q && !result_ready_i;
+
   assign ready_o = !stall;
+
+  // Combinational stage outputs (defined below, next to their stages).
+  logic signed [PSUM_WIDTH-1:0]    sop_comb;
+  mx_exp_t                         sexp_comb;
+  logic signed [FP4_LZC_WIDTH-1:0] back1_word_comb;
+  logic                            back1_acc_sticky_comb;
+  logic                            back1_neg_adj_comb;
+  logic                            back1_is_acc_comb;
+  fp4_lead_result_t                back2_lead_comb;
+  logic [31:0]                     back3_result_comb;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      in_valid_q  <= 1'b0; in_id_q  <= '0; in_rd_q  <= '0;
-      rs1_q <= '0; rs2_q <= '0; rs3_q <= '0; mx_format_q <= '0;
-
-      contrib_valid_q <= 1'b0; contrib_id_q <= '0; contrib_rd_q <= '0;
-      contrib_q <= '0; rs3_q1 <= '0;
-
-      sum_valid_q <= 1'b0; sum_id_q <= '0; sum_rd_q <= '0;
-      sum_q <= '0;
-
-      lead_valid_q <= 1'b0; lead_id_q <= '0; lead_rd_q <= '0;
-      lead_q <= '0;
-
-      result_valid_q <= 1'b0; result_id_q <= '0; result_rd_q <= '0;
-      result_data_q <= '0;
+      in_valid_q      <= 1'b0;
+      sop_valid_q     <= 1'b0;
+      sum_valid_q     <= 1'b0;
+      lead_valid_q    <= 1'b0;
+      result_valid_q  <= 1'b0;
     end else if (!stall) begin
-      // Every stage shifts forward by exactly one register per cycle - the
-      // whole point of a uniform, fixed-1-cycle-per-stage pipeline. An
-      // invalid slot's data is never looked at by anything downstream
-      // (its own valid bit, shifted alongside it, correctly reads 0 next
-      // cycle), so writes are never gated on the source valid bit -
-      // simpler, and just as correct.
+      // Whole pipe advances together. A stage whose upstream holds a bubble
+      // simply latches don't-care data alongside a 0 valid bit (its own
+      // valid bit, shifted alongside it, correctly reads 0 next cycle), so
+      // writes are never gated on the source valid bit - simpler, and just
+      // as correct.
       result_valid_q <= lead_valid_q;
       result_id_q    <= lead_id_q;
       result_rd_q    <= lead_rd_q;
       result_data_q  <= back3_result_comb;
 
-      lead_valid_q <= sum_valid_q;
-      lead_id_q    <= sum_id_q;
-      lead_rd_q    <= sum_rd_q;
-      lead_q       <= back2_lead_comb;
+      lead_valid_q  <= sum_valid_q;
+      lead_id_q     <= sum_id_q;
+      lead_rd_q     <= sum_rd_q;
+      lead_q        <= back2_lead_comb;
+      acc_sticky_q3 <= acc_sticky_q2;
+      is_acc_q3     <= is_acc_q2;
+      sexp_q3       <= sexp_q2;
+      old_acc_q3    <= old_acc_q2;
 
-      sum_valid_q <= contrib_valid_q;
-      sum_id_q    <= contrib_id_q;
-      sum_rd_q    <= contrib_rd_q;
-      sum_q       <= back1_sum_comb;
+      sum_valid_q   <= sop_valid_q;
+      sum_id_q      <= sop_id_q;
+      sum_rd_q      <= sop_rd_q;
+      sum_q         <= back1_word_comb;
+      acc_sticky_q2 <= back1_acc_sticky_comb;
+      neg_adj_q2    <= back1_neg_adj_comb;
+      is_acc_q2     <= back1_is_acc_comb;
+      sexp_q2       <= sexp_q1;
+      old_acc_q2    <= old_acc_q1;
 
-      contrib_valid_q <= in_valid_q;
-      contrib_id_q    <= in_id_q;
-      contrib_rd_q    <= in_rd_q;
-      contrib_q       <= contrib_comb;
-      rs3_q1          <= rs3_q;   // carry rs3 forward alongside contrib_q - see file header
+      sop_valid_q <= in_valid_q;
+      sop_id_q    <= in_id_q;
+      sop_rd_q    <= in_rd_q;
+      sop_q       <= sop_comb;
+      sexp_q1     <= sexp_comb;
+      old_acc_q1  <= rs3_q[31:0];   // threaded forward to stay aligned - see header
 
       in_valid_q  <= start_i;
       in_id_q     <= id_i;
@@ -238,17 +257,19 @@ module mxdotp_fused_engine
   assign result_data_o  = result_data_q;
 
   //----------------------------------------------------------------------------
-  // FRONT-END: format-selected unpack + multiply + sum -> mx_raw_contrib_t.
-  // Unchanged by this milestone. Only MX_FMT_MXFP4 is real; every other
-  // value (including MX_FMT_MXFP8's stub, and MX_FMT_MXFP4_RESIDUAL/
-  // MX_FMT_M2XFP4, neither of which is meaningful for an instruction with
-  // no AR operand) falls through to a safe, defined "contributes nothing"
-  // default.
+  // FRONT-END: unpack + multiply + sum -> raw signed SoP, plus the HOISTED
+  // scale-exponent adder (Phase-18-style: computed here where the slack is,
+  // consumed twice downstream - BACK1's accumulator shift amount and
+  // BACK3's final exponent - never on the wide datapath).
+  //
+  // The SoP is the format mux's only client: MX_FMT_MXFP4 passes the real
+  // sum; every other value (MXFP8 never routes here - it has its own
+  // engine - plus the not-meaningful-here MXFP4_RESIDUAL/M2XFP4) falls to
+  // a safe SoP = 0, which makes the whole instruction an exact accumulator
+  // pass-through (strictly better than the old stub behavior, which
+  // round-tripped old_acc through the wide buffer).
   //----------------------------------------------------------------------------
 
-  // --- MX_FMT_MXFP4 sub-datapath: k=MX_K nibbles from rs1_q/rs2_q, exact
-  //     fixed-point fp4_to_code multiply-sum - identical to
-  //     mxdotp_dotp_engine.sv's A/B path, but with no AR/p2 tree at all. ---
   logic [3:0] a_nib [0:MX_K-1];
   logic [3:0] b_nib [0:MX_K-1];
 
@@ -257,9 +278,6 @@ module mxdotp_fused_engine
 
   logic signed [PROD_WIDTH-1:0] p1_term [0:MX_K-1];
   logic signed [PSUM_WIDTH-1:0] p1_sum_mxfp4;
-
-  logic                  p1_sign_mxfp4;
-  logic [PSUM_WIDTH-1:0] p1_mag_mxfp4;
 
   int fi;
 
@@ -280,90 +298,143 @@ module mxdotp_fused_engine
       p1_sum_mxfp4 = p1_sum_mxfp4 + PSUM_WIDTH'(p1_term[fi]);
     end
 
-    p1_sign_mxfp4 = p1_sum_mxfp4[PSUM_WIDTH-1];
-    p1_mag_mxfp4  = p1_sign_mxfp4 ? (-p1_sum_mxfp4) : p1_sum_mxfp4;  // same-width reinterpret
+    sop_comb = (mx_format_q == MX_FMT_MXFP4) ? p1_sum_mxfp4 : '0;
+
+    // Hoisted scale adder. rs3_q packing: {reserved[15:0], b_scale[7:0],
+    // a_scale[7:0]} in the upper 32 bits, old_acc in the lower 32 - see
+    // mxdotp_pkg.sv's MXFUSED funct3 comment for the full layout. Note the
+    // old "-2" fp4_to_code exponent correction is NOT applied here any
+    // more: in the sliding-accumulator scheme it is a structural constant
+    // of the frame itself (folded into FP4_ACC_SHIFT_CONST and
+    // fp4_finalize's exponent), not a property of this operand.
+    sexp_comb = scale_exp(rs3_q[39:32], rs3_q[47:40]);
   end
 
-  // --- Format mux -> mx_raw_contrib_t. This is the ONLY per-format branch
-  //     in this engine; the back-end below never looks at mx_format_q. ---
-  mx_raw_contrib_t contrib_comb;
+  //----------------------------------------------------------------------------
+  // BACK1: the accumulator slide. The SoP (sop_q) is already frame-resident
+  // and untouched; this stage only decodes the FP32 accumulator, computes
+  // its shift against the scale-free frame, and produces the 62-bit
+  // extended word {frame38, remaining24} plus sticky/bypass flags. See
+  // mxdotp_pkg.sv's FP4_FRAME_WIDTH milestone header for the scheme,
+  // layouts, and the exactness proofs referenced below.
+  //----------------------------------------------------------------------------
+
+  logic        acc_sign;
+  logic [7:0]  acc_exp_f;
+  logic [22:0] acc_mant_f;
+  logic        acc_is_normal;
+  logic signed [24:0] smant;      // 25-bit signed: |{implicit, mant23}| <= 2^24-1,
+                                  // so negation never wraps
+  mx_exp_t     acc_shift;         // = (E + is_subnormal) - 148 - scale_exp
+
+  int          lsh;               // left-shift amount, 0..13
+  int          rsh;               // right-shift amount (clamped), 1..25
+  int          dropped;           // shift below 'remaining' (clamped), 1..25
+  logic signed [FP4_FRAME_WIDTH-1:0] acc_inframe;
+  logic signed [FP4_FRAME_WIDTH-1:0] frame38;
+  logic signed [48:0]                rem_wide;   // smant << (0..24) fits in 49b
+  logic [FP4_REMAIN_BITS-1:0]        remaining;
+  logic [25:0]                       drop_mask;
 
   always_comb begin
-    unique case (mx_format_q)
-      MX_FMT_MXFP4: begin
-        contrib_comb.sign     = p1_sign_mxfp4;
-        contrib_comb.mag      = {{(32-PSUM_WIDTH){1'b0}}, p1_mag_mxfp4};
-        // Same "-2" correction as mxdotp_final_engine.sv/mxdotp_pkg.sv's
-        // derivation: fp4_to_code's code=2*value convention makes every raw
-        // product carry an implicit *4 relative to the true unscaled value.
-        contrib_comb.exp_corr = -mx_exp_t'(2);
+    acc_sign      = old_acc_q1[31];
+    acc_exp_f     = old_acc_q1[30:23];
+    acc_mant_f    = old_acc_q1[22:0];
+    acc_is_normal = (acc_exp_f != 8'd0);
+
+    // Subnormal accumulators are HONORED (paper-faithfully): no implicit
+    // bit, effective exponent = E + 1. The old fp32_to_acc flushed them.
+    smant = acc_sign ? -$signed({1'b0, acc_is_normal, acc_mant_f})
+                     :  $signed({1'b0, acc_is_normal, acc_mant_f});
+
+    acc_shift = mx_exp_t'({8'd0, acc_exp_f}) + mx_exp_t'(!acc_is_normal)
+              - mx_exp_t'(FP4_ACC_SHIFT_CONST) - sexp_q1;
+
+    back1_acc_sticky_comb = 1'b0;
+    back1_is_acc_comb     = 1'b0;
+    acc_inframe           = '0;
+    remaining             = '0;
+    rem_wide              = '0;
+    drop_mask             = '0;
+    lsh = 0; rsh = 0; dropped = 0;
+
+    if (acc_shift > mx_exp_t'(FP4_MAX_ACC_SHIFT)) begin
+      // SoP too small to change the accumulator: |SoP| <= 2304 < 2^13 =
+      // ulp(acc)/2 at this shift, strictly - the margin survives even
+      // binade boundaries - so RNE returns the accumulator exactly.
+      // The frame contents are don't-cares.
+      back1_is_acc_comb = 1'b1;
+    end else if (acc_shift >= mx_exp_t'(0)) begin
+      // In-frame left shift: mant top bit lands at <= bit 36, one below
+      // the sign bit; (2^24-1)*2^13 + 2304 < 2^37, so the 38-bit add can
+      // never wrap - no saturation logic exists or is needed.
+      lsh         = int'(acc_shift);
+      acc_inframe = FP4_FRAME_WIDTH'(smant) <<< lsh;
+    end else begin
+      // Right shift: floor-truncation at 24-fractional-bit resolution.
+      // Shift amounts are clamped at 25: smant is 25 bits, so any
+      // arithmetic right shift >= 25 already yields pure sign bits (and
+      // any drop mask >= 25 bits already covers the whole mantissa) -
+      // the clamps keep both shifters at 5-bit shift amounts without
+      // changing any result (verified by the golden model's floor/sticky
+      // identity asserts across the full sweep).
+      rsh         = (-int'(acc_shift) > 25) ? 25 : -int'(acc_shift);
+      acc_inframe = FP4_FRAME_WIDTH'(smant) >>> rsh;   // sign-extend then shift - identical for arithmetic shift, width-clean
+      if (-int'(acc_shift) > FP4_REMAIN_BITS) begin
+        dropped   = (-int'(acc_shift) - FP4_REMAIN_BITS > 25)
+                  ? 25 : (-int'(acc_shift) - FP4_REMAIN_BITS);
+        remaining = FP4_REMAIN_BITS'(smant >>> dropped);
+        drop_mask = (26'd1 << dropped) - 26'd1;
+        back1_acc_sticky_comb = |(smant & drop_mask[24:0]);
+        // The reference design's SoP==0 bypass: with accumulator bits
+        // already dropped, round-tripping would lose acc precision through
+        // the sticky path - return it verbatim instead (exact).
+        if (sop_q == '0) back1_is_acc_comb = 1'b1;
+      end else begin
+        rem_wide  = 49'(smant) <<< (FP4_REMAIN_BITS + int'(acc_shift));
+        remaining = rem_wide[FP4_REMAIN_BITS-1:0];
       end
-      default: begin
-        // MX_FMT_MXFP8 stub (real arithmetic deferred - see file header)
-        // and any other reserved/not-meaningful-here format value: safe,
-        // defined "contributes nothing" default.
-        contrib_comb.sign     = 1'b0;
-        contrib_comb.mag      = 32'd0;
-        contrib_comb.exp_corr = '0;
-      end
-    endcase
+    end
+
+    frame38 = FP4_FRAME_WIDTH'(sop_q) + acc_inframe;
+
+    // fp4_find_lead's sticky-negation condition (see mxdotp_pkg.sv): a
+    // nonzero positive residue was floor-truncated below this word.
+    back1_neg_adj_comb = (dropped != 0) && (smant != '0) && back1_acc_sticky_comb;
+
+    back1_word_comb = {frame38, remaining};
   end
 
-  //----------------------------------------------------------------------------
-  // BACK1: scale + accumulate (place_in_acc/fp32_to_acc + the wide sum).
-  // Operates on contrib_q AND rs3_q1 - both stage-1 registers, both
-  // belonging to the SAME instruction (see file header for why rs3 needs
-  // its own forwarded copy here rather than reading rs3_q directly).
-  //----------------------------------------------------------------------------
-
-  logic [7:0]  a_scale, b_scale;
-  logic [31:0] old_acc;
-
-  mx_exp_t exp1;
-
-  logic signed [ACC_WIDTH-1:0]      contrib1, acc_contrib;
-  logic signed [ACC_FULL_WIDTH-1:0] contrib1_wide, acc_contrib_wide;
-  logic signed [ACC_FULL_WIDTH-1:0] back1_sum_comb;
-
+  // synthesis translate_off
+  // Safety net for the knife-edge no-overflow proof: recompute the frame
+  // sum 2 bits wider and confirm the 38-bit result is identical.
+  logic signed [FP4_FRAME_WIDTH+1:0] frame_chk;
   always_comb begin
-    // rs3_q1 packing: {reserved[15:0],b_scale[7:0],a_scale[7:0]} in the
-    // upper 32 bits, old_acc in the lower 32 bits - see mxdotp_pkg.sv's
-    // MXFUSED funct3 comment for the full layout.
-    a_scale = rs3_q1[39:32];
-    b_scale = rs3_q1[47:40];
-    // rs3_q1[63:48] is reserved for now.
-    old_acc = rs3_q1[31:0];
-
-    exp1 = scale_exp(a_scale, b_scale) + contrib_q.exp_corr;
-
-    contrib1    = place_in_acc(contrib_q.sign, exp1, contrib_q.mag);
-    acc_contrib = fp32_to_acc(old_acc);
-
-    contrib1_wide    = contrib1;     // sign-extends ACC_WIDTH -> ACC_FULL_WIDTH
-    acc_contrib_wide = acc_contrib;
-
-    back1_sum_comb = contrib1_wide + acc_contrib_wide;
+    frame_chk = (FP4_FRAME_WIDTH+2)'(sop_q) + (FP4_FRAME_WIDTH+2)'(acc_inframe);
+    if (sop_valid_q && !back1_is_acc_comb)
+      assert (frame_chk == (FP4_FRAME_WIDTH+2)'(frame38)) else
+        $error("mxdotp_fused_engine: 38-bit frame overflow - violates the sizing proof");
   end
+  // synthesis translate_on
 
   //----------------------------------------------------------------------------
-  // BACK2: leading-one scan (mxdotp_pkg.sv's acc_find_lead) on sum_q.
+  // BACK2: sign/magnitude (with the sticky-negation adjust) + leading-one
+  // scan on the 62-bit extended word (mxdotp_pkg.sv's fp4_find_lead).
   //----------------------------------------------------------------------------
-
-  mx_lead_result_t back2_lead_comb;
 
   always_comb begin
-    back2_lead_comb = acc_find_lead(sum_q);
+    back2_lead_comb = fp4_find_lead(sum_q, neg_adj_q2);
   end
 
   //----------------------------------------------------------------------------
   // BACK3: mantissa extraction + sticky + round + exponent clamp
-  // (mxdotp_pkg.sv's acc_finalize) on lead_q.
+  // (mxdotp_pkg.sv's fp4_finalize - the scale re-enters here, on the
+  // exponent only), or the verbatim accumulator bypass.
   //----------------------------------------------------------------------------
 
-  logic [31:0] back3_result_comb;
-
   always_comb begin
-    back3_result_comb = acc_finalize(lead_q);
+    back3_result_comb = is_acc_q3 ? old_acc_q3
+                                  : fp4_finalize(lead_q, acc_sticky_q3, sexp_q3);
   end
 
 endmodule

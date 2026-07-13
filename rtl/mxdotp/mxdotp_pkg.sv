@@ -400,16 +400,19 @@ package mxdotp_pkg;
   // mxdotp_fused_engine.sv's header, for what that will likely need to
   // look like).
   //
-  // ACC_WIDTH=95/ACC_ANCHOR=34 (below) are shared, UNCHANGED, by both the
-  // fused engine's back-end and mxdotp_final_engine.sv's - deliberately not
-  // re-derived for MXFP4's smaller dynamic range yet (still Known
-  // Limitation #1 / a deferred "optimize later" item). These are not
-  // arbitrary placeholders: they are the MXDOTP paper's own sizing for its
-  // real MXFP8/k=8 datapath (95-bit fixed-point accumulator, anchor at 34,
-  // sized to exactly hold the sum of eight products plus the shifted
-  // accumulator, sign and rounding bits included) - i.e. already the
-  // *intended* width for MXFP8's eventual front-end, and over-provisioned
-  // headroom (not lossy) for MXFP4's smaller range in the meantime.
+  // ACC_WIDTH=95/ACC_ANCHOR=34 (below) remain the sizing for
+  // mxdotp_final_engine.sv (residue path) and the MXFP8 engine - they are
+  // the MXDOTP paper's own numbers for its MXFP8/k=8 datapath (95-bit
+  // fixed-point accumulator, anchor at 34, sized to exactly hold the sum
+  // of eight products plus the shifted accumulator, sign and rounding
+  // bits included). The plain-MXFP4 fused engine NO LONGER uses this
+  // buffer as of the FP4 sliding-accumulator milestone (see the
+  // FP4_FRAME_WIDTH section at the bottom of this package): it has its
+  // own dedicated 38-bit scale-free frame, mirroring the reference
+  // implementation's accumulator-shift structure. Known Limitation #1
+  // (re-derive for MXFP4) is thereby RESOLVED for the fused path;
+  // MXFINAL's re-derivation is still open (needs a residue-offset
+  // convention on top of the same scheme).
   //
   //==============================================================================
 
@@ -451,10 +454,11 @@ package mxdotp_pkg;
 
   // --- Internal wide fixed-point accumulation buffer: 95-bit two's-
   //     complement buffer, bit[ACC_ANCHOR] has weight 2^0. PRODSUM_WIDTH=67
-  //     is the raw sum-of-products magnitude width (before anchoring) that
-  //     the original MXDOTP paper's own datapath uses - reused verbatim,
-  //     deliberately NOT re-derived for MXFP4's much smaller dynamic range
-  //     yet (see milestone header above). GUARD_BITS=3 covers summing the
+  //     is the SINGLE SHIFTED PRODUCT's signed width in the paper's own
+  //     datapath (sign + magnitude span [2^31 : 2^-34]; their
+  //     PROD_SHIFT_WIDTH = 1 + 32 + 34) - the sum of 8 needs 3 more bits.
+  //     Documentation-only constant, consumed nowhere; kept for reference.
+  //     GUARD_BITS=3 covers summing the
   //     (at most 3) contributions MXFINAL ever combines (p1, p2, old
   //     accumulator) without overflow. ---
   localparam int ACC_WIDTH     = 95;
@@ -743,8 +747,17 @@ package mxdotp_pkg;
       end
 
       if (mant_ext[23]) begin
+        // BUG FIX (found by fp4_golden.py's exact-rational sweep, latent
+        // since this function was written): a carry out of the 23-bit
+        // fraction is only ever reachable when the pre-round fraction was
+        // ALL ONES (1.111...1 rounding up to 2.0), so the renormalized
+        // fraction is exactly ZERO. The previous mant_ext[23:1] kept the
+        // carry bit as the new fraction MSB, producing 1.5*2^(e+1) instead
+        // of 1.0*2^(e+1) - a half-magnitude error. Never hit by the
+        // existing test vectors (none round up from an all-ones fraction);
+        // affects MXFP8/MXFINAL results only in that corner.
         unbiased_exp = unbiased_exp + mx_exp_t'(1);
-        mant_out     = mant_ext[23:1];
+        mant_out     = '0;
       end else begin
         mant_out = mant_ext[22:0];
       end
@@ -779,5 +792,177 @@ package mxdotp_pkg;
   function automatic logic [31:0] acc_to_fp32(input logic signed [ACC_FULL_WIDTH-1:0] acc);
     return acc_finalize(acc_find_lead(acc));
   endfunction
+
+
+  //============================================================================
+  // MILESTONE: FP4 dedicated sliding-accumulator frame (paper-faithful BACK1)
+  //============================================================================
+  //
+  // Used ONLY by mxdotp_fused_engine.sv (the plain-MXFP4 fast path). The
+  // shared ACC_WIDTH=95/ACC_ANCHOR=34 buffer above is UNCHANGED and still
+  // used by mxdotp_final_engine.sv (residue path) and, in spirit, by
+  // mxdotp_fp8_fused_engine.sv - MXFP8 genuinely needs that sizing.
+  //
+  // The scheme here mirrors the reference implementation's own datapath
+  // (fpnew_mxdotp_accumulator_shift / add_accumulator_sop / twos_compl in
+  // the paper's released code), restricted to one format:
+  //
+  //   result = s1*s2 * ( A.B  +  acc/(s1*s2) )
+  //
+  // The sum-of-products NEVER moves - it lives in a fixed, SCALE-FREE
+  // 38-bit frame (bit b = code weight 2^b = value weight 2^(b-2); the *4
+  // of fp4_to_code is absorbed by the constant -2 in the final exponent,
+  // so the frame has zero hardware fraction bits). Only the ACCUMULATOR
+  // slides, shifted by (acc_exp - combined_scale); the scale is re-applied
+  // on the result EXPONENT at the very end, never on the wide datapath.
+  //
+  // Frame layout (38 = FP4_FRAME_WIDTH):
+  //   | sign : 1 | acc @ max left shift : 24 | R guard : 1 | unsigned SoP : 12 |
+  //   - SoP: |sum of 16 products of 9-bit codes| <= 16*144 = 2304 < 2^12
+  //   - acc mantissa (24b) parked at bits [36:13] when acc_shift = 13
+  //   - knife-edge exact: (2^24-1)*2^13 + 2304 < 2^37, sign bit never
+  //     corrupted, NO saturation logic exists or is needed in-frame
+  //
+  // When the accumulator shifts RIGHT below frame bit 0, the next 24 bits
+  // are kept in a 'remaining' field appended below the frame for the
+  // leading-one scan (62-bit extended word = {frame38, remaining24});
+  // anything below THAT is a single sticky flag. Floor-truncation of a
+  // NEGATIVE word with a positive residue below flips the sticky
+  // direction; the reference design's fix (mirrored in fp4_find_lead's
+  // neg_adjust input) is to take ~word instead of ~word+1, re-expressing
+  // |true| = |word| - eps as (|word|-1) + (1-eps) so "sticky = more
+  // magnitude below" stays true.
+  //
+  // Exactness: bit-exact RNE against an exact-rational reference on 227k+
+  // directed/random vectors (fp4_golden.py), EXCEPT one bounded,
+  // reference-design-inherited corner: when the acc dropped sticky bits
+  // below the remaining field (acc right shift > 24+24) AND cancellation
+  // pushes the extended word's leading one to bit <= 23, the round bit is
+  // inside the dropped region and unrecoverable -> deviation <= 2 ulp
+  // (typically 1). Observed on 0.11% of unconstrained-random vectors; the
+  // paper's own hardware has the identical behavior. Everywhere else,
+  // including the acc-dominates bypass (proven |SoP contribution| <
+  // ulp(acc)/2 strictly, even across binade boundaries), results are
+  // exact-to-RNE for ANY E8M0 scale pair and ANY normal/subnormal FP32
+  // accumulator - unlike the absolute-window place_in_acc path, which
+  // truncates whole scale/magnitude ranges.
+  //----------------------------------------------------------------------------
+
+  localparam int FP4_FRAME_WIDTH   = 38;                    // see layout above
+  localparam int FP4_MAX_ACC_SHIFT = FP4_FRAME_WIDTH - 24 - 1;  // = 13
+  localparam int FP4_REMAIN_BITS   = 24;                    // DST precision
+  localparam int FP4_LZC_WIDTH     = FP4_FRAME_WIDTH + FP4_REMAIN_BITS;  // = 62
+
+  // Accumulator-shift constant: mant24 LSB (weight 2^(e-23)) lands at frame
+  // bit (e - 21 - scale_exp) since frame bit b has value weight 2^(b-2);
+  // with e = E_biased + is_subnormal - 127 this is E + is_sub - 148 - scale.
+  localparam int FP4_ACC_SHIFT_CONST = 148;                 // 127 + 23 - 2
+
+  // acc_find_lead/acc_finalize sibling contract, sized for the 62-bit word.
+  // lead_pos: -1 sentinel .. 61, signed 8 bits with room to spare.
+  typedef struct packed {
+    logic                          sign;
+    logic signed [7:0]             lead_pos;
+    logic [FP4_LZC_WIDTH-1:0]      mag;
+  } fp4_lead_result_t;
+
+  // First half (BACK2): two's-complement -> sign/magnitude with the
+  // reference design's sticky-direction adjustment, then the leading-one
+  // scan. neg_adjust_i must be BACK1's registered
+  // (right_shift > FP4_REMAIN_BITS) && acc_sticky && (smant != 0) - i.e.
+  // "a nonzero positive residue was floor-truncated below this word".
+  function automatic fp4_lead_result_t fp4_find_lead(
+    input logic signed [FP4_LZC_WIDTH-1:0] word,
+    input logic                            neg_adjust_i
+  );
+    logic                     sign;
+    logic [FP4_LZC_WIDTH-1:0] mag;
+    int                       lead_pos;
+    int                       i;
+    fp4_lead_result_t         result;
+    begin
+      sign = word[FP4_LZC_WIDTH-1];
+      if (sign && neg_adjust_i)
+        mag = ~word;        // |word| - 1, with the implied (1-eps) tail below
+      else
+        mag = sign ? (-word) : word;
+      lead_pos = -1;
+      for (i = FP4_LZC_WIDTH-1; i >= 0; i--) begin
+        if (lead_pos == -1 && mag[i]) lead_pos = i;
+      end
+      result.sign     = sign;
+      result.lead_pos = 8'(lead_pos);
+      result.mag      = mag;
+      return result;
+    end
+  endfunction
+
+  // Second half (BACK3): mantissa extraction + round/sticky + exponent
+  // clamp on the 62-bit word. Differences from the shared acc_finalize:
+  //   - exponent = lead_pos - 26 + scale_exp (24 remaining bits + the -2
+  //     code anchor; the scale re-enters HERE, on an exponent wire only)
+  //   - acc_sticky_i (bits dropped below the remaining field) ORs into
+  //     the sticky term
+  //   - carry-out of an all-ones fraction renormalizes to fraction = 0
+  //     (the shared acc_finalize's mant_ext[23:1] here is a latent bug -
+  //     it keeps the carry as the new fraction MSB; see fp4_golden.py)
+  function automatic logic [31:0] fp4_finalize(
+    input fp4_lead_result_t lr,
+    input logic             acc_sticky_i,
+    input mx_exp_t          scale_exp_i
+  );
+    int          lead_pos;
+    mx_exp_t     unbiased_exp;
+    logic [22:0] mant_out;
+    logic        round_bit, sticky_bit;
+    logic [23:0] mant_ext;
+    logic [7:0]  exp_out;
+    int          i;
+    begin
+      lead_pos = int'(lr.lead_pos);
+      if (lead_pos == -1) return 32'd0;
+
+      unbiased_exp = mx_exp_t'(lead_pos) - mx_exp_t'(FP4_REMAIN_BITS + 2)
+                   + scale_exp_i;
+
+      mant_out   = '0;
+      round_bit  = 1'b0;
+      sticky_bit = acc_sticky_i;
+      for (i = 0; i < 23; i++) begin
+        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
+      end
+      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
+      // Fixed-bound loop, data-dependent guard inside - same synthesizable
+      // pattern as acc_finalize (see its comment for the Vivado history).
+      for (i = 0; i < FP4_LZC_WIDTH; i++) begin
+        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
+      end
+
+      mant_ext = {1'b0, mant_out};
+      if (round_bit && (sticky_bit || mant_out[0])) begin  // round-to-nearest-even
+        mant_ext = mant_ext + 24'd1;
+      end
+
+      if (mant_ext[23]) begin
+        // Carry out of the 23-bit fraction: only reachable from an
+        // all-ones fraction, so the renormalized fraction is exactly 0.
+        unbiased_exp = unbiased_exp + mx_exp_t'(1);
+        mant_out     = '0;
+      end else begin
+        mant_out = mant_ext[22:0];
+      end
+
+      if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
+        exp_out = 8'd0; mant_out = '0;
+      end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
+        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
+      end else begin
+        exp_out = 8'(unbiased_exp + mx_exp_t'(127));
+      end
+
+      return {lr.sign, exp_out, mant_out};
+    end
+  endfunction
+
 
 endpackage
