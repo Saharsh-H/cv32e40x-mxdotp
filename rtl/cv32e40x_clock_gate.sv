@@ -9,6 +9,10 @@ module cv32e40x_clock_gate
     output logic clk_o
 );
 
-    assign clk_o = clk_i;
+    OPENROAD_CLKGATE u_clkgate (
+        .CK  ( clk_i ),
+        .E   ( en_i | scan_cg_en_i ),
+        .GCK ( clk_o )
+    );
 
 endmodule

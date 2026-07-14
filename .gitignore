@@ -9,6 +9,7 @@ TAGS
 
 # Verilator build directory
 tb/obj_dir/
+tb/obj_dir_fp4/
 
 # Simulation files
 tb/tb_mxdotp_core.vcd
