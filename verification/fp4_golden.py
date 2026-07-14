@@ -9,9 +9,26 @@ Mirrors fpnew_mxdotp_accumulator_shift / add_accumulator_sop / twos_compl
 Checked against exact Fraction arithmetic + reference IEEE-754 RNE, with the
 project's output conventions (flush subnormal *results* to +0, clamp overflow
 to max finite, no Inf/NaN handling, bypass returns old_acc verbatim).
+
+Usage:
+  python3 fp4_golden.py                 Verify the golden model only (227k+
+                                         directed/random vectors vs the exact-
+                                         rational reference). Writes nothing.
+                                         Exit code 0 iff fail == 0.
+
+  python3 fp4_golden.py --emit-vectors  Run the SAME full verification first.
+                                         If any check fails, abort with a
+                                         nonzero exit code and write nothing.
+                                         If verification passes, deterministically
+                                         (re)generate tb/fp4_unit_vectors.hex
+                                         from a fixed RNG seed (see EMIT_SEED
+                                         below) - same file every run, on any
+                                         machine, until the seed/vector count
+                                         is deliberately changed.
 """
 from fractions import Fraction
-import random, itertools, sys
+import random, sys, argparse
+from pathlib import Path
 
 # ---- constants (must match RTL) ----
 FRAME_W    = 38
@@ -222,152 +239,258 @@ def bits_to_val(b):
 def zeros_equal(x, y):
     return (x & 0x7FFFFFFF) == 0 and (y & 0x7FFFFFFF) == 0
 
-# ---- harness ----
-fail = 0
-corner_allowed = 0
-corner_examples = []
-corner_tags = {}
-checked = 0
-
-def check(a_nibs, b_nibs, a_raw, b_raw, acc_bits, tag=""):
-    global fail, corner_allowed, checked
-    checked += 1
-    diag = {}
-    got = fp4_fused_model(a_nibs, b_nibs, a_raw, b_raw, acc_bits, diag=diag)
-    exact = reference(a_nibs, b_nibs, a_raw, b_raw, acc_bits)
-
-    if diag['bypass']:
-        if got != acc_bits:
-            fail += 1; print(f"BYPASS FAIL {tag}: got {got:08x} != acc {acc_bits:08x}"); return
-        # exactness proof: |exact - acc| < ulp(acc)/2 strictly
-        accv = fp32_decode_exact(acc_bits)
-        E = (acc_bits >> 23) & 0xFF
-        ulp = Fraction(2) ** (max(E,1) - 127 - 23)
-        if not (abs(exact - accv) < ulp / 2):
-            fail += 1
-            print(f"BYPASS INEXACT {tag}: acc {acc_bits:08x} |exact-acc|={float(abs(exact-accv))} ulp/2={float(ulp/2)}")
-        return
-
-    exp = project_rne(exact)
-    if got == exp or zeros_equal(got, exp):
-        return
-    # allowed deviation (paper-inherited): acc dropped sticky bits below the
-    # 24-bit remaining field AND near-total cancellation put the leading one
-    # at/below bit 23 of the 62-bit word, so the round bit is unrecoverable.
-    if diag['acc_sticky'] and diag['rshift'] > REMAIN and diag['lead'] is not None and diag['lead'] <= 23:
-        gv, ev = bits_to_val(got), bits_to_val(exp)
-        Ee = (exp >> 23) & 0xFF
-        ulp = Fraction(2) ** (max(Ee, 1) - 127 - 23)
-        if abs(gv - ev) <= 2 * ulp:
-            corner_allowed += 1
-            corner_tags[tag] = corner_tags.get(tag, 0) + 1
-            if len(corner_examples) < 5:
-                corner_examples.append((tag, got, exp, float(exact)))
-            return
-    fail += 1
-    if fail <= 20:
-        sop = sum(fp4_to_code(a) * fp4_to_code(b) for a, b in zip(a_nibs, b_nibs))
-        print(f"FAIL {tag}: got {got:08x} exp {exp:08x} exact={float(exact)} "
-              f"sop={sop} scales=({a_raw},{b_raw}) acc={acc_bits:08x} diag={diag}")
-
-# ---- directed vectors ----
 def nibs_for_codes(codes):
-    """inverse of fp4_to_code for building directed vectors"""
+    """Inverse of fp4_to_code, for building directed vectors from a list of
+    signed code values (each in fp4_to_code's range) rather than raw nibbles."""
     inv = {}
     for n in range(16):
         inv.setdefault(fp4_to_code(n), n)
     return [inv[c] for c in codes]
 
-Z16 = [0]*16
+# ---- harness ----
+# Wrapped in a function (rather than run at import time) so this module can
+# be imported by other scripts (e.g. a future vector-emission unit test for
+# another engine) without re-running the sweep, and so --emit-vectors can
+# gate vector writing on this function's result.
+def run_verification(verbose_fails=20):
+    fail = 0
+    corner_allowed = 0
+    corner_examples = []
+    corner_tags = {}
+    checked = 0
 
-# M-test: A.B = 16.0, unit scales, acc=0 -> 0x41800000
-a = nibs_for_codes([4]*8 + [0]*8)   # 8 elements of value 2.0
-b = nibs_for_codes([4]*8 + [0]*8)   # 2*2*8 = 32 ... adjust: want 16
-# value dot = sum(2*2)=32; instead use 4 elements of 2*2: dot=16
-a = nibs_for_codes([4]*4 + [0]*12); b = nibs_for_codes([4]*4 + [0]*12)
-r = fp4_fused_model(a, b, 127, 127, 0x00000000)
-assert r == 0x41800000, hex(r)
-check(a, b, 127, 127, 0x00000000, "M-test")
+    def check(a_nibs, b_nibs, a_raw, b_raw, acc_bits, tag=""):
+        nonlocal fail, corner_allowed, checked
+        checked += 1
+        diag = {}
+        got = fp4_fused_model(a_nibs, b_nibs, a_raw, b_raw, acc_bits, diag=diag)
+        exact = reference(a_nibs, b_nibs, a_raw, b_raw, acc_bits)
 
-# worked example: dot = 10.5, acc = 16.0 -> 26.5 = 0x41D40000
-codes = [12, 12, 12, 2, 1] + [0]*11        # 6*... value: (6*?),: build dot=10.5
-# simpler: A = [3, 1.5, 0.5, ...] B=[2,2,1,...]: 6+3+0.5+1 = 10.5
-a = nibs_for_codes([6, 3, 1, 2] + [0]*12)  # values 3, 1.5, 0.5, 1
-b = nibs_for_codes([4, 4, 2, 2] + [0]*12)  # values 2, 2, 1, 1
-r = fp4_fused_model(a, b, 127, 127, 0x41800000)
-assert r == 0x41D40000, hex(r)             # 26.5
-check(a, b, 127, 127, 0x41800000, "worked-26.5")
+        if diag['bypass']:
+            if got != acc_bits:
+                fail += 1; print(f"BYPASS FAIL {tag}: got {got:08x} != acc {acc_bits:08x}"); return
+            # exactness proof: |exact - acc| < ulp(acc)/2 strictly
+            accv = fp32_decode_exact(acc_bits)
+            E = (acc_bits >> 23) & 0xFF
+            ulp = Fraction(2) ** (max(E,1) - 127 - 23)
+            if not (abs(exact - accv) < ulp / 2):
+                fail += 1
+                print(f"BYPASS INEXACT {tag}: acc {acc_bits:08x} |exact-acc|={float(abs(exact-accv))} ulp/2={float(ulp/2)}")
+            return
 
-# ---- directed sweeps ----
-rng = random.Random(20260712)
+        exp = project_rne(exact)
+        if got == exp or zeros_equal(got, exp):
+            return
+        # allowed deviation (paper-inherited): acc dropped sticky bits below the
+        # 24-bit remaining field AND near-total cancellation put the leading one
+        # at/below bit 23 of the 62-bit word, so the round bit is unrecoverable.
+        if diag['acc_sticky'] and diag['rshift'] > REMAIN and diag['lead'] is not None and diag['lead'] <= 23:
+            gv, ev = bits_to_val(got), bits_to_val(exp)
+            Ee = (exp >> 23) & 0xFF
+            ulp = Fraction(2) ** (max(Ee, 1) - 127 - 23)
+            if abs(gv - ev) <= 2 * ulp:
+                corner_allowed += 1
+                corner_tags[tag] = corner_tags.get(tag, 0) + 1
+                if len(corner_examples) < 5:
+                    corner_examples.append((tag, got, exp, float(exact)))
+                return
+        fail += 1
+        if fail <= verbose_fails:
+            sop = sum(fp4_to_code(a) * fp4_to_code(b) for a, b in zip(a_nibs, b_nibs))
+            print(f"FAIL {tag}: got {got:08x} exp {exp:08x} exact={float(exact)} "
+                  f"sop={sop} scales=({a_raw},{b_raw}) acc={acc_bits:08x} diag={diag}")
 
-def rand_nibs():
-    return [rng.randrange(16) for _ in range(16)]
+    # ---- directed vectors ----
+    # M-test: A.B = 16.0, unit scales, acc=0 -> 0x41800000
+    a = nibs_for_codes([4]*4 + [0]*12); b = nibs_for_codes([4]*4 + [0]*12)
+    check(a, b, 127, 127, 0x00000000, "M-test")
 
-def rand_acc():
-    E = rng.choice([0, 0, 1, 2, 127, 126, 128, 200, 253, 254] + [rng.randrange(255)]*3)
-    return (rng.randrange(2) << 31) | (E << 23) | rng.randrange(1 << 23)
+    # worked example: dot = 10.5, acc = 16.0 -> 26.5 = 0x41D40000
+    # A = [3, 1.5, 0.5, 1, 0...], B = [2, 2, 1, 1, 0...]: 6+3+0.5+1 = 10.5
+    a = nibs_for_codes([6, 3, 1, 2] + [0]*12)
+    b = nibs_for_codes([4, 4, 2, 2] + [0]*12)
+    check(a, b, 127, 127, 0x41800000, "worked-26.5")
 
-special_sops = [
-    ([0]*16, [0]*16),                                   # sop = 0
-    (nibs_for_codes([1]+[0]*15),  nibs_for_codes([1]+[0]*15)),   # sop = 1
-    (nibs_for_codes([-1]+[0]*15), nibs_for_codes([1]+[0]*15)),   # sop = -1
-    (nibs_for_codes([12]*16),     nibs_for_codes([12]*16)),      # sop = +2304
-    (nibs_for_codes([-12]*16),    nibs_for_codes([12]*16)),      # sop = -2304
-    (nibs_for_codes([12]*4+[1]+[0]*11), nibs_for_codes([12]*4+[1]+[0]*11)),  # 577
-]
-special_accs = [0x00000000, 0x80000000, 0x00000001, 0x007FFFFF,   # zero, -0, subnormals
-                0x00800000, 0x3F800000, 0x41800000, 0x7F000000, 0x7F7FFFFF,
-                0x80800001, 0xC0000000, 0x00800001, 0x34000000]
-special_scales = [0, 1, 63, 126, 127, 128, 191, 253, 254]
+    # ---- directed sweeps ----
+    rng = random.Random(20260712)
 
-for (an, bn) in special_sops:
-    for acc in special_accs:
-        for sa in special_scales:
-            for sb in special_scales:
-                check(an, bn, sa, sb, acc, "directed")
+    def rand_nibs():
+        return [rng.randrange(16) for _ in range(16)]
 
-# boundary acc_shift targeting: choose scale pair to hit exact shifts
-for target in [360, 14, 13, 12, 1, 0, -1, -23, -24, -25, -26, -47, -48, -147, -300, -401]:
-    for acc in special_accs:
-        E = (acc >> 23) & 0xFF
-        e_eff = E + (0 if E else 1)
-        need = e_eff - EXP_CONST - target      # scale_exp needed
-        if -254 <= need <= 254:
-            sa = max(0, min(254, need + 127)); sb = need + 254 - sa
-            if 0 <= sb <= 254 and (sa - 127) + (sb - 127) == need:
-                for (an, bn) in special_sops:
-                    check(an, bn, sa, sb, acc, f"shift{target}")
+    def rand_acc():
+        E = rng.choice([0, 0, 1, 2, 127, 126, 128, 200, 253, 254] + [rng.randrange(255)]*3)
+        return (rng.randrange(2) << 31) | (E << 23) | rng.randrange(1 << 23)
 
-# cancellation targeting: sop=+-1 against acc_ext ~ -+2^23-ish (rshift>24)
-one_p = (nibs_for_codes([1]+[0]*15), nibs_for_codes([1]+[0]*15))
-one_n = (nibs_for_codes([-1]+[0]*15), nibs_for_codes([1]+[0]*15))
-for _ in range(20000):
-    E = rng.randrange(1, 255)
-    mant = rng.randrange(1 << 23) | (rng.choice([0, 1 << 22]))
-    for sgn, (an, bn) in ((1, one_p), (0, one_n)):
-        acc = (sgn << 31) | (E << 23) | mant
-        # want rshift in 25..47
-        rsh = rng.randrange(25, 48)
-        need = E - EXP_CONST + rsh
-        if -254 <= need <= 254:
-            sa = max(0, min(254, need + 127)); sb = need + 254 - sa
-            if 0 <= sb <= 254:
-                check(an, bn, sa, sb, acc, "cancel")
+    special_sops = [
+        ([0]*16, [0]*16),                                   # sop = 0
+        (nibs_for_codes([1]+[0]*15),  nibs_for_codes([1]+[0]*15)),   # sop = 1
+        (nibs_for_codes([-1]+[0]*15), nibs_for_codes([1]+[0]*15)),   # sop = -1
+        (nibs_for_codes([12]*16),     nibs_for_codes([12]*16)),      # sop = +2304
+        (nibs_for_codes([-12]*16),    nibs_for_codes([12]*16)),      # sop = -2304
+        (nibs_for_codes([12]*4+[1]+[0]*11), nibs_for_codes([12]*4+[1]+[0]*11)),  # 577
+    ]
+    special_accs = [0x00000000, 0x80000000, 0x00000001, 0x007FFFFF,   # zero, -0, subnormals
+                    0x00800000, 0x3F800000, 0x41800000, 0x7F000000, 0x7F7FFFFF,
+                    0x80800001, 0xC0000000, 0x00800001, 0x34000000]
+    special_scales = [0, 1, 63, 126, 127, 128, 191, 253, 254]
 
-# tie-rounding targeted: random with small scale windows around 0
-for _ in range(60000):
-    check(rand_nibs(), rand_nibs(),
-          rng.choice([125, 126, 127, 128, 129, rng.randrange(255)]),
-          rng.choice([125, 126, 127, 128, 129, rng.randrange(255)]),
-          rand_acc(), "rand-near")
+    for (an, bn) in special_sops:
+        for acc in special_accs:
+            for sa in special_scales:
+                for sb in special_scales:
+                    check(an, bn, sa, sb, acc, "directed")
 
-# broad random
-for _ in range(120000):
-    check(rand_nibs(), rand_nibs(), rng.randrange(255), rng.randrange(255),
-          rand_acc(), "rand")
+    # boundary acc_shift targeting: choose scale pair to hit exact shifts
+    for target in [360, 14, 13, 12, 1, 0, -1, -23, -24, -25, -26, -47, -48, -147, -300, -401]:
+        for acc in special_accs:
+            E = (acc >> 23) & 0xFF
+            e_eff = E + (0 if E else 1)
+            need = e_eff - EXP_CONST - target      # scale_exp needed
+            if -254 <= need <= 254:
+                sa = max(0, min(254, need + 127)); sb = need + 254 - sa
+                if 0 <= sb <= 254 and (sa - 127) + (sb - 127) == need:
+                    for (an, bn) in special_sops:
+                        check(an, bn, sa, sb, acc, f"shift{target}")
 
-print(f"\nchecked={checked} fail={fail} corner_allowed={corner_allowed} by tag: {corner_tags}")
-for ex in corner_examples:
-    print("  corner example:", ex[0], f"got {ex[1]:08x} exp {ex[2]:08x} exact={ex[3]}")
-sys.exit(1 if fail else 0)
+    # cancellation targeting: sop=+-1 against acc_ext ~ -+2^23-ish (rshift>24)
+    one_p = (nibs_for_codes([1]+[0]*15), nibs_for_codes([1]+[0]*15))
+    one_n = (nibs_for_codes([-1]+[0]*15), nibs_for_codes([1]+[0]*15))
+    for _ in range(20000):
+        E = rng.randrange(1, 255)
+        mant = rng.randrange(1 << 23) | (rng.choice([0, 1 << 22]))
+        for sgn, (an, bn) in ((1, one_p), (0, one_n)):
+            acc = (sgn << 31) | (E << 23) | mant
+            # want rshift in 25..47
+            rsh = rng.randrange(25, 48)
+            need = E - EXP_CONST + rsh
+            if -254 <= need <= 254:
+                sa = max(0, min(254, need + 127)); sb = need + 254 - sa
+                if 0 <= sb <= 254:
+                    check(an, bn, sa, sb, acc, "cancel")
+
+    # tie-rounding targeted: random with small scale windows around 0
+    for _ in range(60000):
+        check(rand_nibs(), rand_nibs(),
+              rng.choice([125, 126, 127, 128, 129, rng.randrange(255)]),
+              rng.choice([125, 126, 127, 128, 129, rng.randrange(255)]),
+              rand_acc(), "rand-near")
+
+    # broad random
+    for _ in range(120000):
+        check(rand_nibs(), rand_nibs(), rng.randrange(255), rng.randrange(255),
+              rand_acc(), "rand")
+
+    return {
+        "checked": checked,
+        "fail": fail,
+        "corner_allowed": corner_allowed,
+        "corner_tags": corner_tags,
+        "corner_examples": corner_examples,
+    }
+
+
+# ---- vector emission (deterministic, gated on run_verification() passing) ----
+
+# Fixed seed for --emit-vectors: chosen once and committed here, NOT re-rolled
+# run to run - the whole point is that tb/fp4_unit_vectors.hex is
+# reproducible byte-for-byte from this script alone. Change only deliberately
+# (and note it in a commit message), since it invalidates the shipped .hex.
+EMIT_SEED       = 0x46503452   # arbitrary fixed constant ("FP4R" in ASCII hex)
+EMIT_N_RANDOM   = 20000
+SCRIPT_DIR      = Path(__file__).resolve().parent
+DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "fp4_unit_vectors.hex"
+
+def _pack_nibs(nibs):
+    v = 0
+    for i, n in enumerate(nibs):
+        v |= (n & 0xF) << (4 * i)
+    return v
+
+def _pack_vector_line(a_nibs, b_nibs, a_raw, b_raw, acc_bits):
+    rs1 = _pack_nibs(a_nibs)
+    rs2 = _pack_nibs(b_nibs)
+    rs3 = ((b_raw & 0xFF) << 40) | ((a_raw & 0xFF) << 32) | (acc_bits & 0xFFFFFFFF)
+    exp = fp4_fused_model(a_nibs, b_nibs, a_raw, b_raw, acc_bits)
+    return f"{rs1:016x}{rs2:016x}{rs3:016x}{exp:08x}"
+
+def _directed_emit_vectors():
+    """A handful of fixed, human-checkable cases, always included first -
+    same intent as run_verification()'s directed vectors, kept separate
+    (and much smaller) so the .hex file's first few lines stay meaningful
+    to skim by eye."""
+    codes = nibs_for_codes
+    vecs = []
+    vecs.append((codes([4]*4+[0]*12), codes([4]*4+[0]*12), 127, 127, 0x00000000))   # M-test: 16.0
+    vecs.append((codes([6,3,1,2]+[0]*12), codes([4,4,2,2]+[0]*12), 127, 127, 0x41800000))  # 26.5
+    vecs.append((codes([1]+[0]*15), codes([1]+[0]*15), 0, 0, 0x3F800000))           # bypass (huge neg scale)
+    vecs.append((codes([1]+[0]*15), codes([1]+[0]*15), 254, 254, 0xC0000000))       # deep right shift
+    vecs.append((codes([-12]*16), codes([12]*16), 127, 127, 0x00000001))            # subnormal acc
+    vecs.append((codes([0]*16), codes([0]*16), 200, 200, 0x00400000))               # sop=0 dropped-bits bypass
+    return vecs
+
+def emit_vectors(out_path=None, n_random=EMIT_N_RANDOM, seed=EMIT_SEED):
+    """Deterministically (re)generate the FP4 unit-test vector file. Caller
+    is responsible for having already confirmed run_verification() passed -
+    this function itself does not re-verify, to keep the two responsibilities
+    (checking the model, emitting vectors from it) separate."""
+    out_path = Path(out_path) if out_path is not None else DEFAULT_VECTORS_OUT
+    rng = random.Random(seed)
+
+    lines = []
+    for a_nibs, b_nibs, sa, sb, acc in _directed_emit_vectors():
+        lines.append(_pack_vector_line(a_nibs, b_nibs, sa, sb, acc))
+    for _ in range(n_random):
+        a = [rng.randrange(16) for _ in range(16)]
+        b = [rng.randrange(16) for _ in range(16)]
+        sa, sb = rng.randrange(255), rng.randrange(255)
+        acc = (rng.randrange(2) << 31) | (rng.randrange(255) << 23) | rng.randrange(1 << 23)
+        lines.append(_pack_vector_line(a, b, sa, sb, acc))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return len(lines), out_path
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="MXFP4 fused-engine golden model: verify, and optionally "
+                    "(re)generate tb/fp4_unit_vectors.hex from a fixed seed."
+    )
+    ap.add_argument("--emit-vectors", action="store_true",
+                     help="After a full passing verification, deterministically "
+                          "regenerate the FP4 unit-test vector file. Writes "
+                          "nothing if verification fails.")
+    ap.add_argument("--vectors-out", default=None,
+                     help=f"Override the output path (default: {DEFAULT_VECTORS_OUT}).")
+    ap.add_argument("--n-random", type=int, default=EMIT_N_RANDOM,
+                     help=f"Number of random vectors to emit (default: {EMIT_N_RANDOM}).")
+    ap.add_argument("--seed", type=int, default=EMIT_SEED,
+                     help=f"RNG seed for emitted vectors (default: 0x{EMIT_SEED:x}). "
+                          "Only override deliberately - changing it changes the "
+                          "committed .hex file's contents.")
+    args = ap.parse_args()
+
+    result = run_verification()
+    print(f"\nchecked={result['checked']} fail={result['fail']} "
+          f"corner_allowed={result['corner_allowed']} by tag: {result['corner_tags']}")
+    for ex in result["corner_examples"]:
+        print("  corner example:", ex[0], f"got {ex[1]:08x} exp {ex[2]:08x} exact={ex[3]}")
+
+    if result["fail"]:
+        print(f"\nVERIFICATION FAILED ({result['fail']} mismatches) - "
+              f"aborting without writing any vector file.", file=sys.stderr)
+        sys.exit(1)
+
+    print("\nVerification PASSED.")
+
+    if not args.emit_vectors:
+        sys.exit(0)
+
+    n, out_path = emit_vectors(args.vectors_out, n_random=args.n_random, seed=args.seed)
+    print(f"Wrote {n} vectors to {out_path} (seed=0x{args.seed:x}).")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

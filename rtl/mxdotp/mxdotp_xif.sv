@@ -172,6 +172,30 @@ module mxdotp_xif
     always_comb begin
         issue_if.issue_resp = '0;
 
+        // dualread is a pure function of instruction encoding (mx_operation,
+        // itself decoded from issue_req.instr alone by mxdotp_decoder, whose
+        // ONLY input is instr - see decoder_i above). Computed unconditionally
+        // here, NOT gated on issue_valid/issue_ready like its sibling fields
+        // below, so it has zero dependency on anything downstream of the
+        // issue handshake and cannot participate in a combinational cycle
+        // back through issue_valid. This was previously computed inside the
+        // gated block below (identical expression), which created exactly
+        // that cycle: issue_resp.dualread -> cv32e40x_id_stage.sv's
+        // rf_re_o[5:3]/issue_req.rs[0:2] -> controller_bypass.sv hazard
+        // logic -> controller_fsm.sv stall decision -> instr_valid ->
+        // issue_valid -> back into this always_comb block. Confirmed by two
+        // independent tools (Yosys post-flatten CHECK, Verilator UNOPTFLAT)
+        // and traced end-to-end through the actual RTL. The truth table is
+        // UNCHANGED (still 1 for DOTP/DUALREAD_TEST/FUSED, 0 for FINAL) -
+        // only WHEN it's computed changed, not WHAT it means. Per the
+        // CV-X-IF spec's own wording ("signals in issue_resp are valid when
+        // issue_valid and issue_ready are both 1 - there are no stability
+        // requirements"), that's a floor on what a consumer may rely on, not
+        // a ceiling on when the coprocessor may compute the real value.
+        issue_if.issue_resp.dualread = is_mx && ((mx_operation == MX_FUNCT3_DOTP) ||
+                                                  (mx_operation == MX_FUNCT3_DUALREAD_TEST) ||
+                                                  (mx_operation == MX_FUNCT3_FUSED));
+
         if (issue_if.issue_valid && is_mx && issue_if.issue_ready) begin
             issue_if.issue_resp.accept = 1'b1;
             // MXDOTP stages its raw dot-product sums in the mailbox and does
@@ -198,10 +222,8 @@ module mxdotp_xif
             // MXFINAL's rs1 is today, just relocated and dual-read since it
             // now needs the full 64 bits). MX_FUNCT3_DUALREAD_TEST also
             // requests it, independent of format, for its own validation
-            // purpose (see mxdotp_pkg.sv).
-            issue_if.issue_resp.dualread  = (mx_operation == MX_FUNCT3_DOTP) ||
-                                             (mx_operation == MX_FUNCT3_DUALREAD_TEST) ||
-                                             (mx_operation == MX_FUNCT3_FUSED);
+            // purpose (see mxdotp_pkg.sv). dualread itself is now assigned
+            // unconditionally above - see that comment for why.
         end
     end
 

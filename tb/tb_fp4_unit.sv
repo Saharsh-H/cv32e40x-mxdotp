@@ -5,11 +5,18 @@
 // (exercising the global stall), and compares every result against the
 // Python golden model's own output (fp4_golden.py), which was itself
 // verified against an exact-rational reference.
+//
+// The vector count is NOT hardcoded: it's derived from the vector file
+// itself (a dynamic array sized by a line count taken before $readmemh), so
+// fp4_golden.py's --emit-vectors can freely change how many vectors it
+// emits (directed + random count) without this file needing to track that
+// number in lockstep.
 module tb_fp4_unit;
   import mxdotp_pkg::*;
 
-  localparam int N = 20000;
-  logic [223:0] vec [0:N-1];   // {rs1[64], rs2[64], rs3[64], expected[32]} packed as hex
+  logic [223:0] vec [];   // {rs1[64], rs2[64], rs3[64], expected[32]} packed as hex;
+                          // dynamically sized in the initial block below.
+  int N;
 
   logic clk = 0, rst_n = 0;
   always #5 clk = ~clk;
@@ -37,7 +44,33 @@ module tb_fp4_unit;
   logic [31:0] expq [$];
 
   initial begin
-    $readmemh("fp4_unit_vectors.hex", vec);
+    int fd, c;
+    string line;
+    // Pass 1: count lines (= vector count) so the array can be sized
+    // exactly, rather than assuming a fixed N that would silently go stale
+    // whenever the golden script's emitted vector count changes.
+    fd = $fopen("fp4_unit_vectors.hex", "r");
+    if (fd == 0) $fatal(1, "tb_fp4_unit: cannot open fp4_unit_vectors.hex - run `make fp4` from tb/, or regenerate it via verification/fp4_golden.py --emit-vectors");
+    N = 0;
+    while ($fgets(line, fd) != 0) begin
+      if (line.len() > 0) N++;
+    end
+    $fclose(fd);
+    if (N == 0) $fatal(1, "tb_fp4_unit: fp4_unit_vectors.hex is empty");
+
+    // Pass 2: parse each line as a 56-hex-digit (224-bit) value. $readmemh
+    // itself can't target a dynamic array in Verilator, so do it by hand;
+    // $fgets keeps the trailing newline in `line`, which %h simply stops at.
+    vec = new[N];
+    fd = $fopen("fp4_unit_vectors.hex", "r");
+    for (int i = 0; i < N; i++) begin
+      c = $fgets(line, fd);
+      if (c == 0) $fatal(1, "tb_fp4_unit: fp4_unit_vectors.hex ended early at line %0d/%0d", i, N);
+      if ($sscanf(line, "%h", vec[i]) != 1)
+        $fatal(1, "tb_fp4_unit: malformed hex line %0d: %s", i, line);
+    end
+    $fclose(fd);
+
     rst_n = 0; start = 0; rready = 0;
     repeat (4) @(posedge clk);
     rst_n = 1;
@@ -77,7 +110,7 @@ module tb_fp4_unit;
   end
 
   initial begin
-    #10ms;
+    #20ms;
     $fatal(1, "timeout");
   end
 endmodule

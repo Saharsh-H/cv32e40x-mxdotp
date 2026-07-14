@@ -101,7 +101,6 @@ VERILATOR_FLAGS := \
 	-O3 \
     --timing \
 	-Wall \
-	-Wno-UNOPTFLAT \
 	-Wno-BLKANDNBLK \
 	-I$(RTL_DIR)/include \
 	-I$(MXDOTP_RTL_DIR) \
@@ -159,26 +158,38 @@ $(EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
 # Each gets its own --Mdir (obj_dir_<name>) so unit builds never collide with
 # each other or with the system build's obj_dir.
 #
-# The golden-model Python scripts that generate/check each unit's vectors
-# live in verification/ (one level up from tb/) - this Makefile does not
-# invoke them; regenerating vectors is a separate, explicit step for now.
+# If a unit test has a golden-model Python script (verification/, one level
+# up from tb/), setting <name>_GOLDEN to that script's path makes `make
+# <name>` automatically run it with --emit-vectors first: the script re-runs
+# its full verification sweep and only (re)writes the vector file if every
+# check passes, aborting the whole `make <name>` (nothing builds or runs) if
+# not. This is optional per test - a unit test with no _GOLDEN variable set
+# just skips straight to build+run, same as before.
 #
-# TO ADD A NEW ONE: define <name>_ENGINE_SRCS, add <name> to UNIT_TESTS,
-# and drop tb_<name>_unit.sv into tb/. That's the entire integration.
+# TO ADD A NEW ONE: define <name>_ENGINE_SRCS (and <name>_GOLDEN, if it has
+# a golden-model script), add <name> to UNIT_TESTS, and drop
+# tb_<name>_unit.sv into tb/. That's the entire integration.
 #==============================================================================
+
+VERIFICATION_DIR := $(ROOT_DIR)/verification
 
 # --- registered unit tests ---------------------------------------------------
 
 UNIT_TESTS := fp4
 
 fp4_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_fused_engine.sv
+fp4_GOLDEN      := $(VERIFICATION_DIR)/fp4_golden.py
 
-# Future targets - uncomment the ENGINE_SRCS line and add the name to
-# UNIT_TESTS once both the engine RTL and tb_<name>_unit.sv exist:
+# Future targets - uncomment the ENGINE_SRCS line (and _GOLDEN, once each has
+# its own golden-model script) and add the name to UNIT_TESTS once both the
+# engine RTL and tb_<name>_unit.sv exist:
 #
 # fp8_ENGINE_SRCS     := $(MXDOTP_RTL_DIR)/mxdotp_fp8_fused_engine.sv
+# fp8_GOLDEN          := $(VERIFICATION_DIR)/fp8_golden.py
 # fp4r_ENGINE_SRCS    := $(MXDOTP_RTL_DIR)/mxdotp_dotp_engine.sv
+# fp4r_GOLDEN         := $(VERIFICATION_DIR)/fp4r_golden.py
 # mxfinal_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_final_engine.sv
+# mxfinal_GOLDEN      := $(VERIFICATION_DIR)/mxfinal_golden.py
 #
 # UNIT_TESTS += fp8 fp4r mxfinal
 
@@ -200,6 +211,16 @@ UNIT_VERILATOR_FLAGS := \
 # $(1) is the unit test name (e.g. "fp4"). Every variable/target it defines
 # is namespaced by $(1), so instantiating it once per registered test (via
 # the $(foreach)/$(eval) below) never collides across tests.
+#
+# $(1)-vectors is always a prerequisite of $(1): when $(1)_GOLDEN is set it
+# regenerates+verifies the vector file (aborting on failure); when unset it's
+# a harmless no-op. Vector regeneration doesn't affect what gets compiled
+# (Verilator has no vector-file dependency; tb_$(1)_unit.sv reads it at
+# SIMULATION run time via $$readmemh), so $(1)-vectors and the executable
+# build are independent and Make is free to satisfy either first - the only
+# thing guaranteed, which is the only thing that matters here, is that both
+# complete successfully before $(1)'s own recipe (which runs the binary)
+# starts.
 
 define UNIT_TEST_template
 
@@ -208,8 +229,16 @@ $(1)_BUILD_DIR  := obj_dir_$(1)
 $(1)_TB_SRC     := $(TB_DIR)/tb_$(1)_unit.sv
 $(1)_EXECUTABLE := $$($(1)_BUILD_DIR)/V$$($(1)_TOP)
 
-.PHONY: $(1)
-$(1): $$($(1)_EXECUTABLE)
+.PHONY: $(1) $(1)-vectors
+ifneq ($$($(1)_GOLDEN),)
+$(1)-vectors:
+	@cd $(TB_DIR) && python3 $$($(1)_GOLDEN) --emit-vectors
+else
+$(1)-vectors:
+	@:
+endif
+
+$(1): $(1)-vectors $$($(1)_EXECUTABLE)
 	@echo
 	@echo "==============================="
 	@echo "Running $(1) unit testbench ($$($(1)_TOP))..."
