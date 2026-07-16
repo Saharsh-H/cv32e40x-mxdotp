@@ -7,6 +7,8 @@
 #                        workflow from before this reorganization.
 #   make fp4             standalone FP4 fused-engine unit test (tb_fp4_unit.sv
 #                        driving mxdotp_fused_engine.sv directly, no core/XIF).
+#   make fp8             standalone FP8 fused-engine unit test (tb_fp8_unit.sv
+#                        driving mxdotp_fp8_fused_engine.sv directly).
 #   make units           runs every registered standalone unit test in turn.
 #   make clean           removes all build outputs (system + every unit test).
 #
@@ -175,23 +177,24 @@ VERIFICATION_DIR := $(ROOT_DIR)/verification
 
 # --- registered unit tests ---------------------------------------------------
 
-UNIT_TESTS := fp4
+UNIT_TESTS := fp4 fp8
 
 fp4_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_fused_engine.sv
 fp4_GOLDEN      := $(VERIFICATION_DIR)/fp4_golden.py
+
+fp8_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_fp8_fused_engine.sv
+fp8_GOLDEN      := $(VERIFICATION_DIR)/fp8_golden.py
 
 # Future targets - uncomment the ENGINE_SRCS line (and _GOLDEN, once each has
 # its own golden-model script) and add the name to UNIT_TESTS once both the
 # engine RTL and tb_<name>_unit.sv exist:
 #
-# fp8_ENGINE_SRCS     := $(MXDOTP_RTL_DIR)/mxdotp_fp8_fused_engine.sv
-# fp8_GOLDEN          := $(VERIFICATION_DIR)/fp8_golden.py
 # fp4r_ENGINE_SRCS    := $(MXDOTP_RTL_DIR)/mxdotp_dotp_engine.sv
 # fp4r_GOLDEN         := $(VERIFICATION_DIR)/fp4r_golden.py
 # mxfinal_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_final_engine.sv
 # mxfinal_GOLDEN      := $(VERIFICATION_DIR)/mxfinal_golden.py
 #
-# UNIT_TESTS += fp8 fp4r mxfinal
+# UNIT_TESTS += fp4r mxfinal
 
 # --- shared flags for every unit test ----------------------------------------
 

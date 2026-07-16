@@ -33,8 +33,8 @@ from pathlib import Path
 # ---- constants (must match RTL) ----
 FRAME_W    = 38
 MAX_SHIFT  = 13          # FRAME_W - 24 - 1
-REMAIN     = 24
-LZC_W      = 62          # FRAME_W + REMAIN
+REMAIN     = 25
+LZC_W      = FRAME_W + REMAIN
 EXP_CONST  = 148         # 127 (FP32 bias) + 23 (mant frac) - 2 (code anchor)
 
 # ---- E2M1 decode: code = 2*value ----
@@ -186,7 +186,7 @@ def fp4_fused_model(a_nibs, b_nibs, a_raw, b_raw, acc_bits, trace=False, diag=No
     sticky = acc_sticky
     if lead - 24 > 0 and (mag & ((1 << (lead - 24)) - 1)):
         sticky = 1
-    unb = lead - 26 + scale_exp
+    unb = lead - (REMAIN + 2) + scale_exp
     m_ext = mant_out
     if round_bit and (sticky or (mant_out & 1)):
         m_ext += 1

@@ -24,8 +24,8 @@
 //   - the SoP never moves: it IS the frame (13-bit signed integer straight
 //     from the front-end, zero shifters on the wide path for it);
 //   - only the ACCUMULATOR slides, by (acc_exp - combined_scale), with a
-//     24-bit 'remaining' capture + sticky below the 38-bit frame;
-//   - BACK2/BACK3 run on the 62-bit extended word (was 98 bits);
+//     25-bit 'remaining' capture + sticky below the 38-bit frame;
+//   - BACK2/BACK3 run on the 63-bit extended word (was 98 bits);
 //   - the scale re-enters on the final EXPONENT only (BACK3), never on the
 //     wide datapath;
 //   - the scale adder itself (scale_exp) is HOISTED into the front-end
@@ -43,13 +43,22 @@
 //   results are exact-to-RNE for ANY E8M0 scale pair and ANY
 //   normal/subnormal FP32 accumulator (subnormal accumulators were
 //   previously flushed; scale_exp < 0 previously truncated SoP bits;
-//   |acc| outside ~[2^-11, 2^60] previously flushed/saturated), except the
-//   single bounded corner documented in mxdotp_pkg.sv. When the SoP cannot
-//   affect the accumulator (acc_shift > FP4_MAX_ACC_SHIFT, or SoP == 0
-//   with accumulator bits already dropped below the remaining field), the
-//   result is old_acc VERBATIM - proven exact, |SoP contribution| <
-//   ulp(acc)/2 strictly. Golden model: fp4_golden.py (227k+ vectors vs an
-//   exact-rational reference, 0 failures).
+//   |acc| outside ~[2^-11, 2^60] previously flushed/saturated). When the
+//   SoP cannot affect the accumulator (acc_shift > FP4_MAX_ACC_SHIFT, or
+//   SoP == 0 with accumulator bits already dropped below the remaining
+//   field), the result is old_acc VERBATIM - proven exact, |SoP
+//   contribution| < ulp(acc)/2 strictly. Golden model: fp4_golden.py (227k+
+//   vectors vs an exact-rational reference, 0 failures, 0 corner-case
+//   deviations).
+//
+//   FP4_REMAIN_BITS 24->25 (this milestone): the previous 24-bit remaining
+//   field had a bounded 1-ulp deviation under catastrophic cancellation -
+//   with acc_sticky asserted (right-shift > REMAIN) and SoP != 0, the
+//   extended word's leading one could land as low as bit 23, putting the
+//   round bit inside the already-crushed sticky region. Widening REMAIN to
+//   25 pushes the minimum leading-one position to bit 24, so the round bit
+//   is always inside the kept word. See mxdotp_pkg.sv's FP4_FRAME_WIDTH
+//   header for the closed-form bound.
 //
 //   OVERLAP MILESTONE (unchanged): genuine 5-register-point pipeline
 //   (input capture, sop_q/BACK1 inputs, sum_q, lead_q, result_data_q) with
@@ -145,7 +154,7 @@ module mxdotp_fused_engine
   mx_exp_t                       sexp_q1;      // hoisted scale_exp(a,b)
   logic [31:0]                   old_acc_q1;   // FP32 accumulator operand
 
-  // Stage 2 (post BACK1): the 62-bit extended word {frame38, remaining24}
+  // Stage 2 (post BACK1): the 63-bit extended word {frame38, remaining25}
   // plus the flags/values BACK2/BACK3 need.
   logic                              sum_valid_q;
   logic [X_ID_WIDTH-1:0]             sum_id_q;
@@ -313,8 +322,8 @@ module mxdotp_fused_engine
   //----------------------------------------------------------------------------
   // BACK1: the accumulator slide. The SoP (sop_q) is already frame-resident
   // and untouched; this stage only decodes the FP32 accumulator, computes
-  // its shift against the scale-free frame, and produces the 62-bit
-  // extended word {frame38, remaining24} plus sticky/bypass flags. See
+  // its shift against the scale-free frame, and produces the 63-bit
+  // extended word {frame38, remaining25} plus sticky/bypass flags. See
   // mxdotp_pkg.sv's FP4_FRAME_WIDTH milestone header for the scheme,
   // layouts, and the exactness proofs referenced below.
   //----------------------------------------------------------------------------
@@ -332,7 +341,7 @@ module mxdotp_fused_engine
   int          dropped;           // shift below 'remaining' (clamped), 1..25
   logic signed [FP4_FRAME_WIDTH-1:0] acc_inframe;
   logic signed [FP4_FRAME_WIDTH-1:0] frame38;
-  logic signed [48:0]                rem_wide;   // smant << (0..24) fits in 49b
+  logic signed [49:0]                rem_wide;   // smant << (0..25) fits in 50b
   logic [FP4_REMAIN_BITS-1:0]        remaining;
   logic [25:0]                       drop_mask;
 
@@ -371,7 +380,7 @@ module mxdotp_fused_engine
       lsh         = int'(acc_shift);
       acc_inframe = FP4_FRAME_WIDTH'(smant) <<< lsh;
     end else begin
-      // Right shift: floor-truncation at 24-fractional-bit resolution.
+      // Right shift: floor-truncation at 25-fractional-bit resolution.
       // Shift amounts are clamped at 25: smant is 25 bits, so any
       // arithmetic right shift >= 25 already yields pure sign bits (and
       // any drop mask >= 25 bits already covers the whole mantissa) -
@@ -391,7 +400,7 @@ module mxdotp_fused_engine
         // the sticky path - return it verbatim instead (exact).
         if (sop_q == '0) back1_is_acc_comb = 1'b1;
       end else begin
-        rem_wide  = 49'(smant) <<< (FP4_REMAIN_BITS + int'(acc_shift));
+        rem_wide  = 50'(smant) <<< (FP4_REMAIN_BITS + int'(acc_shift));
         remaining = rem_wide[FP4_REMAIN_BITS-1:0];
       end
     end
@@ -419,7 +428,7 @@ module mxdotp_fused_engine
 
   //----------------------------------------------------------------------------
   // BACK2: sign/magnitude (with the sticky-negation adjust) + leading-one
-  // scan on the 62-bit extended word (mxdotp_pkg.sv's fp4_find_lead).
+  // scan on the 63-bit extended word (mxdotp_pkg.sv's fp4_find_lead).
   //----------------------------------------------------------------------------
 
   always_comb begin

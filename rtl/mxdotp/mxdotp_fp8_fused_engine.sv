@@ -5,52 +5,81 @@
 // Description:
 //   Standalone MXFUSED arithmetic engine for the MXFP8 element formats
 //   (OCP MX: E4M3 and E5M2) - the sibling of mxdotp_fused_engine.sv, which
-//   handles MXFP4. This is DELIBERATELY a separate engine for now:
+//   handles MXFP4. This is DELIBERATELY a separate engine: E4M3/E5M2 have
+//   real biased exponents and real mantissas, so every element pair's
+//   product lands at its OWN exponent position - each product must be
+//   shifted into the frame individually and summed there (the paper's
+//   "early accumulation"), unlike MXFP4's plain-integer SoP.
 //
-//     MXFP8 is NOT a reparameterization of MXFP4's exact "code = 2*value"
-//     fixed-point trick. E2M1 elements are all exact multiples of 0.5, so a
-//     whole block of MXFP4 products can be summed as plain integers FIRST and
-//     placed into the wide accumulator ONCE (one exponent for the lot). E4M3
-//     and E5M2 have real biased exponents and real mantissas, so every element
-//     pair's product lands at its OWN exponent position - each product must be
-//     shifted into the wide fixed-point accumulator individually and summed
-//     THERE (the paper's "early accumulation"). That makes the front-end +
-//     BACK1 a structurally different shape from MXFP4's, which is exactly why
-//     this is its own module rather than another branch in the format mux.
+//   MILESTONE (current): dedicated FP8 sliding-accumulator frame. The
+//   previous version placed each product AND the FP32 accumulator into the
+//   shared 95-bit/anchor-34 ABSOLUTE window (place_in_acc / fp32_to_acc)
+//   and finalized through the shared acc_find_lead / acc_finalize. That
+//   mis-read the reference's sizing: its ANCHOR=34 is the fractional point
+//   of a scale-FREE product frame in the factored form
 //
-//   Sharing the back-end is a later refactor (BACK2/BACK3 here are literally
-//   the same acc_find_lead / acc_finalize this project already uses). For now
-//   this file duplicates the overlap pipeline SKELETON on purpose, so MXFP8
-//   can be brought up and validated without touching the working MXFP4 path.
+//     result = s1*s2 * ( A.B + acc/(s1*s2) )
+//
+//   (fpnew_mxdotp_accumulator_shift slides the ACCUMULATOR by the scale;
+//   the products never see the scale) - NOT an absolute fixed-point
+//   anchor. Used absolutely, the window imposed a hard |value| range of
+//   ~[2^-11, 2^60]: accumulators/products below it lost round/sticky
+//   information (place_in_acc's right-shift dropped bits with no sticky
+//   capture, and acc_finalize has no sticky input), and values above it
+//   saturated. This milestone replaces that with the reference's own
+//   scheme, mirroring the FP4 engine's BACK1 structure exactly:
+//
+//   - each product is shifted into a 95-bit SCALE-FREE frame (anchor 32:
+//     frame bit b = value weight 2^(b-32); the smallest possible product,
+//     E5M2 subnormal^2 = 2^-32, lands exactly on bit 0 - every product is
+//     exact in-frame, zero truncation) and the 8 are summed into a 70-bit
+//     signed SoP; the SoP never moves after that;
+//   - only the ACCUMULATOR slides, by (acc_exp - combined_scale), with a
+//     25-bit 'remaining' capture + sticky below the frame;
+//   - BACK2/BACK3 run on the 120-bit extended word (fp8_find_lead /
+//     fp8_finalize, siblings of the FP4 pair in mxdotp_pkg.sv);
+//   - the scale re-enters on the final EXPONENT only (BACK3), never on the
+//     wide datapath; the scale adder stays HOISTED in FRONT (Phase 18),
+//     but now feeds a forwarded sexp_q1 register instead of being folded
+//     into each product's exponent.
+//
+//   Behavioral deltas vs the absolute-window version (all intended):
+//   results are exact-to-RNE for ANY E8M0 scale pair and ANY
+//   normal/subnormal FP32 accumulator (subnormal accumulators were
+//   previously flushed by fp32_to_acc; contributions below the old window
+//   floor previously lost round/sticky; |value| above ~2^60 previously
+//   saturated to a mid-range ceiling rather than FP32 max). When the SoP
+//   cannot affect the accumulator (acc_shift > FP8_MAX_ACC_SHIFT, or
+//   SoP == 0 with accumulator bits already dropped below the remaining
+//   field), the result is old_acc VERBATIM - proven exact per-vector,
+//   |SoP contribution| < ulp(acc)/2 strictly (margin ~1.3x at the shift-71
+//   boundary; see mxdotp_pkg.sv's FP8 frame header). Golden model:
+//   fp8_golden.py (325k+ vectors across two seeds vs an exact-rational
+//   reference, 0 failures, 0 corner-case deviations). FP8_REMAIN_BITS=25
+//   (not the reference's 24) closes the same 1-ulp cancellation corner the
+//   FP4 engine's REMAIN bump closed - same closed-form bound.
 //
 //   OVERLAP / PIPELINE (identical discipline to mxdotp_fused_engine.sv):
-//   five register points (input capture, prod_q [post front-end decode+mult],
-//   sum_q [post BACK1], lead_q [post BACK2], result_data_q [post BACK3 /
-//   output]), each carrying its own valid bit + {id, rd} sideband, shifting
-//   forward one stage per cycle. A single global stall
-//   (stall = result_valid_q && !result_ready_i) freezes every register in the
-//   same cycle; ready_o is exactly !stall. Up to 5 instructions genuinely
-//   in flight at once.
+//   five register points (input capture, prod_q [post front-end
+//   decode+mult], sum_q [post BACK1], lead_q [post BACK2], result_data_q
+//   [post BACK3/output]), each carrying its own valid bit + {id, rd}
+//   sideband, shifting forward one stage per cycle. A single global stall
+//   (stall = result_valid_q && !result_ready_i) freezes every register in
+//   the same cycle; ready_o is exactly !stall. Up to 5 instructions
+//   genuinely in flight at once.
 //
 //   rs3 handling under overlap: rs3 packs {reserved[15:0], b_scale, a_scale}
-//   in its upper 32 bits (from rs3+1) and old_acc in its lower 32, all captured
-//   at the INPUT stage alongside rs1/rs2. The scales AND the E4M3/E5M2 sub-format
-//   bit are consumed in the FRONT stage (all three input-stage regs belong to
-//   the same instruction that cycle): FRONT computes the block scale exponent
-//   scale_exp(a_scale,b_scale) and folds it - together with each element pair's
-//   own exponents - straight into prod_q[].exp, so each product carries its FULL
-//   place_in_acc shift amount forward. This deliberately keeps the scale_exp
-//   adder and the per-lane exponent adds OFF the BACK1 critical path (ASIC
-//   synthesis showed them as BACK1's serial prefix, feeding all 8 shift lanes -
-//   BACK1 was the critical stage). The only thing BACK1 still needs from rs3 is
-//   old_acc, so only old_acc[31:0] is carried forward one register (old_acc_q1)
-//   to stay aligned with prod_q; the scales/sub-format/reserved bits do not need
-//   forwarding, having already been consumed in FRONT.
+//   in its upper 32 bits (from rs3+1) and old_acc in its lower 32, all
+//   captured at the INPUT stage alongside rs1/rs2. The scales AND the
+//   E4M3/E5M2 sub-format bit are consumed in the FRONT stage; FRONT
+//   computes scale_exp(a_scale,b_scale) and registers it as sexp_q1
+//   (forwarded to BACK1 for the accumulator slide and onward to BACK3 for
+//   the final exponent - the FP4 engine's exact pattern). Only old_acc and
+//   sexp travel forward; the sub-format/reserved bits are consumed in FRONT.
 //
 //   k = 8 elements per 64-bit dual-read operand (8*8 = 64), NOT 16: this is
-//   the paper's own MXFP8/k=8 datapath, exactly what ACC_WIDTH=95 /
-//   ACC_ANCHOR=34 / ACC_FULL_WIDTH=98 were originally sized to hold (the sum
-//   of eight products plus the shifted old accumulator). See mxdotp_pkg.sv.
+//   the paper's own MXFP8/k=8 datapath. Frame sizing in mxdotp_pkg.sv's
+//   FP8_FRAME_WIDTH section.
 //
 //   Element-format sub-select (E4M3 vs E5M2): funct2 only carries a single
 //   MX_FMT_MXFP8 code, so the E4M3/E5M2 choice is taken from rs3 bit 48 - the
@@ -63,8 +92,8 @@
 //   handling anywhere in this datapath): max-exponent E4M3 NaN (S.1111.111)
 //   and E5M2 Inf/NaN (S.11111.xx) decode to their plain finite numeric
 //   interpretation rather than propagating NaN/Inf. Subnormals (biased
-//   exp field == 0) ARE handled correctly (implicit leading bit = 0, exponent
-//   = 1 - bias - mant_bits), since place_in_acc takes an arbitrary exponent.
+//   exp field == 0) ARE handled correctly (implicit leading bit = 0,
+//   exponent = 1 - bias - mant_bits); the frame's anchor covers them exactly.
 //==============================================================================
 
 module mxdotp_fp8_fused_engine
@@ -120,14 +149,16 @@ module mxdotp_fp8_fused_engine
   wire _unused = &{1'b0, mx_format_i};
 
   //----------------------------------------------------------------------------
-  // One decoded product: sign, its own signed exponent (already carrying the
-  // per-element bias/mantissa-scale correction), and the integer mantissa
-  // product magnitude (zero-extended to 32 bits, ready for place_in_acc).
+  // One decoded product: sign, its own signed exponent (element exponents
+  // ONLY - the block scale is NOT folded in; it drives the accumulator
+  // slide and the final exponent instead, exactly like the FP4 engine),
+  // and the integer mantissa product magnitude (max 15*15 = 225, 8 bits;
+  // held in 16 for the multiplier's natural width).
   //----------------------------------------------------------------------------
   typedef struct packed {
     logic        sign;
     mx_exp_t     exp;
-    logic [31:0] mag;
+    logic [15:0] mag;
   } fp8_prod_t;
 
   //----------------------------------------------------------------------------
@@ -144,19 +175,32 @@ module mxdotp_fp8_fused_engine
   logic [X_ID_WIDTH-1:0]  prod_id_q;
   logic [4:0]             prod_rd_q;
   fp8_prod_t              prod_q [0:MX_K8-1];
-  logic [31:0]            old_acc_q1;   // only old_acc carried forward one stage
-                                         // to stay aligned with prod_q; scales &
-                                         // sub-format consumed in FRONT - see header.
+  mx_exp_t                sexp_q1;      // hoisted scale_exp(a,b) - forwarded,
+                                         // no longer folded into prod exps
+  logic [31:0]            old_acc_q1;   // FP32 accumulator operand
 
-  logic                   sum_valid_q;
-  logic [X_ID_WIDTH-1:0]  sum_id_q;
-  logic [4:0]             sum_rd_q;
-  logic signed [ACC_FULL_WIDTH-1:0] sum_q;
+  // Stage 2 (post BACK1): the 120-bit extended word {frame95, remaining25}
+  // plus the flags/values BACK2/BACK3 need. Same register set as the FP4
+  // engine's stage 2.
+  logic                              sum_valid_q;
+  logic [X_ID_WIDTH-1:0]             sum_id_q;
+  logic [4:0]                        sum_rd_q;
+  logic signed [FP8_LZC_WIDTH-1:0]   sum_q;
+  logic                              acc_sticky_q2;  // acc bits dropped below 'remaining'
+  logic                              neg_adj_q2;     // fp8_find_lead's sticky-negation adjust
+  logic                              is_acc_q2;      // result-is-accumulator bypass
+  mx_exp_t                           sexp_q2;
+  logic [31:0]                       old_acc_q2;
 
+  // Stage 3 (post BACK2).
   logic                   lead_valid_q;
   logic [X_ID_WIDTH-1:0]  lead_id_q;
   logic [4:0]             lead_rd_q;
-  mx_lead_result_t        lead_q;
+  fp8_lead_result_t       lead_q;
+  logic                   acc_sticky_q3;
+  logic                   is_acc_q3;
+  mx_exp_t                sexp_q3;
+  logic [31:0]            old_acc_q3;
 
   logic                   result_valid_q;
   logic [X_ID_WIDTH-1:0]  result_id_q;
@@ -173,8 +217,12 @@ module mxdotp_fp8_fused_engine
 
   // Forward decls of the combinational stage outputs (defined below).
   fp8_prod_t                        prod_comb [0:MX_K8-1];
-  logic signed [ACC_FULL_WIDTH-1:0] back1_sum_comb;
-  mx_lead_result_t                  back2_lead_comb;
+  mx_exp_t                          sexp_comb;
+  logic signed [FP8_LZC_WIDTH-1:0]  back1_word_comb;
+  logic                             back1_acc_sticky_comb;
+  logic                             back1_neg_adj_comb;
+  logic                             back1_is_acc_comb;
+  fp8_lead_result_t                 back2_lead_comb;
   logic [31:0]                      back3_result_comb;
 
   integer k;
@@ -186,13 +234,23 @@ module mxdotp_fp8_fused_engine
 
       prod_valid_q <= 1'b0; prod_id_q <= '0; prod_rd_q <= '0;
       for (k = 0; k < MX_K8; k++) prod_q[k] <= '0;
+      sexp_q1    <= '0;
       old_acc_q1 <= '0;
 
       sum_valid_q <= 1'b0; sum_id_q <= '0; sum_rd_q <= '0;
-      sum_q <= '0;
+      sum_q         <= '0;
+      acc_sticky_q2 <= 1'b0;
+      neg_adj_q2    <= 1'b0;
+      is_acc_q2     <= 1'b0;
+      sexp_q2       <= '0;
+      old_acc_q2    <= '0;
 
       lead_valid_q <= 1'b0; lead_id_q <= '0; lead_rd_q <= '0;
-      lead_q <= '0;
+      lead_q        <= '0;
+      acc_sticky_q3 <= 1'b0;
+      is_acc_q3     <= 1'b0;
+      sexp_q3       <= '0;
+      old_acc_q3    <= '0;
 
       result_valid_q <= 1'b0; result_id_q <= '0; result_rd_q <= '0;
       result_data_q <= '0;
@@ -206,20 +264,30 @@ module mxdotp_fp8_fused_engine
       result_rd_q    <= lead_rd_q;
       result_data_q  <= back3_result_comb;
 
-      lead_valid_q <= sum_valid_q;
-      lead_id_q    <= sum_id_q;
-      lead_rd_q    <= sum_rd_q;
-      lead_q       <= back2_lead_comb;
+      lead_valid_q  <= sum_valid_q;
+      lead_id_q     <= sum_id_q;
+      lead_rd_q     <= sum_rd_q;
+      lead_q        <= back2_lead_comb;
+      acc_sticky_q3 <= acc_sticky_q2;
+      is_acc_q3     <= is_acc_q2;
+      sexp_q3       <= sexp_q2;
+      old_acc_q3    <= old_acc_q2;
 
-      sum_valid_q <= prod_valid_q;
-      sum_id_q    <= prod_id_q;
-      sum_rd_q    <= prod_rd_q;
-      sum_q       <= back1_sum_comb;
+      sum_valid_q   <= prod_valid_q;
+      sum_id_q      <= prod_id_q;
+      sum_rd_q      <= prod_rd_q;
+      sum_q         <= back1_word_comb;
+      acc_sticky_q2 <= back1_acc_sticky_comb;
+      neg_adj_q2    <= back1_neg_adj_comb;
+      is_acc_q2     <= back1_is_acc_comb;
+      sexp_q2       <= sexp_q1;
+      old_acc_q2    <= old_acc_q1;
 
       prod_valid_q <= in_valid_q;
       prod_id_q    <= in_id_q;
       prod_rd_q    <= in_rd_q;
       for (k = 0; k < MX_K8; k++) prod_q[k] <= prod_comb[k];
+      sexp_q1      <= sexp_comb;
       old_acc_q1   <= rs3_q[31:0];  // forward old_acc alongside prod_q - see header
 
       in_valid_q  <= start_i;
@@ -240,20 +308,23 @@ module mxdotp_fp8_fused_engine
   //----------------------------------------------------------------------------
   // MXFP8 element decode. Returns (sign, exp, mag) such that the element's
   // value is (-1)^sign * 2^exp * mag, with mag an integer mantissa (implicit
-  // leading bit included for normals, omitted for subnormals) - i.e. already
-  // shaped for place_in_acc, which takes an arbitrary signed exponent.
+  // leading bit included for normals, omitted for subnormals).
   //
   //   E4M3: bias 7, 3 mantissa bits. normal value = 2^(e-7) * (1.mmm)
   //         = 2^(e-7-3) * {1,mmm};  subnormal (e==0) = 2^(1-7-3) * {0,mmm}.
   //   E5M2: bias 15, 2 mantissa bits. normal value = 2^(e-15) * (1.mm)
   //         = 2^(e-15-2) * {1,mm};   subnormal (e==0) = 2^(1-15-2) * {0,mm}.
+  //
+  //   Exponent ranges: E4M3 in [-9, 5]; E5M2 in [-16, 14] (max-exponent
+  //   encodings decoded as finite per Known Limitation #3). The frame's
+  //   anchor (32) equals -2*min(exp), so every product shift is >= 0.
   //----------------------------------------------------------------------------
   function automatic void fp8_decode(
       input  logic [7:0] b,
       input  logic       e5m2,
       output logic       sgn,
       output mx_exp_t    ex,
-      output logic [31:0] mg
+      output logic [7:0] mg
   );
     logic [3:0] e4;
     logic [2:0] m4;
@@ -266,18 +337,18 @@ module mxdotp_fp8_fused_engine
       if (e5m2) begin
         if (e5 == 5'd0) begin
           ex = mx_exp_t'(1) - mx_exp_t'(15) - mx_exp_t'(2);   // subnormal exponent
-          mg = {30'd0, m5};                                    // sig = {0, mm}
+          mg = {6'd0, m5};                                     // sig = {0, mm}
         end else begin
           ex = mx_exp_t'({11'd0, e5}) - mx_exp_t'(15) - mx_exp_t'(2);
-          mg = {29'd0, 1'b1, m5};                              // sig = {1, mm}
+          mg = {5'd0, 1'b1, m5};                               // sig = {1, mm}
         end
       end else begin
         if (e4 == 4'd0) begin
           ex = mx_exp_t'(1) - mx_exp_t'(7) - mx_exp_t'(3);     // subnormal exponent
-          mg = {29'd0, m4};                                    // sig = {0, mmm}
+          mg = {5'd0, m4};                                     // sig = {0, mmm}
         end else begin
           ex = mx_exp_t'({12'd0, e4}) - mx_exp_t'(7) - mx_exp_t'(3);
-          mg = {28'd0, 1'b1, m4};                              // sig = {1, mmm}
+          mg = {4'd0, 1'b1, m4};                               // sig = {1, mmm}
         end
       end
     end
@@ -292,23 +363,18 @@ module mxdotp_fp8_fused_engine
   logic sub_fmt_e5m2;
   assign sub_fmt_e5m2 = rs3_q[48];
 
-  // Block scale exponent, computed HERE (FRONT) instead of in BACK1. a_scale
-  // and b_scale live in the input-stage rs3_q (same instruction as rs1_q/rs2_q
-  // this cycle), so scale_exp can be evaluated a full stage early and folded
-  // straight into each product's exponent below. This keeps the scale_exp adder
-  // and the per-lane exponent adds OFF the BACK1 critical path - ASIC synthesis
-  // showed them as BACK1's serial prefix feeding all 8 place_in_acc shift lanes,
-  // and BACK1 was the critical stage. FRONT has ample slack to absorb them.
-  mx_exp_t se_front;
-  assign se_front = scale_exp(rs3_q[39:32], rs3_q[47:40]);
+  // Block scale exponent, computed HERE (FRONT) and REGISTERED as sexp_q1
+  // (Phase 18's hoist, retargeted): it feeds the accumulator slide in BACK1
+  // and the final exponent in BACK3 - it is NOT folded into the product
+  // exponents any more, because the products live in the SCALE-FREE frame.
+  assign sexp_comb = scale_exp(rs3_q[39:32], rs3_q[47:40]);
 
   logic       fe_a_sign [0:MX_K8-1];
   logic       fe_b_sign [0:MX_K8-1];
   mx_exp_t    fe_a_exp  [0:MX_K8-1];
   mx_exp_t    fe_b_exp  [0:MX_K8-1];
-  logic [31:0] fe_a_mag [0:MX_K8-1];
-  logic [31:0] fe_b_mag [0:MX_K8-1];
-  logic [15:0] fe_prod_mag [0:MX_K8-1];
+  logic [7:0] fe_a_mag  [0:MX_K8-1];
+  logic [7:0] fe_b_mag  [0:MX_K8-1];
 
   integer fi;
   always_comb begin
@@ -316,43 +382,160 @@ module mxdotp_fp8_fused_engine
       fp8_decode(rs1_q[8*fi +: 8], sub_fmt_e5m2, fe_a_sign[fi], fe_a_exp[fi], fe_a_mag[fi]);
       fp8_decode(rs2_q[8*fi +: 8], sub_fmt_e5m2, fe_b_sign[fi], fe_b_exp[fi], fe_b_mag[fi]);
 
-      // Integer mantissa product: max 15*15 = 225 (E4M3) fits in 16 bits.
-      fe_prod_mag[fi] = fe_a_mag[fi][7:0] * fe_b_mag[fi][7:0];
-
       prod_comb[fi].sign = fe_a_sign[fi] ^ fe_b_sign[fi];
-      // FULL place_in_acc shift amount: block scale + both element exponents.
-      // BACK1 places each product at this exponent directly - no further adds.
-      prod_comb[fi].exp  = se_front + fe_a_exp[fi] + fe_b_exp[fi];
-      prod_comb[fi].mag  = {16'd0, fe_prod_mag[fi]};
+      // Element exponents ONLY (see header): range [-32, 28].
+      prod_comb[fi].exp  = fe_a_exp[fi] + fe_b_exp[fi];
+      // Integer mantissa product: max 15*15 = 225 fits in 8 bits; the
+      // struct's 16-bit field is the multiplier's natural output width.
+      prod_comb[fi].mag  = {8'd0, fe_a_mag[fi]} * {8'd0, fe_b_mag[fi]};
     end
   end
 
   //----------------------------------------------------------------------------
-  // BACK1: place EACH product into the wide accumulator at its own (already
-  // fully-computed) exponent, and sum all k=8 placements plus the old FP32
-  // accumulator. prod_q[bi].exp already carries the full shift amount
-  // (scale_exp + both element exponents, folded in FRONT), so this stage is
-  // pure shift + sum - the scale_exp adder and per-lane exponent adds that used
-  // to prefix this path have been hoisted into FRONT (see header). The only rs3
-  // field still needed here is old_acc, carried forward as old_acc_q1.
+  // BACK1: the scale-free frame. Two independent halves meeting at one add:
   //
-  // ACC_FULL_WIDTH (98) is the paper's own sizing for exactly this: 8 products
-  // plus the shifted accumulator. Realistic MXFP8 magnitudes land far below
-  // the MAGW=94 saturation boundary, so the 9-term sum stays well within range
-  // (same over-provisioned, not-re-derived stance as Known Limitation #1).
+  //   (a) SoP: shift each product into the frame at (exp + FP8_FRAME_ANCHOR)
+  //       - a shift in [0, 60], exact by construction (the anchor covers the
+  //       smallest product exactly; see mxdotp_pkg.sv's FP8 frame header) -
+  //       and sum the 8 into a 70-bit signed SoP.
+  //   (b) accumulator slide: decode the FP32 accumulator, compute its shift
+  //       against the frame, and produce the 120-bit extended word
+  //       {frame95, remaining25} plus sticky/bypass flags. Identical
+  //       structure to the FP4 engine's BACK1; only the constants differ.
   //----------------------------------------------------------------------------
-  logic signed [ACC_WIDTH-1:0]      placed [0:MX_K8-1];
-  logic signed [ACC_FULL_WIDTH-1:0] acc_sum;
+
+  // (a) product placement + SoP
+  logic signed [FP8_SOP_WIDTH-1:0] sp_placed [0:MX_K8-1];
+  logic signed [FP8_SOP_WIDTH-1:0] sop;
 
   integer bi;
   always_comb begin
-    acc_sum = ACC_FULL_WIDTH'(fp32_to_acc(old_acc_q1));   // sign-extends ACC_WIDTH -> ACC_FULL_WIDTH
+    sop = '0;
     for (bi = 0; bi < MX_K8; bi++) begin
-      placed[bi] = place_in_acc(prod_q[bi].sign, prod_q[bi].exp, prod_q[bi].mag);
-      acc_sum    = acc_sum + ACC_FULL_WIDTH'(placed[bi]);
+      // Sign-apply then shift: |mag| <= 225 (8 bits) at shift <= 60 tops out
+      // at bit 67 < 69, so a single placed product never overflows 70 signed;
+      // the 8-term sum is bounded by the package's |SoP| < 2^69 proof.
+      sp_placed[bi] = (prod_q[bi].sign
+                        ? -$signed({{(FP8_SOP_WIDTH-16){1'b0}}, prod_q[bi].mag})
+                        :  $signed({{(FP8_SOP_WIDTH-16){1'b0}}, prod_q[bi].mag}))
+                      <<< (int'(prod_q[bi].exp) + FP8_FRAME_ANCHOR);
+      sop = sop + sp_placed[bi];
     end
-    back1_sum_comb = acc_sum;
   end
+
+  // synthesis translate_off
+  // Sizing-proof assert: every product shift is in [0, 60] and the SoP obeys
+  // the package bound. Mirrors fp8_golden.py's in-model asserts.
+  always_comb begin
+    for (int ci = 0; ci < MX_K8; ci++) begin
+      if (prod_valid_q) begin
+        assert (int'(prod_q[ci].exp) + FP8_FRAME_ANCHOR >= 0 &&
+                int'(prod_q[ci].exp) + FP8_FRAME_ANCHOR <= 60) else
+          $error("mxdotp_fp8_fused_engine: product frame shift out of [0,60]");
+      end
+    end
+  end
+  // synthesis translate_on
+
+  // (b) accumulator slide - the FP4 engine's BACK1, FP8 constants.
+  logic        acc_sign;
+  logic [7:0]  acc_exp_f;
+  logic [22:0] acc_mant_f;
+  logic        acc_is_normal;
+  logic signed [24:0] smant;      // 25-bit signed: |{implicit, mant23}| <= 2^24-1,
+                                  // so negation never wraps
+  mx_exp_t     acc_shift;         // = (E + is_subnormal) - 118 - scale_exp
+
+  int          lsh;               // left-shift amount, 0..70
+  int          rsh;               // right-shift amount (clamped), 1..25
+  int          dropped;           // shift below 'remaining' (clamped), 1..25
+  logic signed [FP8_FRAME_WIDTH-1:0] acc_inframe;
+  logic signed [FP8_FRAME_WIDTH-1:0] frame95;
+  logic signed [49:0]                rem_wide;   // smant << (0..25) fits in 50b
+  logic [FP8_REMAIN_BITS-1:0]        remaining;
+  logic [25:0]                       drop_mask;
+
+  always_comb begin
+    acc_sign      = old_acc_q1[31];
+    acc_exp_f     = old_acc_q1[30:23];
+    acc_mant_f    = old_acc_q1[22:0];
+    acc_is_normal = (acc_exp_f != 8'd0);
+
+    // Subnormal accumulators are HONORED (paper-faithfully): no implicit
+    // bit, effective exponent = E + 1. The old fp32_to_acc flushed them.
+    smant = acc_sign ? -$signed({1'b0, acc_is_normal, acc_mant_f})
+                     :  $signed({1'b0, acc_is_normal, acc_mant_f});
+
+    acc_shift = mx_exp_t'({8'd0, acc_exp_f}) + mx_exp_t'(!acc_is_normal)
+              - mx_exp_t'(FP8_ACC_SHIFT_CONST) - sexp_q1;
+
+    back1_acc_sticky_comb = 1'b0;
+    back1_is_acc_comb     = 1'b0;
+    acc_inframe           = '0;
+    remaining             = '0;
+    rem_wide              = '0;
+    drop_mask             = '0;
+    lsh = 0; rsh = 0; dropped = 0;
+
+    if (acc_shift > mx_exp_t'(FP8_MAX_ACC_SHIFT)) begin
+      // SoP too small to change the accumulator: |SoP| < 2^69 frame units
+      // while ulp(acc)/2 >= 2^69 at this shift even across a binade
+      // boundary (strictly greater than |SoP|max = 392*2^60 ~ 2^68.62;
+      // margin ~1.3x - see mxdotp_pkg.sv). RNE returns the accumulator
+      // exactly. The frame contents are don't-cares.
+      back1_is_acc_comb = 1'b1;
+    end else if (acc_shift >= mx_exp_t'(0)) begin
+      // In-frame left shift: mant top bit lands at <= bit 93, one below
+      // the sign bit; (2^24-1)*2^70 + 392*2^60 < 2^94, so the 95-bit add
+      // can never wrap - no saturation logic exists or is needed.
+      lsh         = int'(acc_shift);
+      acc_inframe = FP8_FRAME_WIDTH'(smant) <<< lsh;
+    end else begin
+      // Right shift: floor-truncation at 25-fractional-bit resolution.
+      // Shift amounts are clamped at 25: smant is 25 bits, so any
+      // arithmetic right shift >= 25 already yields pure sign bits (and
+      // any drop mask >= 25 bits already covers the whole mantissa) -
+      // the clamps keep both shifters at 5-bit shift amounts without
+      // changing any result (verified by the golden model's floor/sticky
+      // identity asserts across the full sweep).
+      rsh         = (-int'(acc_shift) > 25) ? 25 : -int'(acc_shift);
+      acc_inframe = FP8_FRAME_WIDTH'(smant) >>> rsh;   // sign-extend then shift
+      if (-int'(acc_shift) > FP8_REMAIN_BITS) begin
+        dropped   = (-int'(acc_shift) - FP8_REMAIN_BITS > 25)
+                  ? 25 : (-int'(acc_shift) - FP8_REMAIN_BITS);
+        remaining = FP8_REMAIN_BITS'(smant >>> dropped);
+        drop_mask = (26'd1 << dropped) - 26'd1;
+        back1_acc_sticky_comb = |(smant & drop_mask[24:0]);
+        // The reference design's SoP==0 bypass: with accumulator bits
+        // already dropped, round-tripping would lose acc precision through
+        // the sticky path - return it verbatim instead (exact).
+        if (sop == '0) back1_is_acc_comb = 1'b1;
+      end else begin
+        rem_wide  = 50'(smant) <<< (FP8_REMAIN_BITS + int'(acc_shift));
+        remaining = rem_wide[FP8_REMAIN_BITS-1:0];
+      end
+    end
+
+    frame95 = FP8_FRAME_WIDTH'(sop) + acc_inframe;
+
+    // fp8_find_lead's sticky-negation condition (see mxdotp_pkg.sv): a
+    // nonzero positive residue was floor-truncated below this word.
+    back1_neg_adj_comb = (dropped != 0) && (smant != '0) && back1_acc_sticky_comb;
+
+    back1_word_comb = {frame95, remaining};
+  end
+
+  // synthesis translate_off
+  // Same knife-edge sizing assert discipline as the FP4 engine: compute the
+  // sum 2 bits wider and confirm the 95-bit result is identical.
+  logic signed [FP8_FRAME_WIDTH+1:0] frame_chk;
+  always_comb begin
+    frame_chk = (FP8_FRAME_WIDTH+2)'(sop) + (FP8_FRAME_WIDTH+2)'(acc_inframe);
+    if (prod_valid_q && !back1_is_acc_comb)
+      assert (frame_chk == (FP8_FRAME_WIDTH+2)'(frame95)) else
+        $error("mxdotp_fp8_fused_engine: 95-bit frame overflow - violates the sizing proof");
+  end
+  // synthesis translate_on
 
   // rs3_q[63:49] unused: bits [47:32] (scales) and [48] (E4M3/E5M2 select) are
   // consumed in FRONT, [31:0] (old_acc) is forwarded as old_acc_q1; [63:49] are
@@ -360,19 +543,23 @@ module mxdotp_fp8_fused_engine
   wire _unused_rsvd = &{1'b0, rs3_q[63:49]};
 
   //----------------------------------------------------------------------------
-  // BACK2: leading-one scan (mxdotp_pkg.sv's acc_find_lead) on sum_q.
-  // Shared, unchanged - same call the MXFP4 engine and MXFINAL make.
+  // BACK2: sign/magnitude (with the sticky-negation adjust) + leading-one
+  // scan on the 120-bit extended word (mxdotp_pkg.sv's fp8_find_lead).
   //----------------------------------------------------------------------------
+
   always_comb begin
-    back2_lead_comb = acc_find_lead(sum_q);
+    back2_lead_comb = fp8_find_lead(sum_q, neg_adj_q2);
   end
 
   //----------------------------------------------------------------------------
-  // BACK3: mantissa extract + sticky + round + exponent clamp
-  // (mxdotp_pkg.sv's acc_finalize) on lead_q. Shared, unchanged.
+  // BACK3: mantissa extraction + sticky + round + exponent clamp
+  // (mxdotp_pkg.sv's fp8_finalize - the scale re-enters here, on the
+  // exponent only), or the verbatim accumulator bypass.
   //----------------------------------------------------------------------------
+
   always_comb begin
-    back3_result_comb = acc_finalize(lead_q);
+    back3_result_comb = is_acc_q3 ? old_acc_q3
+                                  : fp8_finalize(lead_q, acc_sticky_q3, sexp_q3);
   end
 
 endmodule
