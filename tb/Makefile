@@ -6,9 +6,14 @@
 #   make / make mxdotp   full system regression (tb_mxdotp_core) - UNCHANGED
 #                        workflow from before this reorganization.
 #   make fp4             standalone FP4 fused-engine unit test (tb_fp4_unit.sv
-#                        driving mxdotp_fused_engine.sv directly, no core/XIF).
+#                        driving mxdotp_fp4_fused_engine.sv directly, no core/XIF).
 #   make fp8             standalone FP8 fused-engine unit test (tb_fp8_unit.sv
 #                        driving mxdotp_fp8_fused_engine.sv directly).
+#   make m2              standalone M2XFP4 fused-engine unit test (tb_m2_unit.sv
+#                        driving mxdotp_m2xfp4_fused_engine.sv directly). NOTE:
+#                        the engine is not yet routed by mxdotp_xif.sv, so this
+#                        unit test is currently the ONLY thing exercising it -
+#                        `make mxdotp` does not reach it.
 #   make units           runs every registered standalone unit test in turn.
 #   make clean           removes all build outputs (system + every unit test).
 #
@@ -76,7 +81,9 @@ MXDOTP_SRCS := \
 	$(MXDOTP_RTL_DIR)/mxdotp_decoder.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_dotp_engine.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_final_engine.sv \
-	$(MXDOTP_RTL_DIR)/mxdotp_fused_engine.sv \
+	$(MXDOTP_RTL_DIR)/mxdotp_fp4_fused_engine.sv \
+	$(MXDOTP_RTL_DIR)/mxdotp_fp8_fused_engine.sv \
+	$(MXDOTP_RTL_DIR)/mxdotp_m2xfp4_fused_engine.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_xif.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_core_top.sv
 
@@ -177,13 +184,16 @@ VERIFICATION_DIR := $(ROOT_DIR)/verification
 
 # --- registered unit tests ---------------------------------------------------
 
-UNIT_TESTS := fp4 fp8
+UNIT_TESTS := fp4 fp8 m2
 
-fp4_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_fused_engine.sv
+fp4_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_fp4_fused_engine.sv
 fp4_GOLDEN      := $(VERIFICATION_DIR)/fp4_golden.py
 
 fp8_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_fp8_fused_engine.sv
 fp8_GOLDEN      := $(VERIFICATION_DIR)/fp8_golden.py
+
+m2_ENGINE_SRCS  := $(MXDOTP_RTL_DIR)/mxdotp_m2xfp4_fused_engine.sv
+m2_GOLDEN       := $(VERIFICATION_DIR)/m2_golden.py
 
 # Future targets - uncomment the ENGINE_SRCS line (and _GOLDEN, once each has
 # its own golden-model script) and add the name to UNIT_TESTS once both the

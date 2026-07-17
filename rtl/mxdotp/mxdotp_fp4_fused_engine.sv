@@ -1,5 +1,5 @@
 //==============================================================================
-// File    : mxdotp_fused_engine.sv
+// File    : mxdotp_fp4_fused_engine.sv
 // Project : MXDOTP XIF Coprocessor
 //------------------------------------------------------------------------------
 // Description:

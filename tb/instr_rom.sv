@@ -182,8 +182,13 @@ module instr_rom
   localparam logic [4:0] REG_RA_BASE  = 5'd13; // x13 (lo) / x14 (hi): A
   localparam logic [4:0] REG_RB_BASE  = 5'd15; // x15 (lo) / x16 (hi): B
   localparam logic [4:0] REG_RAR_BASE = 5'd17; // x17 (lo) / x18 (hi): AR (residue, used)
-  localparam logic [4:0] REG_RSCALES  = 5'd19; // x19: {a_scale,ar_scale,b_scale,reserved}
-  localparam logic [4:0] REG_ROLD_ACC = 5'd20; // x20: old FP32 accumulator
+  // x29/x30 rather than x19/x20: these held Test 1's R rs3, which R consumed
+  // at issue (rom[26]) long before these loads run (rom[45..48]), so they are
+  // free to reuse. That deliberately frees x19/x20 to be PRISTINE registers
+  // for Test 4's destinations - see Test 4's header for why every test's
+  // destination must be written exactly once in the whole program.
+  localparam logic [4:0] REG_RSCALES  = 5'd29; // x29: {a_scale,ar_scale,b_scale,reserved}
+  localparam logic [4:0] REG_ROLD_ACC = 5'd30; // x30: old FP32 accumulator
   localparam logic [4:0] REG_RRESULT_FINAL = 5'd21; // x21: MXFINAL rd (residual test - distinct
                                                       // name from Test 1's REG_RRESULT above)
 
@@ -269,6 +274,106 @@ module instr_rom
     REG_F8T_RESULT, REG_F8T_AB_BASE, REG_F8T_AB_BASE, REG_F8_E5_RS3  // A=B=x22
   );
 
+  //----------------------------------------------------------------------------
+  // Test 4: M2XFP4 (metadata-augmented MXFP4) AND three-engine overlap. Three
+  // back-to-back MXFUSED instructions, one per engine, no gap:
+  //   U: M2XFP4 -> the m2 engine  (order-queue slot FUSED_M2)  <- the new path
+  //   V: MXFP4  -> the fp4 engine (order-queue slot FUSED)
+  //   W: MXFP8  -> the fp8 engine (order-queue slot FUSED8)
+  // Test 3 already proved TWO engines interleave; this proves all THREE do,
+  // which is what MX_NUM_SLOTS 5->6 / MX_ORDER_DEPTH 15->20 actually changed.
+  //
+  // U's operands are chosen to be DISCRIMINATING, not merely correct - each of
+  // the three plausible wiring/decode bugs produces a DIFFERENT number, so a
+  // bug fails loudly instead of passing by coincidence:
+  //   * top-1 of subgroup 0 sits at index 2, NOT index 0, so the on-chip
+  //     top-1 re-derivation is actually exercised (a hardwired index-0 or a
+  //     highest-index tie-break gives a different answer).
+  //   * plain MXFP4 on the IDENTICAL operands gives 21.0, not 29.875 - so if
+  //     U were mis-routed to the fp4 engine (or M2XFP4 fell into its
+  //     safe-inert SoP=0 stub) the result is wrong, not accidentally right.
+  //   * elem_em/sg_em differ per subgroup ([3,3] / [1,2]), so swapping the two
+  //     subgroups' metadata gives 31.3125, and dropping the Elem-EM promotion
+  //     entirely gives 28.25.
+  //
+  //   U (M2XFP4): rs1 = A = {1,1,6,1,1,1,1,1 | 1,1,1,1,1,1,1,1} (ACTIVATIONS)
+  //               rs2 = B = {1.0 x16}                            (WEIGHTS)
+  //               elem_em = {sg1=3, sg0=3}, sg_em = {sg1=2, sg0=1}
+  //               scales 1.0/1.0, old_acc 0.0
+  //               sg0: top-1 = idx2 (6.0 -> X' = 7.0 via meta=11);
+  //                    P0 = 7*(2*8) + 2*56 = 224/16 = 14.0; x1.25 = 17.5
+  //               sg1: top-1 = idx0 (all tie -> lowest index; 1.0 -> X' = 1.25)
+  //                    P1 = 7*(2*8) + 2*10 = 132/16 = 8.25;  x1.5  = 12.375
+  //               Result = 17.5 + 12.375 = 29.875 -> 0x41EF0000
+  //   V (MXFP4):  A = B = {1.0 x16} -> 16*(2*2)/4 = 16.0 -> 0x41800000
+  //   W (MXFP8 E4M3): A = B = {1.0 x8} -> 8*(1*1) = 8.0 -> 0x41000000
+  //
+  // All three cross-checked against the golden models (m2_golden.py,
+  // fp4_golden.py, fp8_golden.py) - not hand-derived.
+  //
+  // rs3 IS DELIBERATELY SHARED by all three (x5/x6). That is itself a check:
+  // the same 64-bit word carries M2XFP4 metadata at [56:49], and the fp4
+  // engine must ignore rs3[63:48] entirely while the fp8 engine must read only
+  // rs3[48] (=0 -> E4M3) out of that range. If either engine mistook the
+  // metadata bits for something of its own, V or W would be wrong.
+  //
+  // Destinations x27/x19/x20 are PRISTINE - nothing else in this program, load
+  // or result, ever writes them. That is required, not incidental: the
+  // scoreboard's writeback capture latches are first-write-wins, so a reused
+  // destination would latch an earlier test's value. x19/x20 were freed for
+  // this by moving Test 2's scales/old_acc to x29/x30 (see above).
+  //----------------------------------------------------------------------------
+  localparam logic [4:0] REG_M2U_A_BASE  = 5'd1;  // x1/x2  : U's A (activations, Elem-EM)
+  localparam logic [4:0] REG_M2U_B_BASE  = 5'd3;  // x3/x4  : U's B (weights, Sg-EM)
+  localparam logic [4:0] REG_M2_RS3      = 5'd5;  // x5/x6  : rs3 - SHARED by U, V and W
+  localparam logic [4:0] REG_M2V_AB_BASE = 5'd13; // x13/x14: V's A=B (MXFP4, all 1.0)
+  localparam logic [4:0] REG_M2W_AB_BASE = 5'd22; // x22/x23: W's A=B (E4M3, all 1.0)
+
+  localparam logic [4:0] REG_M2U_RESULT  = 5'd27; // x27: U's rd (M2XFP4) - pristine
+  localparam logic [4:0] REG_M2V_RESULT  = 5'd19; // x19: V's rd (MXFP4)  - pristine (freed above)
+  localparam logic [4:0] REG_M2W_RESULT  = 5'd20; // x20: W's rd (MXFP8)  - pristine (freed above)
+
+  localparam logic [3:0]  MXFP4_SIX = 4'h7; // E2M1 encoding of 6.0 (sign=0,exp=11,mant=1)
+
+  // A: nibble i occupies bits [4i+3:4i], so element 0 is the LOW nibble.
+  // Element 2 = 6.0 makes subgroup 0's top-1 land at index 2.
+  localparam logic [63:0] M2U_A_VAL  = 64'h2222_2222_2222_2722; // sg0: 1,1,6,1,1,1,1,1 | sg1: 1 x8
+  localparam logic [63:0] M2U_B_VAL  = {16{MXFP4_ONE}};          // 16x 1.0 (weights)
+  localparam logic [63:0] M2V_AB_VAL = {16{MXFP4_ONE}};          // 16x 1.0 (MXFP4)
+  localparam logic [63:0] M2W_AB_VAL = 64'h3838_3838_3838_3838;  // 8x 1.0 (E4M3)
+
+  // rs3 upper word: {rsvd[6:0]=0, sg_em[3:0], elem_em[3:0], bit48=0, b_scale, a_scale}
+  // -> word bits: [24:21]=sg_em, [20:17]=elem_em, [16]=sub-format select (0 =
+  // E4M3 for the fp8 engine; kept 0 for M2XFP4, which reserves it uniformly).
+  // sg_em = {sg1=2, sg0=1} = 4'b1001 ; elem_em = {sg1=3, sg0=3} = 4'b1111
+  localparam logic [3:0]  M2_SG_EM   = 4'b1001;  // {subgroup1=2, subgroup0=1}
+  localparam logic [3:0]  M2_ELEM_EM = 4'b1111;  // {subgroup1=3, subgroup0=3}
+  localparam logic [31:0] M2_RS3_HI_VAL = {7'd0, M2_SG_EM, M2_ELEM_EM, 1'b0,
+                                            E8M0_SCALE_ONE, E8M0_SCALE_ONE}; // = 0x013E7F7F
+  localparam logic [63:0] M2_RS3_VAL    = {M2_RS3_HI_VAL, 32'h0000_0000};    // old_acc = 0.0
+
+  // Golden-model cross-checked (see header) - m2/fp4/fp8_golden.py respectively.
+  localparam logic [31:0] M2XFP4_U_EXPECTED = 32'h41EF_0000;  // 29.875f (M2XFP4)
+  localparam logic [31:0] MXFP4_V_EXPECTED  = 32'h4180_0000;  // 16.0f   (MXFP4)
+  localparam logic [31:0] MXFP8_W_EXPECTED  = 32'h4100_0000;  //  8.0f   (MXFP8 E4M3)
+
+  localparam logic [31:0] INSTR_MXFUSED_M2U = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_M2XFP4,
+    REG_M2U_RESULT, REG_M2U_A_BASE, REG_M2U_B_BASE, REG_M2_RS3
+  );
+  localparam logic [31:0] INSTR_MXFUSED_M2V = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP4,
+    // A=B=x13 (same reg pair); rs3 shares U's word - the fp4 engine ignores
+    // rs3[63:48], so U's metadata bits are invisible to it. That is the check.
+    REG_M2V_RESULT, REG_M2V_AB_BASE, REG_M2V_AB_BASE, REG_M2_RS3
+  );
+  localparam logic [31:0] INSTR_MXFUSED_M2W = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP8,
+    // A=B=x22; rs3 shares U's word - the fp8 engine reads only rs3[48] (=0 ->
+    // E4M3) from the range U uses for metadata.
+    REG_M2W_RESULT, REG_M2W_AB_BASE, REG_M2W_AB_BASE, REG_M2_RS3
+  );
+
   localparam logic [31:0] INSTR_JAL_SELF = encode_j(OPCODE_JAL, 5'd0, 21'd0); // infinite self-loop
   localparam logic [31:0] INSTR_NOP      = encode_i(OPCODE_OPIMM, 3'b000, 5'd0, 5'd0, 12'd0);
 
@@ -294,6 +399,12 @@ module instr_rom
     logic [31:0] lui_f4m_lo,  addi_f4m_lo,  lui_f4m_hi,  addi_f4m_hi;
     logic [31:0] lui_f8t_lo,  addi_f8t_lo,  lui_f8t_hi,  addi_f8t_hi;
     logic [31:0] lui_f8e5_lo, addi_f8e5_lo, lui_f8e5_hi, addi_f8e5_hi;
+    // Test 4 (M2XFP4 + three-engine overlap) operand loads
+    logic [31:0] lui_m2ua_lo, addi_m2ua_lo, lui_m2ua_hi, addi_m2ua_hi;
+    logic [31:0] lui_m2ub_lo, addi_m2ub_lo, lui_m2ub_hi, addi_m2ub_hi;
+    logic [31:0] lui_m2r3_lo, addi_m2r3_lo, lui_m2r3_hi, addi_m2r3_hi;
+    logic [31:0] lui_m2v_lo,  addi_m2v_lo,  lui_m2v_hi,  addi_m2v_hi;
+    logic [31:0] lui_m2w_lo,  addi_m2w_lo,  lui_m2w_hi,  addi_m2w_hi;
 
     for (i = 0; i < NUM_WORDS; i++) rom[i] = INSTR_NOP;
 
@@ -337,6 +448,18 @@ module instr_rom
     encode_li32(REG_F8T_AB_BASE + 5'd1, F8T_AB_VAL[63:32],  lui_f8t_hi,  addi_f8t_hi);
     encode_li32(REG_F8_E5_RS3,         F8_E5_RS3_VAL[31:0], lui_f8e5_lo, addi_f8e5_lo);
     encode_li32(REG_F8_E5_RS3 + 5'd1,  F8_E5_RS3_VAL[63:32],lui_f8e5_hi, addi_f8e5_hi);
+
+    // Test 4 operands (loaded fresh - Test 3 has consumed its own).
+    encode_li32(REG_M2U_A_BASE,         M2U_A_VAL[31:0],   lui_m2ua_lo, addi_m2ua_lo);
+    encode_li32(REG_M2U_A_BASE + 5'd1,  M2U_A_VAL[63:32],  lui_m2ua_hi, addi_m2ua_hi);
+    encode_li32(REG_M2U_B_BASE,         M2U_B_VAL[31:0],   lui_m2ub_lo, addi_m2ub_lo);
+    encode_li32(REG_M2U_B_BASE + 5'd1,  M2U_B_VAL[63:32],  lui_m2ub_hi, addi_m2ub_hi);
+    encode_li32(REG_M2_RS3,             M2_RS3_VAL[31:0],  lui_m2r3_lo, addi_m2r3_lo);
+    encode_li32(REG_M2_RS3 + 5'd1,      M2_RS3_VAL[63:32], lui_m2r3_hi, addi_m2r3_hi);
+    encode_li32(REG_M2V_AB_BASE,        M2V_AB_VAL[31:0],  lui_m2v_lo,  addi_m2v_lo);
+    encode_li32(REG_M2V_AB_BASE + 5'd1, M2V_AB_VAL[63:32], lui_m2v_hi,  addi_m2v_hi);
+    encode_li32(REG_M2W_AB_BASE,        M2W_AB_VAL[31:0],  lui_m2w_lo,  addi_m2w_lo);
+    encode_li32(REG_M2W_AB_BASE + 5'd1, M2W_AB_VAL[63:32], lui_m2w_hi,  addi_m2w_hi);
 
     // --- Test 1: MXFUSED x3 back-to-back (P, Q, R) ---
     // ALL operands for P, Q, and R are loaded FIRST, before any of the three
@@ -428,10 +551,29 @@ module instr_rom
     rom[75] = INSTR_MXFUSED_F4M;   // M: MXFP4,      rd=x8,  expect 16.0 - right after S, no gap
     rom[76] = INSTR_MXFUSED_F8T;   // T: MXFP8 E5M2, rd=x26, expect  8.0 - right after M, no gap
 
-    rom[77] = INSTR_JAL_SELF;
+    // --- Test 4: M2XFP4 + three-engine overlap (U, V, W) ---
+    // Same discipline as Test 3: ALL Test-4 operands loaded FIRST, then the
+    // three MXFUSED instructions issue back-to-back with nothing between them,
+    // so U (m2), V (fp4) and W (fp8) are genuinely in flight across all three
+    // engines simultaneously.
+    rom[77] = lui_m2ua_lo;  rom[78] = addi_m2ua_lo;   // x1  <- U's A[31:0]
+    rom[79] = lui_m2ua_hi;  rom[80] = addi_m2ua_hi;   // x2  <- U's A[63:32]
+    rom[81] = lui_m2ub_lo;  rom[82] = addi_m2ub_lo;   // x3  <- U's B[31:0]
+    rom[83] = lui_m2ub_hi;  rom[84] = addi_m2ub_hi;   // x4  <- U's B[63:32]
+    rom[85] = lui_m2r3_lo;  rom[86] = addi_m2r3_lo;   // x5  <- shared rs3[31:0] (old_acc = 0.0)
+    rom[87] = lui_m2r3_hi;  rom[88] = addi_m2r3_hi;   // x6  <- shared rs3[63:32] (meta+scales)
+    rom[89] = lui_m2v_lo;   rom[90] = addi_m2v_lo;    // x13 <- V's A=B[31:0]
+    rom[91] = lui_m2v_hi;   rom[92] = addi_m2v_hi;    // x14 <- V's A=B[63:32]
+    rom[93] = lui_m2w_lo;   rom[94] = addi_m2w_lo;    // x22 <- W's A=B[31:0]
+    rom[95] = lui_m2w_hi;   rom[96] = addi_m2w_hi;    // x23 <- W's A=B[63:32]
+    rom[97]  = INSTR_MXFUSED_M2U;  // U: M2XFP4, rd=x27, expect 29.875
+    rom[98]  = INSTR_MXFUSED_M2V;  // V: MXFP4,  rd=x19, expect 16.0 - right after U, no gap
+    rom[99]  = INSTR_MXFUSED_M2W;  // W: MXFP8,  rd=x20, expect  8.0 - right after V, no gap
+
+    rom[100] = INSTR_JAL_SELF;
 
     // Add further instructions here, e.g.:
-    //   rom[78] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
+    //   rom[101] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
   end
 
   //----------------------------------------------------------------------------

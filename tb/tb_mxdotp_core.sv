@@ -352,6 +352,17 @@ module tb_mxdotp_core;
   wire [4:0]  exp_f8t_rd    = u_instr_rom.REG_F8T_RESULT;   // x26
   wire [31:0] exp_f8t_data  = u_instr_rom.MXFP8_T_EXPECTED;  // 8.0
 
+  // Test 4: M2XFP4 (U) + three-engine overlap (U/V/W). Destinations are
+  // pristine registers - see instr_rom.sv's Test 4 header for why that is a
+  // requirement of the first-write-wins capture latches below, not a
+  // preference.
+  wire [4:0]  exp_m2u_rd    = u_instr_rom.REG_M2U_RESULT;    // x27
+  wire [31:0] exp_m2u_data  = u_instr_rom.M2XFP4_U_EXPECTED; // 29.875
+  wire [4:0]  exp_m2v_rd    = u_instr_rom.REG_M2V_RESULT;    // x19
+  wire [31:0] exp_m2v_data  = u_instr_rom.MXFP4_V_EXPECTED;  // 16.0
+  wire [4:0]  exp_m2w_rd    = u_instr_rom.REG_M2W_RESULT;    // x20
+  wire [31:0] exp_m2w_data  = u_instr_rom.MXFP8_W_EXPECTED;  // 8.0
+
   //----------------------------------------------------------------------------
   // Protocol assertion: once result_valid is asserted without being accepted
   // the same cycle, it must remain asserted until result_ready arrives.
@@ -397,6 +408,9 @@ module tb_mxdotp_core;
     SB_WAIT_F8S_WB,
     SB_WAIT_F8M_WB,
     SB_WAIT_F8T_WB,
+    SB_WAIT_M2U_WB,
+    SB_WAIT_M2V_WB,
+    SB_WAIT_M2W_WB,
     SB_DONE,
     SB_FAIL
   } sb_state_e;
@@ -753,6 +767,37 @@ module tb_mxdotp_core;
       wb_seen7_q <= 1'b1; wb_data7_q <= rf_wdata_wb_o;
     end
   end
+  // Ninth/tenth/eleventh latch instances - Test 4's U (M2XFP4), V (MXFP4) and
+  // W (MXFP8 E4M3) destinations. Same decoupled-per-instruction rationale as
+  // every latch above, and it applies with full force here: U/V/W are in
+  // flight across all THREE fused engines at once, so each needs its own
+  // independent capture.
+  logic        wb_seen9_q;   logic [31:0] wb_data9_q;
+  logic        wb_seen10_q;  logic [31:0] wb_data10_q;
+  logic        wb_seen11_q;  logic [31:0] wb_data11_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen9_q <= 1'b0; wb_data9_q <= '0;
+    end else if (!wb_seen9_q && rf_we_wb_o && (rf_waddr_wb_o == exp_m2u_rd)) begin
+      wb_seen9_q <= 1'b1; wb_data9_q <= rf_wdata_wb_o;
+    end
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen10_q <= 1'b0; wb_data10_q <= '0;
+    end else if (!wb_seen10_q && rf_we_wb_o && (rf_waddr_wb_o == exp_m2v_rd)) begin
+      wb_seen10_q <= 1'b1; wb_data10_q <= rf_wdata_wb_o;
+    end
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen11_q <= 1'b0; wb_data11_q <= '0;
+    end else if (!wb_seen11_q && rf_we_wb_o && (rf_waddr_wb_o == exp_m2w_rd)) begin
+      wb_seen11_q <= 1'b1; wb_data11_q <= rf_wdata_wb_o;
+    end
+  end
+
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       wb_seen8_q <= 1'b0; wb_data8_q <= '0;
@@ -788,6 +833,37 @@ module tb_mxdotp_core;
         F8ORD_M: if (rf_waddr_wb_o == exp_f4m_rd) f8_ord_q <= F8ORD_T; else f8_ord_bad <= 1'b1;
         F8ORD_T: if (rf_waddr_wb_o == exp_f8t_rd) f8_ord_q <= F8ORD_DONE; else f8_ord_bad <= 1'b1;
         default: f8_ord_bad <= 1'b1;  // an extra write to one of these after all three - unexpected
+      endcase
+    end
+  end
+
+  //----------------------------------------------------------------------------
+  // Test 4's ordering monitor - same construction as f8_ord_q above, but for
+  // the THREE-engine case (U on the m2 engine, V on the fp4 engine, W on the
+  // fp8 engine). x27/x19/x20 are written by nothing else in the program, so
+  // watching every rf_we_wb_o to one of them yields exactly the delivery
+  // sequence; any out-of-order retirement sets m2_ord_bad, checked at the end.
+  // This is the check that MX_ORDER_DEPTH 15->20 and the third slot tag
+  // actually work - two engines interleaving (Test 3) does not prove three do.
+  //----------------------------------------------------------------------------
+  typedef enum logic [1:0] { M2ORD_U, M2ORD_V, M2ORD_W, M2ORD_DONE } m2_ord_e;
+  m2_ord_e m2_ord_q;
+  logic    m2_ord_bad;
+
+  wire m2_wb_hit = rf_we_wb_o && ((rf_waddr_wb_o == exp_m2u_rd) ||
+                                  (rf_waddr_wb_o == exp_m2v_rd) ||
+                                  (rf_waddr_wb_o == exp_m2w_rd));
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      m2_ord_q   <= M2ORD_U;
+      m2_ord_bad <= 1'b0;
+    end else if (m2_wb_hit) begin
+      unique case (m2_ord_q)
+        M2ORD_U: if (rf_waddr_wb_o == exp_m2u_rd) m2_ord_q <= M2ORD_V; else m2_ord_bad <= 1'b1;
+        M2ORD_V: if (rf_waddr_wb_o == exp_m2v_rd) m2_ord_q <= M2ORD_W; else m2_ord_bad <= 1'b1;
+        M2ORD_W: if (rf_waddr_wb_o == exp_m2w_rd) m2_ord_q <= M2ORD_DONE; else m2_ord_bad <= 1'b1;
+        default: m2_ord_bad <= 1'b1;  // an extra write to one of these after all three - unexpected
       endcase
     end
   end
@@ -1266,8 +1342,57 @@ module tb_mxdotp_core;
               $display("[%0t] FUSED8(T,E5M2) WB ok: x%0d <= 0x%0h", $time, exp_f8t_rd, wb_data8_q);
               $display("[%0t] CROSS-ENGINE ORDER ok: S(x%0d,fp8) -> M(x%0d,fp4) -> T(x%0d,fp8) retired in program order",
                         $time, exp_f8s_rd, exp_f4m_rd, exp_f8t_rd);
+              sb_state <= SB_WAIT_M2U_WB;
+            end
+          end
+        end
+
+        //----------------------------------------------------------------
+        // Test 4: M2XFP4 (U) + three-engine overlap (U on m2, V on fp4,
+        // W on fp8). U's expected value is deliberately NOT reachable by
+        // any other engine on the same operands (plain MXFP4 would give
+        // 21.0, not 29.875), so a mis-route or a fall-through to the fp4
+        // engine's safe-inert SoP=0 stub fails here rather than passing
+        // by coincidence. See instr_rom.sv's Test 4 header.
+        //----------------------------------------------------------------
+
+        SB_WAIT_M2U_WB: begin
+          if (wb_seen9_q) begin
+            if (wb_data9_q !== exp_m2u_data) begin
+              sb_fail($sformatf("M2XFP4(U) result mismatch: x%0d = 0x%0h, expected 0x%0h (plain MXFP4 on the same operands would give 0x41A80000 = 21.0 - if that is what came back, U was routed to the fp4 engine or fell into its SoP=0 stub)",
+                                 exp_m2u_rd, wb_data9_q, exp_m2u_data));
+            end else begin
+              $display("[%0t] FUSED_M2(U,M2XFP4) WB ok: x%0d <= 0x%0h (29.875)", $time, exp_m2u_rd, wb_data9_q);
+              sb_state <= SB_WAIT_M2V_WB;
+            end
+          end
+        end
+
+        SB_WAIT_M2V_WB: begin
+          if (wb_seen10_q) begin
+            if (wb_data10_q !== exp_m2v_data) begin
+              sb_fail($sformatf("MXFP4(V) result mismatch: x%0d = 0x%0h, expected 0x%0h (V shares U's rs3 word, which carries M2XFP4 metadata at [56:49] - the fp4 engine must ignore rs3[63:48] entirely)",
+                                 exp_m2v_rd, wb_data10_q, exp_m2v_data));
+            end else begin
+              $display("[%0t] FUSED(V,MXFP4) WB ok: x%0d <= 0x%0h", $time, exp_m2v_rd, wb_data10_q);
+              sb_state <= SB_WAIT_M2W_WB;
+            end
+          end
+        end
+
+        SB_WAIT_M2W_WB: begin
+          if (wb_seen11_q) begin
+            if (wb_data11_q !== exp_m2w_data) begin
+              sb_fail($sformatf("MXFP8(W,E4M3) result mismatch: x%0d = 0x%0h, expected 0x%0h (W shares U's rs3 word - the fp8 engine must read only rs3[48]=0 -> E4M3 out of the metadata range)",
+                                 exp_m2w_rd, wb_data11_q, exp_m2w_data));
+            end else if (m2_ord_bad) begin
+              sb_fail("Three-engine ordering violation: U/V/W writebacks did not retire in program order (U,V,W) - the three-slot order queue delivered out of order");
+            end else begin
+              $display("[%0t] FUSED8(W,E4M3) WB ok: x%0d <= 0x%0h", $time, exp_m2w_rd, wb_data11_q);
+              $display("[%0t] THREE-ENGINE ORDER ok: U(x%0d,m2) -> V(x%0d,fp4) -> W(x%0d,fp8) retired in program order",
+                        $time, exp_m2u_rd, exp_m2v_rd, exp_m2w_rd);
               $display("=====================================================");
-              $display(" PASS: MXFUSED(P,Q,R overlap) -> MXDUALREAD_TEST -> MXDOTP/MXFINAL(residual) -> MXFP8(E4M3,E5M2)+overlap all traversed");
+              $display(" PASS: MXFUSED(P,Q,R overlap) -> MXDUALREAD_TEST -> MXDOTP/MXFINAL(residual) -> MXFP8(E4M3,E5M2)+overlap -> M2XFP4+3-engine overlap all traversed");
               $display("=====================================================");
               pass_count++;
               sb_state <= SB_DONE;

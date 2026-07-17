@@ -370,15 +370,20 @@ module mxdotp_xif
     // forward reference is safe - same style already used for order_head_tag.
     wire fused_pending_push = accept_fused;
     // Which engine the head belongs to, by its element format: MXFP8 -> the fp8
-    // engine, everything else -> the MXFP4 engine.
+    // engine, M2XFP4 -> the m2 engine, everything else (MXFP4 plus the
+    // not-meaningful-here MXFP4_RESIDUAL) -> the MXFP4 engine, whose SoP=0
+    // stub keeps the residual encoding safe-inert as before.
     wire head_is_fp8 = fused_pending_head_valid &&
                        (fused_pending_q[fused_pending_head_ptr].format == MX_FMT_MXFP8);
-    // fused4_engine_start / fused8_engine_start are defined in the FUSED engine
-    // section below; both are pure combinational (start derives from ready,
+    wire head_is_m2  = fused_pending_head_valid &&
+                       (fused_pending_q[fused_pending_head_ptr].format == MX_FMT_M2XFP4);
+    // fused4/fused8/fusedm2_engine_start are defined in the FUSED engine
+    // section below; all are pure combinational (start derives from ready,
     // ready comes straight from an engine instance), so this forward reference
     // is safe - same style already used for order_head_tag elsewhere.
     wire fused_pending_pop  = fused_pending_head_kill ||
-                              fused4_engine_start || fused8_engine_start;
+                              fused4_engine_start || fused8_engine_start ||
+                              fusedm2_engine_start;
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
@@ -702,8 +707,9 @@ module mxdotp_xif
     // AND that engine has room; fused_pending_pop (defined above) advances the
     // queue in lockstep with whichever engine took the head, plus the kill
     // case, which pops unconditionally without touching either engine. The two
-    // engines occupy two distinct order-queue slots (MX_SLOT_FUSED / _FUSED8),
-    // so results from the two interleave back into program order correctly.
+    // engines occupy three distinct order-queue slots (MX_SLOT_FUSED /
+    // _FUSED8 / _FUSED_M2), so results from the three interleave back into
+    // program order correctly.
     //--------------------------------------------------------------------------
 
     logic fused4_engine_start, fused4_engine_ready;
@@ -718,6 +724,12 @@ module mxdotp_xif
     logic [4:0]             fused8_result_rd;
     logic [X_RFW_WIDTH-1:0] fused8_result_data;
 
+    logic fusedm2_engine_start, fusedm2_engine_ready;
+    logic fusedm2_result_valid, fusedm2_result_ready;
+    logic [X_ID_WIDTH-1:0]  fusedm2_result_id;
+    logic [4:0]             fusedm2_result_rd;
+    logic [X_RFW_WIDTH-1:0] fusedm2_result_data;
+
     // Only the engine whose element format matches the pending-queue head is
     // started this cycle; the other ignores its (deasserted) start_i. The
     // shared pending queue pops when EITHER engine takes the head (or on kill -
@@ -726,8 +738,9 @@ module mxdotp_xif
     // MXFP4 instruction behind it jump ahead - this preserves strict
     // program-order handoff, so each engine's own result stream stays in
     // program order within its own order-queue slot.
-    assign fused4_engine_start = fused_pending_head_ok && !head_is_fp8 && fused4_engine_ready;
-    assign fused8_engine_start = fused_pending_head_ok &&  head_is_fp8 && fused8_engine_ready;
+    assign fused4_engine_start  = fused_pending_head_ok && !head_is_fp8 && !head_is_m2 && fused4_engine_ready;
+    assign fused8_engine_start  = fused_pending_head_ok &&  head_is_fp8 && fused8_engine_ready;
+    assign fusedm2_engine_start = fused_pending_head_ok &&  head_is_m2  && fusedm2_engine_ready;
 
     // MXFP4 fused engine (plain E2M1 fast path).
     mxdotp_fused_engine #(
@@ -778,14 +791,43 @@ module mxdotp_xif
         .result_data_o  (fused8_result_data)
     );
 
+    // M2XFP4 fused engine (metadata-augmented E2M1; Elem-EM on rs1, Sg-EM on
+    // rs2 - the one format where operand ORDER carries meaning, see
+    // mxdotp_pkg.sv's ISA NOTE). A deliberately separate engine: its FRONT
+    // is a two-subtree reduction with per-subgroup Sg-EM shift-add and top-1
+    // re-derivation, and its 43-bit frame (anchor 6) differs from MXFP4's
+    // 38-bit one - see mxdotp_m2xfp4_fused_engine.sv's header.
+    mxdotp_m2xfp4_fused_engine #(
+        .X_ID_WIDTH  (X_ID_WIDTH),
+        .X_RFR_WIDTH (X_RFR_WIDTH),
+        .X_RFW_WIDTH (X_RFW_WIDTH)
+    ) fusedm2_engine_i (
+        .clk_i          (clk_i),
+        .rst_ni         (rst_ni),
+        .start_i        (fusedm2_engine_start),
+        .ready_o        (fusedm2_engine_ready),
+        .id_i           (fused_pending_q[fused_pending_head_ptr].id),
+        .rd_i           (fused_pending_q[fused_pending_head_ptr].rd),
+        .rs1_i          (fused_pending_q[fused_pending_head_ptr].rs1),
+        .rs2_i          (fused_pending_q[fused_pending_head_ptr].rs2),
+        .rs3_i          (fused_pending_q[fused_pending_head_ptr].rs3),
+        .mx_format_i    (fused_pending_q[fused_pending_head_ptr].format),
+        .result_valid_o (fusedm2_result_valid),
+        .result_ready_i (fusedm2_result_ready),
+        .result_id_o    (fusedm2_result_id),
+        .result_rd_o    (fusedm2_result_rd),
+        .result_data_o  (fusedm2_result_data)
+    );
+
     // Each engine presents its result only when its OWN slot is at the order
     // queue head. Each engine delivers its own results in program order; the
     // order queue interleaves the two engines' (and the other slots') streams
     // back into global program order. Same gating rationale as the single-
     // engine design, just one instance of it per engine/slot - the engines
     // have no visibility into the shared order queue, so this must live here.
-    assign fused4_result_ready = (order_head_tag == MX_SLOT_FUSED)  && result_if.result_ready;
-    assign fused8_result_ready = (order_head_tag == MX_SLOT_FUSED8) && result_if.result_ready;
+    assign fused4_result_ready  = (order_head_tag == MX_SLOT_FUSED)    && result_if.result_ready;
+    assign fused8_result_ready  = (order_head_tag == MX_SLOT_FUSED8)   && result_if.result_ready;
+    assign fusedm2_result_ready = (order_head_tag == MX_SLOT_FUSED_M2) && result_if.result_ready;
 
     //--------------------------------------------------------------------------
     // In-order result delivery queue
@@ -832,7 +874,8 @@ module mxdotp_xif
                 order_q[order_tail_ptr] <= accept_dotp  ? MX_SLOT_DOTP  :
                                             accept_final ? MX_SLOT_FINAL :
                                             accept_dr    ? MX_SLOT_DUALREAD :
-                                            (accept_fused && (mx_format == MX_FMT_MXFP8)) ? MX_SLOT_FUSED8 :
+                                            (accept_fused && (mx_format == MX_FMT_MXFP8))  ? MX_SLOT_FUSED8   :
+                                            (accept_fused && (mx_format == MX_FMT_M2XFP4)) ? MX_SLOT_FUSED_M2 :
                                                             MX_SLOT_FUSED;
                 order_tail_ptr <= (order_tail_ptr == MX_ORDER_DEPTH-1) ? '0 : order_tail_ptr + 1'b1;
             end
@@ -904,6 +947,15 @@ module mxdotp_xif
                         result_if.result.rd    = fused8_result_rd;
                         result_if.result.we    = 1'b1;
                         result_if.result.data  = fused8_result_data;
+                    end
+                end
+                MX_SLOT_FUSED_M2: begin
+                    if (fusedm2_result_valid) begin
+                        result_if.result_valid = 1'b1;
+                        result_if.result.id    = fusedm2_result_id;
+                        result_if.result.rd    = fusedm2_result_rd;
+                        result_if.result.we    = 1'b1;
+                        result_if.result.data  = fusedm2_result_data;
                     end
                 end
                 default: ;  // result_valid stays 0

@@ -172,11 +172,15 @@ package mxdotp_pkg;
   //                  applies the scale, accumulates, rounds, and writes rd -
   //                  all in one instruction, no mailbox, no AR/residue
   //                  operand at all. mx_format selects the ELEMENT format
-  //                  here (MX_FMT_MXFP4 implemented; MX_FMT_MXFP8 reserved/
-  //                  stubbed - see mxdotp_fused_engine.sv), not a residue
-  //                  variant - MX_FMT_MXFP4_RESIDUAL/MX_FMT_M2XFP4 aren't
-  //                  meaningful for an instruction with no AR operand and
-  //                  fall through to the same safe-inert stub MXFP8 does.
+  //                  here, not a residue variant. MX_FMT_MXFP4 (
+  //                  mxdotp_fused_engine.sv) and MX_FMT_MXFP8 (
+  //                  mxdotp_fp8_fused_engine.sv) each have their own engine.
+  //                  and MX_FMT_M2XFP4 (mxdotp_m2xfp4_fused_engine.sv) each
+  //                  have their own engine, all three routed by
+  //                  mxdotp_xif.sv's fused pending-queue head decode.
+  //                  MX_FMT_MXFP4_RESIDUAL is the one encoding that isn't
+  //                  meaningful for an instruction with no AR operand, and
+  //                  falls through to the same safe-inert stub permanently.
   //
   localparam logic [2:0] MX_FUNCT3_DOTP           = 3'b000;
   localparam logic [2:0] MX_FUNCT3_FINAL          = 3'b001;
@@ -196,18 +200,35 @@ package mxdotp_pkg;
   //     by the intended software convention) but still falls through
   //     safely rather than being treated as an error - see
   //     mxdotp_final_engine.sv.
-  //   - Under MXFUSED (plain fast path): selects the ELEMENT format.
-  //     MX_FMT_MXFP4 is implemented; MX_FMT_MXFP8 is a reserved/stubbed
-  //     front-end (see mxdotp_fused_engine.sv) that safely contributes
-  //     zero until its real arithmetic is designed. MX_FMT_MXFP4_RESIDUAL/
-  //     MX_FMT_M2XFP4 aren't meaningful here (no AR operand exists in this
-  //     instruction's encoding) and fall into the same stub.
+  //   - Under MXFUSED (plain fast path): selects the ELEMENT format, and
+  //     thereby which fused engine the instruction is routed to (see
+  //     mxdotp_xif.sv's fused_pending_q head decode). MX_FMT_MXFP4 and
+  //     MX_FMT_MXFP8 are each implemented by their own engine.
+  //     MX_FMT_M2XFP4 is routed to mxdotp_m2xfp4_fused_engine.sv (its own
+  //     slot, MX_SLOT_FUSED_M2; verified standalone against m2_golden.py,
+  //     59,016 vectors bit-exact, before being wired). NOTE its rs1/rs2
+  //     role asymmetry - see the ISA NOTE below. MX_FMT_MXFP4_RESIDUAL is
+  //     not meaningful here (no AR operand exists in this instruction's
+  //     encoding) and falls into the MXFP4 engine's safe-inert SoP=0 stub
+  //     (an exact accumulator pass-through) permanently.
+  //
+  //     ISA NOTE - M2XFP4 breaks rs1/rs2 symmetry. For MX_FMT_MXFP4 and
+  //     MX_FMT_MXFP8 the two operands are interchangeable (the dot product
+  //     is commutative and both sides decode identically). MX_FMT_M2XFP4 is
+  //     the FIRST encoding in this ISA where operand ORDER carries meaning:
+  //     rs1 is ALWAYS the activations (Elem-EM metadata: 2 bits extend the
+  //     top-1 element's mantissa per subgroup) and rs2 is ALWAYS the weights
+  //     (Sg-EM metadata: 2 bits refine the subgroup's effective scale).
+  //     Swapping rs1/rs2 for M2XFP4 changes the result; W-by-W and A-by-A
+  //     products are not expressible. See the M2XFP4 frame section at the
+  //     bottom of this package for the arithmetic.
   //
   localparam logic [1:0] MX_FMT_MXFP4          = 2'b00;
   localparam logic [1:0] MX_FMT_MXFP4_RESIDUAL = 2'b01;
-  localparam logic [1:0] MX_FMT_M2XFP4         = 2'b10;  // RESERVED - not yet implemented
+  localparam logic [1:0] MX_FMT_M2XFP4         = 2'b10;  // RESERVED (MXDOTP path) /
+                                                          // implemented (MXFUSED path)
   localparam logic [1:0] MX_FMT_MXFP8          = 2'b11;  // RESERVED (MXDOTP path) /
-                                                          // stubbed front-end (MXFUSED path)
+                                                          // implemented (MXFUSED path)
 
 
   //----------------------------------------------------------------------------
@@ -308,36 +329,39 @@ package mxdotp_pkg;
   //     is actually needed, rather than a guess baked in from day one.
   //==============================================================================
 
-  localparam int MX_NUM_SLOTS  = 5;  // DOTP, FINAL, DUALREAD_TEST, FUSED (MXFP4),
-                                      // FUSED8 (MXFP8) - five distinct SLOT TYPES.
-                                      // Counts kinds of work, not how many of one
-                                      // kind can be outstanding at once. FUSED and
-                                      // FUSED8 are the two many-outstanding slots.
+  localparam int MX_NUM_SLOTS  = 6;  // DOTP, FINAL, DUALREAD_TEST, FUSED (MXFP4),
+                                      // FUSED8 (MXFP8), FUSED_M2 (M2XFP4) - six
+                                      // distinct SLOT TYPES. Counts kinds of work,
+                                      // not how many of one kind can be outstanding
+                                      // at once. FUSED, FUSED8 and FUSED_M2 are the
+                                      // three many-outstanding slots.
 
   localparam int MX_FUSED_PENDING_DEPTH  = 2;  // see milestone header above
   localparam int MX_FUSED_INFLIGHT_DEPTH = 5;  // fixed - EACH fused engine's own
                                                  // register-point count, not a knob
                                                  // (input capture, prod/contrib_q,
                                                  // sum_q, lead_q, result_data_q).
-  // The MXFP4 and MXFP8 fused engines SHARE one pending-commit queue (an
-  // accepted FUSED instruction of either element format waits there for its
+  // The MXFP4, MXFP8 and M2XFP4 fused engines SHARE one pending-commit queue
+  // (an accepted FUSED instruction of any element format waits there for its
   // own commit), but each has its OWN MX_FUSED_INFLIGHT_DEPTH pipeline. So the
   // most FUSED-family instructions outstanding at once is the shared pending
-  // depth plus BOTH engines' inflight depths (not one engine's).
-  localparam int MX_FUSED_MAX_OUTSTANDING = MX_FUSED_PENDING_DEPTH + 2*MX_FUSED_INFLIGHT_DEPTH;
+  // depth plus ALL THREE engines' inflight depths (not one engine's).
+  localparam int MX_FUSED_MAX_OUTSTANDING = MX_FUSED_PENDING_DEPTH + 3*MX_FUSED_INFLIGHT_DEPTH;
 
   // DOTP + FINAL + DUALREAD_TEST (one each, unchanged) + the FUSED family's max
-  // simultaneous outstanding across both element-format engines. MX_NUM_SLOTS-2
-  // = the three single-outstanding slots (FUSED and FUSED8 are the two that the
-  // MX_FUSED_MAX_OUTSTANDING term already fully accounts for).
-  localparam int MX_ORDER_DEPTH = (MX_NUM_SLOTS - 2) + MX_FUSED_MAX_OUTSTANDING;
+  // simultaneous outstanding across all three element-format engines.
+  // MX_NUM_SLOTS-3 = the three single-outstanding slots (FUSED, FUSED8 and
+  // FUSED_M2 are the three that the MX_FUSED_MAX_OUTSTANDING term already
+  // fully accounts for). 3 + 2 + 15 = 20 entries.
+  localparam int MX_ORDER_DEPTH = (MX_NUM_SLOTS - 3) + MX_FUSED_MAX_OUTSTANDING;
 
   typedef enum logic [2:0] {
     MX_SLOT_DOTP,
     MX_SLOT_FINAL,
     MX_SLOT_DUALREAD,
     MX_SLOT_FUSED,
-    MX_SLOT_FUSED8
+    MX_SLOT_FUSED8,
+    MX_SLOT_FUSED_M2
   } mx_slot_e;
 
   //==============================================================================
@@ -1126,6 +1150,330 @@ package mxdotp_pkg;
       // Fixed-bound loop, data-dependent guard inside - same synthesizable
       // pattern as acc_finalize (see its comment for the Vivado history).
       for (i = 0; i < FP8_LZC_WIDTH; i++) begin
+        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
+      end
+
+      mant_ext = {1'b0, mant_out};
+      if (round_bit && (sticky_bit || mant_out[0])) begin  // round-to-nearest-even
+        mant_ext = mant_ext + 24'd1;
+      end
+
+      if (mant_ext[23]) begin
+        // Carry out of the 23-bit fraction: only reachable from an
+        // all-ones fraction, so the renormalized fraction is exactly 0.
+        unbiased_exp = unbiased_exp + mx_exp_t'(1);
+        mant_out     = '0;
+      end else begin
+        mant_out = mant_ext[22:0];
+      end
+
+      if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
+        exp_out = 8'd0; mant_out = '0;
+      end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
+        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
+      end else begin
+        exp_out = 8'(unbiased_exp + mx_exp_t'(127));
+      end
+
+      return {lr.sign, exp_out, mant_out};
+    end
+  endfunction
+
+
+  //----------------------------------------------------------------------------
+  // M2XFP4 SLIDING-ACCUMULATOR FRAME (mxdotp_m2xfp4_fused_engine.sv)
+  //
+  // Third sibling of the FP4_FRAME_WIDTH / FP8_FRAME_WIDTH sections above,
+  // same structure and same register discipline, different constants. Sized
+  // from M2XFP (ASPLOS'26, arXiv:2601.19213) - metadata-augmented MXFP4.
+  //
+  // WHAT M2XFP4 IS. Elements are ordinary MXFP4 (E2M1). The 16-element
+  // dual-read operand pair is split into 2 subgroups of 8, and 8 bits of
+  // per-instruction metadata ride in rs3's previously-reserved field:
+  //
+  //   rs1 = ACTIVATIONS, Elem-EM. 2 bits per subgroup extend the mantissa of
+  //         the SINGLE largest-magnitude element ("top-1") to E2M3. Every
+  //         other element in the subgroup stays plain E2M1, uncorrected.
+  //   rs2 = WEIGHTS, Sg-EM. 2 bits per subgroup refine that subgroup's
+  //         effective scale to (1 + k/4)*2^E, k in {0,1,2,3} - i.e.
+  //         multipliers {1.0, 1.25, 1.5, 1.75}. Chosen offline by MSE search
+  //         at quantization time; NO on-chip search, and no multiplier - it
+  //         is a shift-and-add on the subgroup's partial sum (paper Sec 5.4).
+  //
+  // The role split is ASYMMETRIC and is the paper's central empirical finding
+  // (Sec 4.3), not an implementation convenience: weights are static and can
+  // afford an offline adaptive-scale search; activations are dynamic and need
+  // a deterministic, fixed-shared-scale encoding. This is the first encoding
+  // in this ISA where rs1/rs2 order carries meaning - see the funct2 section.
+  //
+  // ELEM-EM DECODE - THE PART THAT IS NOT "APPEND 2 MANTISSA BITS".
+  // The stored 6-bit datum for the top-1 element is {fp4_bits[3:0],meta[1:0]}
+  // where fp4_bits is FloatToBits(|x_fp4|) - the encoding operates on
+  // MAGNITUDES only (paper Alg. 1 lines 13-14), so the sign rides along in
+  // the FP4 nibble and is never disturbed. The decode is that pattern
+  // MINUS ONE, read as E2M3 (bias 1, subnormal = m/8):
+  //
+  //     X'_mag_bits = {fp4_nib[2:0], meta[1:0]} - 1        // 5-bit E2M3 mag
+  //
+  // The -1 is the paper's bias-clamp encoding (Alg. 1 steps 6-8): the encoder
+  // adds 1 to the E2M3 pattern and clamps it into [fp4_bits||00, fp4_bits||11]
+  // so the top-1's high bits stay identical to its FP4 value and it therefore
+  // REMAINS the subgroup max after substitution.
+  //
+  //   CONSEQUENCE: with meta == 00 the decrement borrows out of the mantissa
+  //   into the exponent field, so the top-1 element's BASELINE value is NOT
+  //   the stored FP4 code - it is (code-1) with mantissa 11. Reading Sec 5.4's
+  //   "X' = X + dX, so W*X' = W*X + W*dX" as "the FP4 MAC is reused unchanged
+  //   and a correction term is added alongside" is a misreading: that split is
+  //   POST-decrement. The paper needs it only because its Top-1 Decode Unit is
+  //   physically separate from the systolic PE array (Fig. 10 forwards
+  //   (val,idx) to Fig. 11's PE, which then needs an 8:1 select on the W side
+  //   to feed an auxiliary MAC). This engine decodes all 16 lanes in parallel,
+  //   so nothing needs selecting and no auxiliary MAC exists: the top-1's lane
+  //   simply carries a wider code. See the code convention below.
+  //
+  //   The all-zero pattern {fp4_nib[2:0],meta} == 5'b00000 would borrow below
+  //   zero. It is CLAMPED to 0 rather than wrapping. The encoder provably
+  //   cannot emit it (fp6_bits+1 >= 1, and clamping into [0,3] when
+  //   fp4_bits==0 can only yield >= 1 - asserted in m2_golden.py's encoder
+  //   conformance sweep), so this is a totality guard against garbage
+  //   metadata, not a reachable path.
+  //
+  // TOP-1 SELECTION - re-derived on-chip, deterministically, NOT transmitted.
+  // This is what keeps the metadata budget at 8 bits: no index bits are sent.
+  // Rule (paper Alg. 1 lines 7-10): select on |quantized FP4 value|, ties
+  // broken by LOWEST index. The hardware and the offline quantizer MUST agree
+  // exactly, so this is a hard conformance requirement on the quantizer, in
+  // the same class as how AR is produced for the residue format.
+  //   - The paper's own Fig. 10 CONTRADICTS its Alg. 1 here: the figure's
+  //     FP4->UINT lookup table ranks +6 above -6, so they never tie and the
+  //     sign decides; Alg. 1 takes abs() first, so they tie and the index
+  //     decides. We follow Alg. 1, because that is the rule the quantizer
+  //     implements and the RTL must match the quantizer.
+  //   - E2M1 magnitude codes are monotonic in value, so the comparison is a
+  //     plain 3-bit unsigned compare. The paper's 16-entry FP4->UINT LUT
+  //     (Fig. 10) exists to make its sign-inclusive ordering monotonic and is
+  //     unnecessary under the Alg. 1 rule. Comparator tree -> equality mask ->
+  //     priority encode (lowest index) -> one-hot, and the priority encoder IS
+  //     Alg. 1's min(C_idx) tie-break, for free.
+  //
+  // CODE CONVENTION (this is where the anchor comes from).
+  //   weights      : code_w = 2*W    (fp4_to_code, unchanged), |code_w| <= 12
+  //   activations  : code_x = 8*X'   , |code_x| <= 56  -> 7-bit signed
+  //   plain lanes  : code_x = 4*fp4_to_code(nib)  (8*X == 4*(2*X)), exact
+  // so a product code_w*code_x = 16*W*X' is in units of 1/16, |prod| <= 672
+  // -> PROD_WIDTH 11. Sg-EM then takes the subgroup partial sum P (units of
+  // 1/16) to (1 + k/4)*P, which in units of 1/64 is the EXACT integer
+  // P*(4+k) - a 2-place and 1-place shift plus adds, no multiplier, no
+  // truncation. That is why the frame anchor is 6 here and 2 for MXFP4: the
+  // frame LSB is 2^-6, not 2^-2. Everything below stays exact; there is no
+  // fraction to define sticky semantics for.
+  //
+  // Frame layout (43 = M2_FRAME_WIDTH):
+  //   | sign : 1 | acc @ max left shift : 24 | R guard : 1 | unsigned SoP : 17 |
+  //   - SoP sizing proof (deliberately loose, easy to check by hand):
+  //       |SoP| <= 2 subgroups * 8 elements * (12*56) * 7 = 75264 < 2^17
+  //     The tight bound is 65856 (the top-1 caps the other 7 lanes at 6.0, so
+  //     a subgroup is 7*(12*48) + 1*(12*56) = 4704, not 8*672 = 5376). Both
+  //     give the same 17-bit field, so the loose bound is used as the proof.
+  //   - acc mantissa (24b) parked at bits [41:18] when acc_shift = 18
+  //   - knife-edge exact: (2^24-1)*2^18 + 75264 = 2^42 - 186880 < 2^42, sign
+  //     bit never corrupted, NO saturation logic exists or is needed in-frame
+  //   - min nonzero |SoP| is exactly 1 frame unit (e.g. P0=+2,k0=0 and
+  //     P1=-1,k1=3 give 2*4 + (-1)*7 = 1) - load-bearing for M2_REMAIN_BITS
+  //     below, and a directed vector in m2_golden.py.
+  //
+  // M2_REMAIN_BITS = 25, IDENTICAL to FP4's and for exactly the same reason,
+  // which is worth stating because it is NOT a coincidence: when the acc drops
+  // sticky bits below the remaining field (right shift > REMAIN) AND SoP != 0,
+  // the extended word's magnitude is bounded below by 2^REMAIN - 2^23 (the acc
+  // is right-shifted far enough that its visible leading one sits at or below
+  // bit 22, while SoP != 0 contributes at least 1 frame unit = 2^REMAIN). That
+  // bound depends ONLY on the accumulator's 24-bit mantissa - not on the
+  // anchor, not on the SoP width. So the same R >= 25 closure that v8 derived
+  // for MXFP4 transfers here unchanged: 2^25 - 2^23 = 3*2^23 > 2^24, the
+  // leading one is always >= bit 24, and the round bit is always recoverable.
+  // m2_golden.py expects ZERO vectors in that corner class (unlike FP4 at
+  // REMAIN=24) and fails the run if any appear.
+  //
+  // Exactness: bit-exact RNE against an exact-rational reference on 259,781
+  // vectors at each of two independent seeds (m2_golden.py; 0 failures, 0
+  // corner-class deviations), including the acc-dominates bypass (proven
+  // |SoP contribution| < ulp(acc)/2 strictly) and an encoder-conformance
+  // sweep that asserts |X'| <= 7, X' in (1/8)Z, and encode/decode round-trip
+  // against the paper's own Fig. 8 worked example.
+  //
+  // Bypass margin at shift 19 (acc_shift > M2_MAX_ACC_SHIFT): half-ulp across
+  // a binade boundary = 2^17 = 131072 frame units, vs |SoP|max = 75264 -> a
+  // factor of 1.74. Comparable to MXFP4's own 1.78 at its analogous boundary,
+  // and far more comfortable than MXFP8's 1.3. If a future format widens the
+  // SoP bound, re-check this number first.
+  //----------------------------------------------------------------------------
+
+  // Elem-EM / Sg-EM element counts. MX_K=16 elements, 2 subgroups of 8.
+  localparam int M2_SUBGROUPS    = 2;
+  localparam int M2_SUBGROUP_LEN = MX_K / M2_SUBGROUPS;     // = 8
+
+  // Activation code width: code_x = 8*X', |X'| <= 7.0 -> |code_x| <= 56.
+  localparam int M2_XCODE_WIDTH = 7;                        // signed
+  // Product code_w*code_x, |.| <= 12*56 = 672 -> 11 bits signed.
+  localparam int M2_PROD_WIDTH  = 11;
+  // Subgroup partial sum P (units of 1/16), |P| <= 4704 (tight) -> 14b signed.
+  localparam int M2_PSUM_WIDTH  = 14;
+  // SoP = sum of P_j*(4+k_j) (units of 1/64), |SoP| <= 75264 < 2^17 -> 18b
+  // signed. Same relationship FP4 has between its 12-bit in-frame SoP field
+  // and its 13-bit signed PSUM_WIDTH: one extra bit for the sign.
+  localparam int M2_SOP_SIGNED_WIDTH = 18;
+
+  localparam int M2_FRAME_WIDTH   = 43;                     // see layout above
+  localparam int M2_MAX_ACC_SHIFT = M2_FRAME_WIDTH - 24 - 1; // = 18
+  localparam int M2_REMAIN_BITS   = 25;                     // see closure proof above
+  localparam int M2_LZC_WIDTH     = M2_FRAME_WIDTH + M2_REMAIN_BITS;  // = 68
+  localparam int M2_FRAME_ANCHOR  = 6;                      // frame bit b weight 2^(b-6)
+  localparam int M2_SOP_WIDTH     = 17;                     // unsigned SoP field
+
+  // Accumulator-shift constant: mant24 LSB (weight 2^(e-23)) lands at frame
+  // bit (e - 17 - scale_exp) since frame bit b has value weight 2^(b-6);
+  // with e = E_biased + is_subnormal - 127 this is E + is_sub - 144 - scale.
+  localparam int M2_ACC_SHIFT_CONST = 144;                  // 127 + 23 - 6
+
+  // rs3 packing (upper 32 bits, from rs3+1) for MX_FMT_M2XFP4:
+  //   [63:57] reserved (7 bits still spare)
+  //   [56:53] sg_em   : {subgroup1[1:0], subgroup0[1:0]}   - rs2 / weights
+  //   [52:49] elem_em : {subgroup1[1:0], subgroup0[1:0]}   - rs1 / activations
+  //   [48]    reserved - kept uniformly as the sub-format select bit, SYMMETRIC
+  //           with mxdotp_fp8_fused_engine.sv's use of rs3[48] for E4M3/E5M2.
+  //           Deliberately NOT consumed by metadata: keeping one bit meaning
+  //           the same thing across every fused format is worth more than the
+  //           8th metadata bit, and it leaves M2XFP4 a sub-variant escape
+  //           hatch (e.g. an Elem-EM-top2 mode) at no cost today.
+  //   [47:40] b_scale, [39:32] a_scale   - unchanged from MXFP4/MXFP8 MXFUSED
+  //   [31:0]  old_acc (lower 32, from rs3) - unchanged
+  localparam int M2_META_LSB      = 49;
+  localparam int M2_ELEM_EM_LSB   = 49;                     // [52:49]
+  localparam int M2_SG_EM_LSB     = 53;                     // [56:53]
+
+  // acc_find_lead/acc_finalize sibling contract, sized for the 68-bit word.
+  // lead_pos: -1 sentinel .. 67, signed 8 bits with room to spare.
+  typedef struct packed {
+    logic                          sign;
+    logic signed [7:0]             lead_pos;
+    logic [M2_LZC_WIDTH-1:0]       mag;
+  } m2_lead_result_t;
+
+  // Elem-EM decode: the top-1 element's 5-bit E2M3 magnitude code. See the
+  // "ELEM-EM DECODE" note above - this is a decrement, not a concatenation,
+  // and the 5'b00000 input is clamped rather than allowed to borrow.
+  //
+  // Takes the FP4 nibble's 3-bit MAGNITUDE, not the whole nibble, because the
+  // paper's encoding is defined on FloatToBits(|x|) (Alg. 1 lines 13-14): the
+  // sign never participates and is re-applied by m2_x_to_code. Making that
+  // explicit in the signature is deliberate - it is the property that
+  // guarantees the decrement can never disturb the sign bit.
+  function automatic logic [4:0] m2_x_mag_bits(
+    input logic [2:0] nib_mag,
+    input logic [1:0] meta
+  );
+    logic [4:0] v;
+    begin
+      v = {nib_mag, meta};
+      return (v == 5'b00000) ? 5'b00000 : (v - 5'b00001);
+    end
+  endfunction
+
+  // Elem-EM code: code_x = 8*X', signed, |.| <= 56. E2M3 with bias 1:
+  //   e == 0 : mag = m/8            -> code = m
+  //   e >  0 : mag = (1 + m/8)*2^(e-1) -> code = (8 + m) << (e-1)
+  function automatic logic signed [M2_XCODE_WIDTH-1:0] m2_x_to_code(
+    input logic [3:0] nib,
+    input logic [1:0] meta
+  );
+    logic [4:0]                        v;
+    logic [1:0]                        e;
+    logic [2:0]                        m;
+    logic [M2_XCODE_WIDTH-1:0]         mag;
+    begin
+      v = m2_x_mag_bits(nib[2:0], meta);
+      e = v[4:3];
+      m = v[2:0];
+      // Widen BEFORE shifting - {1'b1,m} is only 4 bits, and (8+m)<<2 needs 7.
+      mag = (e == 2'd0) ? M2_XCODE_WIDTH'(m)
+                        : (M2_XCODE_WIDTH'({1'b1, m}) << (e - 2'd1));
+      return nib[3] ? -signed'(mag) : signed'(mag);
+    end
+  endfunction
+
+  // Plain (non-top-1) activation lane: code_x = 8*X == 4*(2*X) == 4*fp4_code.
+  function automatic logic signed [M2_XCODE_WIDTH-1:0] m2_plain_to_code(
+    input logic [3:0] nib
+  );
+    begin
+      return M2_XCODE_WIDTH'(fp4_to_code(nib)) <<< 2;
+    end
+  endfunction
+
+  // First half (BACK2): identical in structure to fp4_find_lead, sized for
+  // the 68-bit word. neg_adjust_i must be BACK1's registered
+  // (right_shift > M2_REMAIN_BITS) && acc_sticky && (smant != 0).
+  function automatic m2_lead_result_t m2_find_lead(
+    input logic signed [M2_LZC_WIDTH-1:0] word,
+    input logic                           neg_adjust_i
+  );
+    logic                    sign;
+    logic [M2_LZC_WIDTH-1:0] mag;
+    int                      lead_pos;
+    int                      i;
+    m2_lead_result_t         result;
+    begin
+      sign = word[M2_LZC_WIDTH-1];
+      if (sign && neg_adjust_i)
+        mag = ~word;        // |word| - 1, with the implied (1-eps) tail below
+      else
+        mag = sign ? (-word) : word;
+      lead_pos = -1;
+      for (i = M2_LZC_WIDTH-1; i >= 0; i--) begin
+        if (lead_pos == -1 && mag[i]) lead_pos = i;
+      end
+      result.sign     = sign;
+      result.lead_pos = 8'(lead_pos);
+      result.mag      = mag;
+      return result;
+    end
+  endfunction
+
+  // Second half (BACK3): identical in structure to fp4_finalize, sized for
+  // the 68-bit word. Exponent = lead_pos - 31 + scale_exp (25 remaining bits
+  // + the -6 code anchor); the scale re-enters HERE, on an exponent wire only.
+  function automatic logic [31:0] m2_finalize(
+    input m2_lead_result_t lr,
+    input logic            acc_sticky_i,
+    input mx_exp_t         scale_exp_i
+  );
+    int          lead_pos;
+    mx_exp_t     unbiased_exp;
+    logic [22:0] mant_out;
+    logic        round_bit, sticky_bit;
+    logic [23:0] mant_ext;
+    logic [7:0]  exp_out;
+    int          i;
+    begin
+      lead_pos = int'(lr.lead_pos);
+      if (lead_pos == -1) return 32'd0;
+
+      unbiased_exp = mx_exp_t'(lead_pos)
+                   - mx_exp_t'(M2_REMAIN_BITS + M2_FRAME_ANCHOR)
+                   + scale_exp_i;
+
+      mant_out   = '0;
+      round_bit  = 1'b0;
+      sticky_bit = acc_sticky_i;
+      for (i = 0; i < 23; i++) begin
+        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
+      end
+      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
+      // Fixed-bound loop, data-dependent guard inside - same synthesizable
+      // pattern as fp4_finalize/fp8_finalize.
+      for (i = 0; i < M2_LZC_WIDTH; i++) begin
         if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
       end
 
