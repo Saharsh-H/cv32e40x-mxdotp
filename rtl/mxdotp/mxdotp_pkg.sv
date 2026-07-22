@@ -472,8 +472,44 @@ package mxdotp_pkg;
   //     ACC_FULL_WIDTH is used anywhere before that one call.
   //----------------------------------------------------------------------------
 
-  // --- Block size: MXFP4 elements per 64-bit dual-read operand (A/B/AR),
-  //     uniform across every format now - 16x4=64 bits exactly. ---
+  // --- Elements per 64-bit dual-read operand (A/B/AR) - 16x4 = 64 bits
+  //     exactly, uniform across every format now.
+  //
+  //     THIS IS NOT THE OCP MX SCALING BLOCK SIZE, and the distinction is
+  //     stated at length here because this file previously labelled MX_K
+  //     "Block size", and that one word propagated into several sessions'
+  //     handoff notes as a false belief that this project runs a non-standard
+  //     group of 16. It does not, and never did.
+  //
+  //       - The OCP MX spec fixes the scaling block at k=32 elements sharing
+  //         one E8M0 scale. That is a FORMAT fact and this project follows it.
+  //       - MX_K=16 is a REGISTER-WIDTH fact: how many E2M1 nibbles fit in one
+  //         64-bit dual-read operand. It says nothing about scaling.
+  //
+  //     A conformant 32-element block is therefore spanned by TWO consecutive
+  //     MXFUSED instructions that carry the SAME a_scale/b_scale in rs3 and
+  //     chain through the FP32 accumulator. Nothing in any engine assumes,
+  //     encodes, or depends on the block size: each instruction applies
+  //     whatever scale rs3 hands it, and MX_K appears ONLY as an unpacking
+  //     loop bound / array size / $clog2 term for PSUM_WIDTH. Block size is
+  //     purely a quantizer-side convention. Grep confirms it: there is no
+  //     non-comment use of MX_K anywhere that a scale flows through.
+  //
+  //     The one hardware-visible consequence of spanning a block across two
+  //     instructions is one extra RNE rounding per block (each MXFUSED rounds
+  //     exactly once, on accumulate). That is inherent to a 64-bit register
+  //     file and is shared by the reference implementation, which likewise
+  //     issues 8 products per instruction for MXFP8 (VECTOR_BITS=3) and so
+  //     spans an OCP block across four.
+  //
+  //     Same conclusion for M2XFP4, for the same reason: Elem-EM and Sg-EM are
+  //     both per-SUBGROUP-of-8 mechanisms (M2_SUBGROUP_LEN below), so a
+  //     32-element block sees 4 subgroups carrying 4 independent Sg-EM k
+  //     values under one shared E - exactly the group=32 / subgroup=8
+  //     configuration the M2XFP paper itself evaluates, at the paper's own
+  //     0.25 metadata bits/element, with no block-size dependence anywhere in
+  //     the datapath. Any claim that this project's M2XFP4 accuracy differs
+  //     from the paper's on account of group size is unfounded. ---
   localparam int MX_K = 16;
 
   // --- E8M0 block-scale format (OCP MX spec): unsigned 8-bit exponent-only
@@ -1311,6 +1347,11 @@ package mxdotp_pkg;
   //----------------------------------------------------------------------------
 
   // Elem-EM / Sg-EM element counts. MX_K=16 elements, 2 subgroups of 8.
+  //
+  // MX_K=16 here is elements-per-OPERAND, not the OCP scaling block (=32) -
+  // see the MX_K definition above for why that distinction matters and how a
+  // 32-element block maps onto two instructions. Both metadata mechanisms are
+  // per-subgroup-of-8, so neither is block-size dependent.
   localparam int M2_SUBGROUPS    = 2;
   localparam int M2_SUBGROUP_LEN = MX_K / M2_SUBGROUPS;     // = 8
 
@@ -1485,6 +1526,249 @@ package mxdotp_pkg;
       if (mant_ext[23]) begin
         // Carry out of the 23-bit fraction: only reachable from an
         // all-ones fraction, so the renormalized fraction is exactly 0.
+        unbiased_exp = unbiased_exp + mx_exp_t'(1);
+        mant_out     = '0;
+      end else begin
+        mant_out = mant_ext[22:0];
+      end
+
+      if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
+        exp_out = 8'd0; mant_out = '0;
+      end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
+        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
+      end else begin
+        exp_out = 8'(unbiased_exp + mx_exp_t'(127));
+      end
+
+      return {lr.sign, exp_out, mant_out};
+    end
+  endfunction
+
+
+  //----------------------------------------------------------------------------
+  // MXFINAL SLIDING-ACCUMULATOR FRAME (mxdotp_final_engine.sv)
+  //
+  // Fourth sibling of the FP4_FRAME_WIDTH / FP8_FRAME_WIDTH / M2_FRAME_WIDTH
+  // sections above, re-derived for the MXFINAL residue accumulate. This
+  // REPLACES the old absolute-window path (place_in_acc x2 + fp32_to_acc into
+  // the ACC_WIDTH=95 / ACC_ANCHOR=34 buffer), which truncated whole
+  // scale/magnitude ranges - the same class of bug the plain-MXFP4 sliding
+  // frame fixed, now closed for MXFINAL too. Validated bit-exact RNE against
+  // an exact-rational reference (mxfinal_golden.py) across 745k+ directed /
+  // random / analytically-derived-worst-corner / acc_shift-boundary vectors,
+  // 0 real mismatches, on multiple seeds.
+  //
+  // WHAT MXFINAL COMPUTES:
+  //   result = (Sa*Sw)*p1 + (Sar*Sw)*p2 + acc
+  //     p1 = sum(code_a *code_b ), p2 = sum(code_ar*code_b), each 13b signed,
+  //          |p1|,|p2| <= 2304 < 2^12  (PSUM_WIDTH, code = 2*value)
+  //     Sa,Sar,Sw = E8M0 raw bytes; Sar <= Sa is PROVEN (residue_scale_check
+  //          against the microxcaling reference: floor(log2(amax))-emax scale
+  //          selection guarantees the residual block scale never exceeds the
+  //          primary's, with >= 2 binades of margin).
+  //
+  // THE FRAME (single sliding-accumulator, anchor selected by p1==0 - NOT a
+  // runtime leading-bit comparator; just one mux):
+  //   anchor = Sa*Sw   (if p1 != 0)  -> F = p1 frame-resident (shift 0),
+  //                                      SECOND = p2 slides down by delta=Sa-Sar
+  //   anchor = Sar*Sw  (if p1 == 0)  -> F = p2 frame-resident (shift 0),
+  //                                      SECOND absent
+  //   acc always slides (acc_shift = E + is_sub - MXF_ACC_SHIFT_CONST - anchor),
+  //   exactly as in the plain-MXFP4 frame.
+  //   F is ALWAYS exact (pure left shift). SECOND and acc EACH use a per-term
+  //   clamped right shift: the shift is clamped at THAT TERM'S OWN BIT WIDTH
+  //   (13 for the 13b product term, 25 for the 25b signed acc mantissa), NOT
+  //   at REMAIN - beyond a term's own width an arithmetic right shift is a
+  //   proven no-op (pure sign bits), so clamping there is lossless. REMAIN
+  //   only sets where word-bit-0 sits relative to F; it does NOT gate any
+  //   individual term's precision. Sticky is set whenever ANY bits are
+  //   genuinely dropped (v != contrib<<clamped_rs), regardless of whether the
+  //   required shift was <= own_width or had to be clamped.
+  //   Scale re-enters ONLY on the result exponent (mxf_finalize), never on the
+  //   wide datapath.
+  //
+  // BYPASSES (each mirrors a plain-MXFP4 bypass; the engine, not these
+  // functions, applies them and returns old_acc verbatim):
+  //   (1) acc_shift > MXF_MAX_ACC_SHIFT     : acc dominates. |F+SECOND at the
+  //       frame-resident scale| <= |p1|+|p2| <= 4608 < 2^13 = ulp(acc)/2 at
+  //       this shift (strictly, even across binade boundaries), so RNE returns
+  //       the accumulator exactly. Same 2^13 margin proof as plain MXFP4, with
+  //       4608 in place of 2304 (still < 8192).
+  //   (2) p1==0 and p2==0                    : SoP-analog is zero.
+  //   (3) p1!=0, delta<12, p2 == -(p1<<delta): F+SECOND cancel EXACTLY to the
+  //       zero coefficient (cancellation is impossible for delta>=12, since
+  //       |p1<<delta| > 2304 >= |p2| once delta>=12 - a cheap bounded check).
+  //
+  // DERIVED SIZING (all from first principles, verified by the golden model):
+  //
+  //   MXF_REMAIN_BITS = 36.  Worst catastrophic-cancellation corner: F and
+  //     SECOND (both exact, delta<=11 for cancellation) combine to a minimum
+  //     nonzero magnitude of 2^(REMAIN-11); the accumulator's clamped
+  //     contribution reaches at most ~2^23 in the tightest single-bit-shift
+  //     corner. For the guaranteed nonzero |word| to stay >= 2^24 (keeping the
+  //     round bit inside exactly-tracked data, never inside the collapsed
+  //     sticky region):
+  //         2^(REMAIN-11) - 2^23 >= 2^24
+  //         2^(REMAIN-11)        >= 3*2^23 > 2^24  =>  REMAIN-11 >= 25
+  //         REMAIN >= 36
+  //     Tight: the golden model's worst-corner sweep shows real (non-tie)
+  //     1-ulp failures at REMAIN=35 and none at REMAIN=36. (Plain MXFP4 needs
+  //     only 25 because it has ONE product term, not two: no F/SECOND
+  //     cancellation, so its minimum nonzero magnitude is bounded differently.)
+  //
+  //   MXF_FRAME_WIDTH = 38.  Knife-edge no-overflow proof for the frame TOP,
+  //     re-derived for the F+SECOND resident pair (which plain MXFP4 lacks):
+  //     at MXF_MAX_ACC_SHIFT=13 the acc's 24b mantissa top bit lands at word
+  //     bit R+36; the frame-resident integer is F+SECOND, up to |p1|+|p2| =
+  //     4608 (SECOND coincides with F's anchor at the delta=0 boundary). Then
+  //         (2^24-1)*2^13 + 4608 = 2^37 - 3584 < 2^37,
+  //     so the magnitude never reaches word bit R+37 (the sign bit) - no
+  //     saturation logic exists or is needed, exactly as in the FP4 frame.
+  //     Layout above the anchor (bit b's value weight is 2^(b-2), the -2 code
+  //     anchor):
+  //       | sign:1 | acc @ max left shift:24 | guard:1 | F+SECOND resident:12 |
+  //
+  //   MXF_LZC_WIDTH = MXF_FRAME_WIDTH + MXF_REMAIN_BITS = 74.  Confirmed tight:
+  //     the max word magnitude observed across the full adversarial sweep is
+  //     exactly 73 bits = MXF_LZC_WIDTH-1, the sign-safe limit.
+  //
+  //   MXF_MAX_ACC_SHIFT = 13 = MXF_FRAME_WIDTH - 24 - 1, unchanged from FP4.
+  //   MXF_ACC_SHIFT_CONST = 148 = 127 + 23 - 2, unchanged from FP4.
+  //----------------------------------------------------------------------------
+
+  localparam int MXF_FRAME_WIDTH   = 38;                    // knife-edge proof above
+  localparam int MXF_MAX_ACC_SHIFT = MXF_FRAME_WIDTH - 24 - 1;  // = 13
+  localparam int MXF_REMAIN_BITS   = 36;                    // derived above (35 fails)
+  localparam int MXF_LZC_WIDTH     = MXF_FRAME_WIDTH + MXF_REMAIN_BITS;  // = 74
+  localparam int MXF_ACC_SHIFT_CONST = 148;                 // 127 + 23 - 2
+
+  // Per-term clamped placement, shared by SECOND (own_width=13) and the
+  // accumulator mantissa (own_width=25). Returns the (signed) contribution to
+  // the extended word and whether any nonzero bits were floor-truncated below
+  // its landing position. `shift` is the word-bit position of value bit 0;
+  // negative shift = arithmetic right shift (floor toward -inf). The clamp is
+  // at own_width because an own_width-bit signed value shifted right by
+  // >= own_width is already all sign bits - clamping there changes no result
+  // while keeping the shifter a fixed 5-bit amount.
+  typedef struct packed {
+    logic signed [MXF_LZC_WIDTH-1:0] contrib;
+    logic                            sticky;
+  } mxf_place_result_t;
+
+  function automatic mxf_place_result_t mxf_place(
+    input logic signed [24:0] value,     // wide enough for the 25b acc mantissa
+    input int                 shift,      // word-bit of value's LSB (may be <0)
+    input int                 own_width   // 13 (product) or 25 (acc mantissa)
+  );
+    mxf_place_result_t result;
+    int                rs, clamped_rs;
+    logic signed [24:0]              floored;   // value >>> clamped_rs, 25b
+    logic signed [24:0]              back;      // floored <<< clamped_rs, 25b
+    begin
+      result.contrib = '0;
+      result.sticky  = 1'b0;
+      if (shift >= 0) begin
+        result.contrib = MXF_LZC_WIDTH'(value) <<< shift;
+        result.sticky  = 1'b0;   // left shift never drops bits
+      end else begin
+        rs         = -shift;
+        clamped_rs = (rs > own_width) ? own_width : rs;
+        // Arithmetic floor within the 25-bit signed container, THEN widen
+        // (sign-extends, since `floored` is signed). For a right shift the
+        // reconstructed `back` = floored<<rs has magnitude <= |value| < 2^25,
+        // so the 25-bit width never wraps (proven exhaustively over the full
+        // signed-25 range) and value!=back is the exact "bits dropped" test.
+        floored        = value >>> clamped_rs;
+        back           = floored <<< clamped_rs;
+        result.contrib = MXF_LZC_WIDTH'(floored);
+        result.sticky  = (value != back);
+      end
+      return result;
+    end
+  endfunction
+
+  // Leading-one scan + sticky-direction adjust, sized for the 74-bit word.
+  // Structural sibling of fp4_find_lead; neg_adjust_i is the engine's
+  // aggregate "a nonzero positive residue was floor-truncated below this
+  // word" flag (OR of the per-term stickies from any right-shifted term).
+  typedef struct packed {
+    logic                          sign;
+    logic signed [7:0]             lead_pos;
+    logic [MXF_LZC_WIDTH-1:0]      mag;
+  } mxf_lead_result_t;
+
+  function automatic mxf_lead_result_t mxf_find_lead(
+    input logic signed [MXF_LZC_WIDTH-1:0] word,
+    input logic                            neg_adjust_i
+  );
+    logic                     sign;
+    logic [MXF_LZC_WIDTH-1:0] mag;
+    int                       lead_pos;
+    int                       i;
+    mxf_lead_result_t         result;
+    begin
+      sign = word[MXF_LZC_WIDTH-1];
+      if (sign && neg_adjust_i)
+        mag = ~word;        // |word|-1, implied (1-eps) tail below
+      else
+        mag = sign ? (-word) : word;
+      lead_pos = -1;
+      for (i = MXF_LZC_WIDTH-1; i >= 0; i--) begin
+        if (lead_pos == -1 && mag[i]) lead_pos = i;
+      end
+      result.sign     = sign;
+      result.lead_pos = 8'(lead_pos);
+      result.mag      = mag;
+      return result;
+    end
+  endfunction
+
+  // Mantissa extract + round/sticky + exponent clamp on the 74-bit word.
+  // Structural sibling of fp4_finalize; scale re-enters HERE via scale_exp_i
+  // (= the selected anchor), on an exponent wire only. Same conventions:
+  //   - exponent = lead_pos - (MXF_REMAIN_BITS + 2) + scale_exp
+  //   - acc_sticky_i (bits dropped below the word) ORs into the sticky term
+  //   - carry-out of an all-ones fraction renormalizes to fraction = 0
+  //   - subnormal RESULT flushes to signed zero; overflow clamps to
+  //     sign|0xFE|0x7FFFFF (Known Limitation #3 - the RTL cannot emit Inf)
+  function automatic logic [31:0] mxf_finalize(
+    input mxf_lead_result_t lr,
+    input logic             acc_sticky_i,
+    input mx_exp_t          scale_exp_i
+  );
+    int          lead_pos;
+    mx_exp_t     unbiased_exp;
+    logic [22:0] mant_out;
+    logic        round_bit, sticky_bit;
+    logic [23:0] mant_ext;
+    logic [7:0]  exp_out;
+    int          i;
+    begin
+      lead_pos = int'(lr.lead_pos);
+      if (lead_pos == -1) return 32'd0;
+
+      unbiased_exp = mx_exp_t'(lead_pos) - mx_exp_t'(MXF_REMAIN_BITS + 2)
+                   + scale_exp_i;
+
+      mant_out   = '0;
+      round_bit  = 1'b0;
+      sticky_bit = acc_sticky_i;
+      for (i = 0; i < 23; i++) begin
+        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
+      end
+      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
+      for (i = 0; i < MXF_LZC_WIDTH; i++) begin
+        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
+      end
+
+      mant_ext = {1'b0, mant_out};
+      if (round_bit && (sticky_bit || mant_out[0])) begin  // round-to-nearest-even
+        mant_ext = mant_ext + 24'd1;
+      end
+
+      if (mant_ext[23]) begin
+        // Carry out of the 23-bit fraction: only reachable from an all-ones
+        // fraction, so the renormalized fraction is exactly 0.
         unbiased_exp = unbiased_exp + mx_exp_t'(1);
         mant_out     = '0;
       end else begin

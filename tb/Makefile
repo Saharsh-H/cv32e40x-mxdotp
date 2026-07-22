@@ -14,6 +14,13 @@
 #                        the engine is not yet routed by mxdotp_xif.sv, so this
 #                        unit test is currently the ONLY thing exercising it -
 #                        `make mxdotp` does not reach it.
+#   make mxfinal         standalone MXFINAL residue-accumulate unit test
+#                        (tb_mxfinal_unit.sv driving mxdotp_final_engine.sv
+#                        directly). Unlike fp4/fp8/m2, this engine exposes a
+#                        plain busy_o/done_o handshake (no ready/id/valid), so
+#                        its testbench has no backpressure to randomize -
+#                        vectors are still issued back to back, exercising the
+#                        BACK1/BACK2/BACK3 pipeline overlap.
 #   make units           runs every registered standalone unit test in turn.
 #   make clean           removes all build outputs (system + every unit test).
 #
@@ -184,7 +191,7 @@ VERIFICATION_DIR := $(ROOT_DIR)/verification
 
 # --- registered unit tests ---------------------------------------------------
 
-UNIT_TESTS := fp4 fp8 m2
+UNIT_TESTS := fp4 fp8 m2 mxfinal
 
 fp4_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_fp4_fused_engine.sv
 fp4_GOLDEN      := $(VERIFICATION_DIR)/fp4_golden.py
@@ -195,16 +202,17 @@ fp8_GOLDEN      := $(VERIFICATION_DIR)/fp8_golden.py
 m2_ENGINE_SRCS  := $(MXDOTP_RTL_DIR)/mxdotp_m2xfp4_fused_engine.sv
 m2_GOLDEN       := $(VERIFICATION_DIR)/m2_golden.py
 
+mxfinal_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_final_engine.sv
+mxfinal_GOLDEN      := $(VERIFICATION_DIR)/mxfinal_golden.py
+
 # Future targets - uncomment the ENGINE_SRCS line (and _GOLDEN, once each has
 # its own golden-model script) and add the name to UNIT_TESTS once both the
 # engine RTL and tb_<name>_unit.sv exist:
 #
 # fp4r_ENGINE_SRCS    := $(MXDOTP_RTL_DIR)/mxdotp_dotp_engine.sv
 # fp4r_GOLDEN         := $(VERIFICATION_DIR)/fp4r_golden.py
-# mxfinal_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_final_engine.sv
-# mxfinal_GOLDEN      := $(VERIFICATION_DIR)/mxfinal_golden.py
 #
-# UNIT_TESTS += fp4r mxfinal
+# UNIT_TESTS += fp4r
 
 # --- shared flags for every unit test ----------------------------------------
 

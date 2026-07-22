@@ -12,11 +12,13 @@ tb/obj_dir/
 tb/obj_dir_fp4/
 tb/obj_dir_fp8/
 tb/obj_dir_m2/
+tb/obj_dir_mxfinal/
 
 # Test Unit Vectors
 tb/fp4_unit_vectors.hex
 tb/fp8_unit_vectors.hex
 tb/m2_unit_vectors.hex
+tb/mxfinal_unit_vectors.hex
 
 # Simulation files
 tb/tb_mxdotp_core.vcd
