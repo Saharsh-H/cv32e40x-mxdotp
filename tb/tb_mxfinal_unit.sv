@@ -45,7 +45,7 @@ module tb_mxfinal_unit;
     // Pass 1: count lines (= vector count) so the array can be sized
     // exactly, rather than assuming a fixed N that would silently go stale
     // whenever the golden script's emitted vector count changes.
-    fd = $fopen("mxfinal_unit_vectors.hex", "r");
+    fd = $fopen("hex_vectors/mxfinal_unit_vectors.hex", "r");
     if (fd == 0) $fatal(1, "tb_mxfinal_unit: cannot open mxfinal_unit_vectors.hex - run `make mxfinal` from tb/, or regenerate it via verification/mxfinal_golden.py --emit-vectors");
     N = 0;
     while ($fgets(line, fd) != 0) begin
@@ -56,7 +56,7 @@ module tb_mxfinal_unit;
 
     // Pass 2: parse each line as a 32-hex-digit (128-bit) value.
     vec = new[N];
-    fd = $fopen("mxfinal_unit_vectors.hex", "r");
+    fd = $fopen("hex_vectors/mxfinal_unit_vectors.hex", "r");
     for (int i = 0; i < N; i++) begin
       c = $fgets(line, fd);
       if (c == 0) $fatal(1, "tb_mxfinal_unit: mxfinal_unit_vectors.hex ended early at line %0d/%0d", i, N);

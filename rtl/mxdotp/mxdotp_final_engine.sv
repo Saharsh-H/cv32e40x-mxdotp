@@ -149,18 +149,18 @@ module mxdotp_final_engine
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      busy_q       <= 1'b0;
-      phase_q      <= FINAL_BACK1;
-      rs1_q        <= '0;
-      rs2_q        <= '0;
-      p1_q         <= '0;
-      p2_q         <= '0;
-      mxf_word_q   <= '0;
-      anchor_q     <= '0;
-      mxf_sticky_q <= 1'b0;
-      mxf_is_acc_q <= 1'b0;
-      bypass_acc_q <= '0;
-      lead_q       <= '0;
+      // Reset: CONTROL state only. Datapath registers are deliberately not
+      // reset - a stage's data is never looked at unless its own control bit
+      // says it is meaningful, so an unreset datapath register cannot be
+      // observed before it is written. This is the discipline MXFP4 and
+      // M2XFP4 already used; MXFP8 and MXFINAL are brought onto it here so
+      // all four engines are consistent. Costs ~900 DFFR_X1 -> DFF_X1 and
+      // takes those flops off the reset tree. The translate_off assertion at
+      // the bottom of this file is what actively checks the discipline:
+      // it fails in a 4-state simulator if any X ever escapes on a beat that
+      // claims to be valid.
+      busy_q  <= 1'b0;
+      phase_q <= FINAL_BACK1;
     end else if (start_i && !busy_q) begin
       busy_q  <= 1'b1;
       phase_q <= FINAL_BACK1;
@@ -352,12 +352,35 @@ module mxdotp_final_engine
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      result_data_q <= '0;
+      // No reset: result_data_q is only sampled by mxdotp_xif.sv when its own
+      // (reset) final_state_q reaches MX_RESULT, which cannot happen before
+      // done_o has written this register.
     end else if (done_o) begin
       result_data_q <= back3_result_comb;
     end
   end
 
   assign result_data = result_data_q;
+
+
+  // synthesis translate_off
+  //----------------------------------------------------------------------------
+  // Reset-discipline check. The datapath in this engine carries no reset, which
+  // is only sound if data is never observed on a beat that claims to be
+  // meaningful before that data has been written. This assertion is what turns
+  // that from an assumption into a checked property: it fires the moment an X
+  // escapes on such a beat.
+  //
+  // Under Verilator (2-state) this is vacuous, so `make` will not exercise it;
+  // it earns its keep in a 4-state simulator (Questa/VCS/Xcelium) and in
+  // gate-level sim - exactly where an unreset-register bug would otherwise hide.
+  //----------------------------------------------------------------------------
+  always_ff @(posedge clk_i) begin
+    if (rst_ni && done_o) begin
+      assert (!$isunknown(back3_result_comb)) else
+        $error("%m: X on the result being latched at done_o - an unreset datapath register was read before it was written");
+    end
+  end
+  // synthesis translate_on
 
 endmodule

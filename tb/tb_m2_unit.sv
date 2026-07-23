@@ -51,7 +51,7 @@ module tb_m2_unit;
     // Pass 1: count lines (= vector count) so the array can be sized
     // exactly, rather than assuming a fixed N that would silently go stale
     // whenever the golden script's emitted vector count changes.
-    fd = $fopen("m2_unit_vectors.hex", "r");
+    fd = $fopen("hex_vectors/m2_unit_vectors.hex", "r");
     if (fd == 0) $fatal(1, "tb_m2_unit: cannot open m2_unit_vectors.hex - run `make m2` from tb/, or regenerate it via verification/m2_golden.py --emit-vectors");
     N = 0;
     while ($fgets(line, fd) != 0) begin
@@ -64,7 +64,7 @@ module tb_m2_unit;
     // itself can't target a dynamic array in Verilator, so do it by hand;
     // $fgets keeps the trailing newline in `line`, which %h simply stops at.
     vec = new[N];
-    fd = $fopen("m2_unit_vectors.hex", "r");
+    fd = $fopen("hex_vectors/m2_unit_vectors.hex", "r");
     for (int i = 0; i < N; i++) begin
       c = $fgets(line, fd);
       if (c == 0) $fatal(1, "tb_m2_unit: m2_unit_vectors.hex ended early at line %0d/%0d", i, N);

@@ -174,7 +174,7 @@ def fp4_fused_model(a_nibs, b_nibs, a_raw, b_raw, acc_bits, trace=False, diag=No
     lead = mag.bit_length() - 1    # -1 sentinel when mag == 0
     diag['lead'] = lead
 
-    # BACK3: mantissa / round / sticky / exponent, mirroring acc_finalize
+    # BACK3: mantissa / round / sticky / exponent, mirroring mx_finalize
     if lead == -1:
         return 0x00000000
     mant_out = 0
@@ -192,16 +192,19 @@ def fp4_fused_model(a_nibs, b_nibs, a_raw, b_raw, acc_bits, trace=False, diag=No
         m_ext += 1
     if m_ext >> 23:
         # carry out of the fraction: pre-round fraction was all-ones, the
-        # renormalized fraction is exactly zero. (The shipping acc_finalize's
-        # mant_ext[23:1] here is a latent bug - keeps the carry as fraction MSB.)
+        # renormalized fraction is exactly zero. (This carry-fix matches the
+        # RTL's mx_finalize. The absolute-window predecessor this replaced -
+        # acc_finalize, deleted from mxdotp_pkg.sv once every engine moved off
+        # it - had a latent bug here: it kept the carry as the fraction MSB
+        # instead of renormalizing to zero. Noted for history, not a live risk.)
         unb += 1
         assert m_ext == (1 << 23)
         mant_out = 0
     else:
         mant_out = m_ext & 0x7FFFFF
     if unb + 127 <= 0:
-        return (sign << 31)          # signed-zero flush, matching acc_finalize's
-                                     # {sign, 0, 0} convention (and fp4_finalize's)
+        return (sign << 31)          # signed-zero flush, matching mx_finalize's
+                                     # {sign, 0, 0} convention
     if unb + 127 >= 255:
         return (sign << 31) | 0x7F7FFFFF
     return (sign << 31) | ((unb + 127) << 23) | mant_out
@@ -216,7 +219,7 @@ def reference(a_nibs, b_nibs, a_raw, b_raw, acc_bits):
 def project_rne(v):
     """Project output convention: RNE at 24-bit *normalized* granularity,
     flush biased<=0 results to +0, clamp overflow to sign|max finite.
-    (Matches acc_finalize's semantics; NOT full-IEEE gradual underflow.)"""
+    (Matches mx_finalize's semantics; NOT full-IEEE gradual underflow.)"""
     if v == 0:
         return 0x00000000
     s = 1 if v < 0 else 0
@@ -398,7 +401,7 @@ def run_verification(verbose_fails=20):
 EMIT_SEED       = 0x46503452   # arbitrary fixed constant ("FP4R" in ASCII hex)
 EMIT_N_RANDOM   = 20000
 SCRIPT_DIR      = Path(__file__).resolve().parent
-DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "fp4_unit_vectors.hex"
+DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "hex_vectors" / "fp4_unit_vectors.hex"
 
 def _pack_nibs(nibs):
     v = 0
@@ -465,7 +468,7 @@ def main():
                      help=f"Override the output path (default: {DEFAULT_VECTORS_OUT}).")
     ap.add_argument("--n-random", type=int, default=EMIT_N_RANDOM,
                      help=f"Number of random vectors to emit (default: {EMIT_N_RANDOM}).")
-    ap.add_argument("--seed", type=int, default=EMIT_SEED,
+    ap.add_argument("--seed", type=lambda s: int(s, 0), default=EMIT_SEED,
                      help=f"RNG seed for emitted vectors (default: 0x{EMIT_SEED:x}). "
                           "Only override deliberately - changing it changes the "
                           "committed .hex file's contents.")
@@ -480,6 +483,18 @@ def main():
     if result["fail"]:
         print(f"\nVERIFICATION FAILED ({result['fail']} mismatches) - "
               f"aborting without writing any vector file.", file=sys.stderr)
+        sys.exit(1)
+    # Same hard contract m2_golden.py already enforces: FP4_REMAIN_BITS=25's own
+    # derivation proves this class is empty (0/227430 on this sweep, per the
+    # package header), so a nonzero count here means the closure argument no
+    # longer holds - a regression, not a tolerable corner. Previously this
+    # class was tracked but never enforced (silently "passed" either way);
+    # brought in line with m2_golden.py/fp8_golden.py's stricter contract.
+    if result["corner_allowed"]:
+        print(f"\nVERIFICATION FAILED: {result['corner_allowed']} vectors hit the "
+              f"REMAIN corner class, which REMAIN=25 is supposed to close "
+              f"(see module docstring / mxdotp_pkg.sv's FP4_REMAIN_BITS comment).",
+              file=sys.stderr)
         sys.exit(1)
 
     print("\nVerification PASSED.")

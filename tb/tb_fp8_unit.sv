@@ -41,7 +41,7 @@ module tb_fp8_unit;
   logic [31:0] expq [$];
 
   initial begin
-    $readmemh("fp8_unit_vectors.hex", vec);
+    $readmemh("hex_vectors/fp8_unit_vectors.hex", vec);
     rst_n = 0; start = 0; rready = 0;
     repeat (4) @(posedge clk);
     rst_n = 1;

@@ -108,11 +108,11 @@ module mxdotp_dotp_engine
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
+      // Control state only - see the note in the fused engines. rs1_q/rs2_q/
+      // rs3_q are read only under busy_q, which is reset and is set by the
+      // same branch that writes them.
       busy_q      <= 1'b0;
       cycle_cnt_q <= '0;
-      rs1_q       <= '0;
-      rs2_q       <= '0;
-      rs3_q       <= '0;
     end else if (start_i && !busy_q) begin
       busy_q      <= 1'b1;
       cycle_cnt_q <= CNT_WIDTH'(LATENCY_CYCLES - 1);
@@ -194,5 +194,26 @@ module mxdotp_dotp_engine
 
   assign p1_o = p1_sum;
   assign p2_o = p2_sum;
+
+
+  // synthesis translate_off
+  //----------------------------------------------------------------------------
+  // Reset-discipline check. The datapath in this engine carries no reset, which
+  // is only sound if data is never observed on a beat that claims to be
+  // meaningful before that data has been written. This assertion is what turns
+  // that from an assumption into a checked property: it fires the moment an X
+  // escapes on such a beat.
+  //
+  // Under Verilator (2-state) this is vacuous, so `make` will not exercise it;
+  // it earns its keep in a 4-state simulator (Questa/VCS/Xcelium) and in
+  // gate-level sim - exactly where an unreset-register bug would otherwise hide.
+  //----------------------------------------------------------------------------
+  always_ff @(posedge clk_i) begin
+    if (rst_ni && done_o) begin
+      assert (!$isunknown({p1_o, p2_o})) else
+        $error("%m: X on p1_o/p2_o at done_o - an unreset datapath register was read before it was written");
+    end
+  end
+  // synthesis translate_on
 
 endmodule

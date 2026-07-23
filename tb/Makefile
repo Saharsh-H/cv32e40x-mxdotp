@@ -3,8 +3,10 @@
 # Project : MXDOTP XIF Coprocessor - Verilator Build
 #------------------------------------------------------------------------------
 # Targets:
-#   make / make mxdotp   full system regression (tb_mxdotp_core) - UNCHANGED
-#                        workflow from before this reorganization.
+#   make / make full     full system regression (tb_mxdotp_core).
+#                        (`make mxdotp` and `make all` still work as aliases -
+#                        "mxdotp" stopped meaning "the whole design" once it
+#                        became one engine name among several after Phase A.)
 #   make fp4             standalone FP4 fused-engine unit test (tb_fp4_unit.sv
 #                        driving mxdotp_fp4_fused_engine.sv directly, no core/XIF).
 #   make fp8             standalone FP8 fused-engine unit test (tb_fp8_unit.sv
@@ -23,6 +25,16 @@
 #                        BACK1/BACK2/BACK3 pipeline overlap.
 #   make units           runs every registered standalone unit test in turn.
 #   make clean           removes all build outputs (system + every unit test).
+#
+# Build outputs all land under one BUILD_ROOT (default: build/) rather than
+# scattered per-target directories in tb/ itself:
+#   build/system/        the full-system build (was tb/obj_dir)
+#   build/units/<name>/  each unit test's build (was tb/obj_dir_<name>)
+# `make clean` removes the whole BUILD_ROOT in one shot.
+#
+# Unit-test golden-vector .hex files live under tb/hex_vectors/, not loose in
+# tb/ next to source - $$readmemh paths in each tb_<name>_unit.sv and each
+# golden script's --emit-vectors default output path both point there.
 #
 # Adding a new standalone unit test (e.g. `make fp8`) once its RTL and
 # testbench exist is exactly three lines - see "Standalone unit-engine
@@ -53,7 +65,11 @@ ROOT_DIR      := ..
 RTL_DIR       := $(ROOT_DIR)/rtl
 TB_DIR        := .
 BHV_DIR       := $(ROOT_DIR)/bhv
-BUILD_DIR     := obj_dir
+BUILD_ROOT    := $(TB_DIR)/build
+# Full-system build only; each unit test gets its own $(1)_BUILD_DIR below,
+# under build/units/ - see the UNIT_TEST_template.
+BUILD_DIR     := $(BUILD_ROOT)/system
+HEX_DIR       := $(TB_DIR)/hex_vectors
 
 MXDOTP_RTL_DIR := $(RTL_DIR)/mxdotp
 
@@ -63,12 +79,13 @@ MANIFEST      := $(ROOT_DIR)/cv32e40x_manifest.flist
 VERILATOR_FLIST := $(BUILD_DIR)/verilator.f
 
 #==============================================================================
-# make mxdotp (default) - full system regression
+# make full (default) - full system regression
 #------------------------------------------------------------------------------
-# Everything in this section (variable names, flags, recipes) is UNCHANGED
-# from before the reorganization - only the target's name (all -> mxdotp,
-# with `all` kept as a backward-compatible alias) and its position in this
-# file moved.
+# Was `make mxdotp`. Renamed because "mxdotp" stopped being a good name for
+# "the whole design" once Phase A gave the project several same-named-ish
+# engines (mxdotp_fp4_fused_engine, mxdotp_final_engine, ...) - `make mxdotp`
+# read as if it built one specific engine. `mxdotp` and `all` are both kept as
+# backward-compatible aliases below.
 #==============================================================================
 
 #----------------------------------------------------------------------------
@@ -117,7 +134,21 @@ MXDOTP_SRCS := \
 # C++ harness
 #----------------------------------------------------------------------------
 
-CXX_FILES := $(TB_DIR)/verilator_tb.cpp
+# $(abspath ...), not a bare relative path: Verilator's own shared include
+# (verilated.mk) hardcodes `VPATH += ..` for locating user .cpp sources -
+# it assumes --Mdir is always exactly ONE directory below the invocation
+# dir. That was true of the old single-level obj_dir/; it is NOT true of
+# build/system/ (two levels below tb/), so the generated sub-Makefile fails
+# with "No rule to make target 'verilator_tb.cpp'" once make -C descends
+# into build/system/ and `..` only reaches build/, not tb/. Passing an
+# absolute path here sidesteps the VPATH mechanism entirely - Verilator
+# embeds the absolute path directly in the generated compile rule instead of
+# a bare filename needing VPATH resolution. Reproduced and confirmed fixed
+# directly against Verilator (5.020) before landing this. This does NOT
+# affect the unit-test targets (make fp4 etc.): those use --binary with a
+# self-contained SV testbench and no --exe/.cpp at all, so this VPATH
+# codepath never executes for them regardless of --Mdir depth.
+CXX_FILES := $(abspath $(TB_DIR)/verilator_tb.cpp)
 
 #----------------------------------------------------------------------------
 # Verilator flags
@@ -144,7 +175,7 @@ VERILATOR_FLAGS := \
 
 EXECUTABLE := $(BUILD_DIR)/V$(TOP_MODULE)
 
-.DEFAULT_GOAL := mxdotp
+.DEFAULT_GOAL := full
 
 #----------------------------------------------------------------------------
 # Build manifest for Verilator
@@ -163,16 +194,18 @@ $(VERILATOR_FLIST): $(MANIFEST)
 # Build + run
 #----------------------------------------------------------------------------
 
-.PHONY: mxdotp all
-mxdotp: $(EXECUTABLE)
+.PHONY: full mxdotp all
+full: $(EXECUTABLE)
 	@echo
 	@echo "==============================="
 	@echo "Running simulation..."
 	@echo "==============================="
 	$(EXECUTABLE)
 
-# Backward-compatible alias - `make all` behaved exactly like this before.
-all: mxdotp
+# Backward-compatible aliases - `make mxdotp` / `make all` both behaved
+# exactly like this before the rename.
+mxdotp: full
+all: full
 
 $(EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
 	$(VERILATOR) $(VERILATOR_FLAGS) \
@@ -190,8 +223,8 @@ $(EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
 # same pattern as tb_fp4_unit.sv). Verilator's --binary mode builds and links
 # in one step, so no separate CXX_FILES entry is needed per unit test either.
 #
-# Each gets its own --Mdir (obj_dir_<name>) so unit builds never collide with
-# each other or with the system build's obj_dir.
+# Each gets its own --Mdir (build/units/<name>) so unit builds never collide
+# with each other or with the system build (build/system).
 #
 # If a unit test has a golden-model Python script (verification/, one level
 # up from tb/), setting <name>_GOLDEN to that script's path makes `make
@@ -267,7 +300,7 @@ UNIT_VERILATOR_FLAGS := \
 define UNIT_TEST_template
 
 $(1)_TOP        := tb_$(1)_unit
-$(1)_BUILD_DIR  := obj_dir_$(1)
+$(1)_BUILD_DIR  := $(BUILD_ROOT)/units/$(1)
 $(1)_TB_SRC     := $(TB_DIR)/tb_$(1)_unit.sv
 $(1)_EXECUTABLE := $$($(1)_BUILD_DIR)/V$$($(1)_TOP)
 
@@ -290,7 +323,17 @@ $(1): $(1)-vectors $$($(1)_EXECUTABLE)
 # Run from $(TB_DIR) (where the Makefile itself lives) so any relative
 # $$readmemh path in tb_$(1)_unit.sv (e.g. fp4_unit_vectors.hex) resolves
 # against tb/ without warnings, regardless of where `make` was invoked from.
+#
+# The explicit mkdir -p matters: Verilator's --Mdir creates at most ONE
+# missing directory level, not the full chain. On a fresh checkout, neither
+# build/ nor build/units/ exists yet, so a bare --Mdir build/units/$(1) (two
+# missing levels) fails with "Cannot write .../V$(1)__Syms.cpp" - reproduced
+# directly (verilator --Mdir ./build/units/fp4 with nothing pre-existing
+# fails the same way; it only succeeds once build/units/ already exists and
+# just the leaf is missing). The system build's $(VERILATOR_FLIST) rule
+# already had this covered (mkdir -p $(BUILD_DIR)); this template didn't.
 $$($(1)_EXECUTABLE): $(MXDOTP_RTL_DIR)/mxdotp_pkg.sv $(MXDOTP_SHARED_SRCS) $$($(1)_ENGINE_SRCS) $$($(1)_TB_SRC)
+	@mkdir -p $$($(1)_BUILD_DIR)
 	$(VERILATOR) $(UNIT_VERILATOR_FLAGS) \
 		--top-module $$($(1)_TOP) \
 		--Mdir $$($(1)_BUILD_DIR) \
@@ -313,8 +356,14 @@ view:
 	gtkwave tb_mxdotp_core.vcd &
 
 clean:
-	rm -rf $(BUILD_DIR)
-	rm -rf $(addprefix obj_dir_,$(UNIT_TESTS))
+	# One root now (build/system + build/units/<name>), instead of separately
+	# removing obj_dir and each obj_dir_<name>.
+	rm -rf $(BUILD_ROOT)
+	# hex_vectors/ is fully regenerable (make fp4/fp8/m2/mxfinal each
+	# recreate their own file via each golden model's --emit-vectors), so
+	# clean removing it is consistent with everything else this target
+	# removes - none of it is committed source.
+	rm -rf $(HEX_DIR)
 	rm -f *.vcd *.fst
 
 .PHONY: clean view

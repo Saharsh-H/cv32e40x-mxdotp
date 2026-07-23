@@ -228,7 +228,7 @@ def m2_fused_model(a_nibs, b_nibs, elem_em, sg_em, a_raw, b_raw, acc_bits,
     lead = mag.bit_length() - 1    # -1 sentinel when mag == 0
     diag['lead'] = lead
 
-    # BACK3: mantissa / round / sticky / exponent, mirroring fp4_finalize
+    # BACK3: mantissa / round / sticky / exponent, mirroring mx_finalize
     if lead == -1:
         return 0x00000000
     mant_out = 0
@@ -246,14 +246,14 @@ def m2_fused_model(a_nibs, b_nibs, elem_em, sg_em, a_raw, b_raw, acc_bits,
         m_ext += 1
     if m_ext >> 23:
         # carry out of the fraction: pre-round fraction was all-ones, the
-        # renormalized fraction is exactly zero (same fix as fp4_finalize's).
+        # renormalized fraction is exactly zero (same fix as mx_finalize's).
         unb += 1
         assert m_ext == (1 << 23)
         mant_out = 0
     else:
         mant_out = m_ext & 0x7FFFFF
     if unb + 127 <= 0:
-        return (sign << 31)          # signed-zero flush, matching fp4_finalize
+        return (sign << 31)          # signed-zero flush, matching mx_finalize
     if unb + 127 >= 255:
         return (sign << 31) | 0x7F7FFFFF
     return (sign << 31) | ((unb + 127) << 23) | mant_out
@@ -526,7 +526,7 @@ def run_verification(verbose_fails=20):
 EMIT_SEED       = 0x4D325850   # arbitrary fixed constant ("M2XP" in ASCII hex)
 EMIT_N_RANDOM   = 20000
 SCRIPT_DIR      = Path(__file__).resolve().parent
-DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "m2_unit_vectors.hex"
+DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "hex_vectors" / "m2_unit_vectors.hex"
 
 def _pack_nibs(nibs):
     v = 0
@@ -594,7 +594,7 @@ def main():
     ap.add_argument("--vectors-out", default=None,
                     help=f"Override the output path (default: {DEFAULT_VECTORS_OUT}).")
     ap.add_argument("--n-random", type=int, default=EMIT_N_RANDOM)
-    ap.add_argument("--seed", type=int, default=EMIT_SEED)
+    ap.add_argument("--seed", type=lambda x: int(x, 0), default=EMIT_SEED)
     args = ap.parse_args()
 
     result = run_verification()

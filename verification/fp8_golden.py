@@ -158,7 +158,8 @@ def fp8_fused_model(a_bytes, b_bytes, a_raw, b_raw, acc_bits, e5m2, diag=None):
     lead = mag.bit_length() - 1    # -1 sentinel when mag == 0
     diag['lead'] = lead
 
-    # BACK3: mantissa / round / sticky / exponent (fp8_finalize)
+    # BACK3: mantissa / round / sticky / exponent (mx_finalize, instantiated
+    # as fp8_finalize_i inside mxdotp_fp8_fused_engine.sv since Phase A.1)
     if lead == -1:
         return 0x00000000
     mant_out = 0
@@ -216,12 +217,17 @@ def zeros_equal(x, y):
 
 # ---- harness ----
 def run_verification(verbose_fails=20):
-    fails = []
-    checked = [0]
+    fail = 0
+    corner_allowed = 0
+    corner_examples = []
+    corner_tags = {}
+    checked = 0
+    fails = []          # kept for the existing fails[:verbose_fails] printer below
     tags = {}
 
     def check(a_bytes, b_bytes, a_raw, b_raw, acc_bits, e5m2, tag=""):
-        checked[0] += 1
+        nonlocal fail, corner_allowed, checked
+        checked += 1
         diag = {}
         got = fp8_fused_model(a_bytes, b_bytes, a_raw, b_raw, acc_bits, e5m2, diag)
         exact = reference(a_bytes, b_bytes, a_raw, b_raw, acc_bits, e5m2)
@@ -231,6 +237,7 @@ def run_verification(verbose_fails=20):
             # must be strictly within half an ulp of the accumulator's value -
             # i.e. RNE at the accumulator's own granularity returns it exactly.
             if got != acc_bits:
+                fail += 1
                 fails.append((tag, "BYPASS-BITS", a_bytes, b_bytes, a_raw, b_raw,
                               acc_bits, e5m2, got))
                 return
@@ -238,13 +245,29 @@ def run_verification(verbose_fails=20):
             E = (acc_bits >> 23) & 0xFF
             ulp = Fraction(2) ** (max(E, 1) - 127 - 23)
             if not (abs(exact - accv) < ulp / 2):
+                fail += 1
                 fails.append((tag, "BYPASS-INEXACT", a_bytes, b_bytes, a_raw, b_raw,
                               acc_bits, e5m2, float(abs(exact - accv)), float(ulp/2)))
             return
         exp = project_rne(exact)
-        if got != exp and not zeros_equal(got, exp):
-            fails.append((tag, a_bytes, b_bytes, a_raw, b_raw, acc_bits, e5m2, got, exp))
-            tags[tag] = tags.get(tag, 0) + 1
+        if got == exp or zeros_equal(got, exp):
+            return
+        # Named, BOUNDED corner-deviation class - structurally identical to
+        # fp4_golden.py's, FP8's own constants substituted in. FP8's REMAIN=25
+        # closes this class by the same closed-form argument as FP4/M2 (see
+        # module docstring), so corner_allowed is expected to stay 0; kept as
+        # a defensive net (and for structural parity with the other three
+        # golden models) rather than silently trusting the derivation forever.
+        if diag['acc_sticky'] and diag['rshift'] > REMAIN and diag['lead'] is not None \
+           and diag['lead'] <= 23:
+            corner_allowed += 1
+            corner_tags[tag] = corner_tags.get(tag, 0) + 1
+            if len(corner_examples) < 5:
+                corner_examples.append((tag, got, exp, float(exact)))
+            return
+        fail += 1
+        fails.append((tag, a_bytes, b_bytes, a_raw, b_raw, acc_bits, e5m2, got, exp))
+        tags[tag] = tags.get(tag, 0) + 1
 
     rng = random.Random(20260716)
     K = 8
@@ -324,11 +347,19 @@ def run_verification(verbose_fails=20):
             check(rand_bytes(), rand_bytes(), rng.randrange(255), rng.randrange(255),
                   rand_acc(), e5m2, "rand")
 
-    print(f"\nchecked={checked[0]} fail={len(fails)} by tag: "
-          f"{ {t: c for t, c in sorted(tags.items())} }")
+    print(f"\nchecked={checked} fail={fail} corner_allowed={corner_allowed} "
+          f"by tag: { {t: c for t, c in sorted(tags.items())} }")
+    for ex in corner_examples:
+        print("  corner example:", ex[0], f"got {ex[1]:08x} exp {ex[2]:08x} exact={ex[3]}")
     for f in fails[:verbose_fails]:
         print("  FAIL:", f)
-    return len(fails) == 0
+    return {
+        "checked": checked,
+        "fail": fail,
+        "corner_allowed": corner_allowed,
+        "corner_tags": corner_tags,
+        "corner_examples": corner_examples,
+    }
 
 # ---- vector emission (deterministic; format mirrors tb_fp4_unit's) ----
 # Fixed seed for --emit-vectors: committed here, NOT re-rolled per run, so the
@@ -338,7 +369,7 @@ def run_verification(verbose_fails=20):
 EMIT_SEED           = 0x46503845   # arbitrary fixed constant ("FP8E" in ASCII hex)
 EMIT_N_RANDOM       = 8000
 SCRIPT_DIR          = Path(__file__).resolve().parent
-DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "fp8_unit_vectors.hex"
+DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "hex_vectors" / "fp8_unit_vectors.hex"
 
 def _pack_bytes(bs):
     v = 0
@@ -397,20 +428,46 @@ def emit_vectors(out_path=None, n_random=EMIT_N_RANDOM, seed=EMIT_SEED):
     p = Path(out_path) if out_path is not None else DEFAULT_VECTORS_OUT
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(lines) + "\n")
-    print(f"wrote {len(lines)} vectors -> {p}")
+    return len(lines), p
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="MXFP8 fused-engine golden model: verify, and optionally "
+                    "(re)generate tb/hex_vectors/fp8_unit_vectors.hex from a "
+                    "fixed seed."
+    )
     ap.add_argument("--emit-vectors", action="store_true",
-                    help="verify, then deterministically write tb/fp8_unit_vectors.hex")
-    ap.add_argument("--out", default=None)
+                     help="After a full passing verification, deterministically "
+                          "regenerate the FP8 unit-test vector file. Writes "
+                          "nothing if verification fails.")
+    ap.add_argument("--vectors-out", default=None,
+                     help=f"Override the output path (default: {DEFAULT_VECTORS_OUT}).")
+    ap.add_argument("--n-random", type=int, default=EMIT_N_RANDOM,
+                     help=f"Number of random vectors to emit (default: {EMIT_N_RANDOM}).")
+    ap.add_argument("--seed", type=lambda s: int(s, 0), default=EMIT_SEED,
+                     help=f"RNG seed for emitted vectors (default: 0x{EMIT_SEED:x}). "
+                          "Only override deliberately - changing it changes the "
+                          "committed .hex file's contents.")
     args = ap.parse_args()
-    ok = run_verification()
-    if not ok:
-        print("\nVerification FAILED."); sys.exit(1)
+
+    result = run_verification()
+    if result["fail"]:
+        print(f"\nVERIFICATION FAILED ({result['fail']} mismatches) - "
+              f"aborting without writing any vector file.", file=sys.stderr)
+        sys.exit(1)
+    if result["corner_allowed"]:
+        print(f"\nVERIFICATION FAILED: {result['corner_allowed']} vectors hit the "
+              f"REMAIN corner class, which REMAIN=25 is supposed to close "
+              f"(see module docstring).", file=sys.stderr)
+        sys.exit(1)
+
     print("\nVerification PASSED.")
-    if args.emit_vectors:
-        emit_vectors(args.out)
+    if not args.emit_vectors:
+        sys.exit(0)
+
+    n, out_path = emit_vectors(args.vectors_out, n_random=args.n_random, seed=args.seed)
+    print(f"wrote {n} vectors -> {out_path} (seed=0x{args.seed:x}).")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

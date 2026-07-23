@@ -381,4 +381,25 @@ module mxdotp_fused_engine
 
   assign back3_result_comb = is_acc_q3 ? old_acc_q3 : back3_finalized;
 
+
+  // synthesis translate_off
+  //----------------------------------------------------------------------------
+  // Reset-discipline check. The datapath in this engine carries no reset, which
+  // is only sound if data is never observed on a beat that claims to be
+  // meaningful before that data has been written. This assertion is what turns
+  // that from an assumption into a checked property: it fires the moment an X
+  // escapes on such a beat.
+  //
+  // Under Verilator (2-state) this is vacuous, so `make` will not exercise it;
+  // it earns its keep in a 4-state simulator (Questa/VCS/Xcelium) and in
+  // gate-level sim - exactly where an unreset-register bug would otherwise hide.
+  //----------------------------------------------------------------------------
+  always_ff @(posedge clk_i) begin
+    if (rst_ni && result_valid_q) begin
+      assert (!$isunknown({result_data_q, result_id_q, result_rd_q})) else
+        $error("%m: X on a valid result beat - an unreset datapath register was read before it was written");
+    end
+  end
+  // synthesis translate_on
+
 endmodule

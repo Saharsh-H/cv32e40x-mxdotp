@@ -229,31 +229,21 @@ module mxdotp_fp8_fused_engine
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      in_valid_q  <= 1'b0; in_id_q  <= '0; in_rd_q  <= '0;
-      rs1_q <= '0; rs2_q <= '0; rs3_q <= '0;
-
-      prod_valid_q <= 1'b0; prod_id_q <= '0; prod_rd_q <= '0;
-      for (k = 0; k < MX_K8; k++) prod_q[k] <= '0;
-      sexp_q1    <= '0;
-      old_acc_q1 <= '0;
-
-      sum_valid_q <= 1'b0; sum_id_q <= '0; sum_rd_q <= '0;
-      sum_q         <= '0;
-      acc_sticky_q2 <= 1'b0;
-      neg_adj_q2    <= 1'b0;
-      is_acc_q2     <= 1'b0;
-      sexp_q2       <= '0;
-      old_acc_q2    <= '0;
-
-      lead_valid_q <= 1'b0; lead_id_q <= '0; lead_rd_q <= '0;
-      lead_q        <= '0;
-      acc_sticky_q3 <= 1'b0;
-      is_acc_q3     <= 1'b0;
-      sexp_q3       <= '0;
-      old_acc_q3    <= '0;
-
-      result_valid_q <= 1'b0; result_id_q <= '0; result_rd_q <= '0;
-      result_data_q <= '0;
+      // Reset: CONTROL state only. Datapath registers are deliberately not
+      // reset - a stage's data is never looked at unless its own control bit
+      // says it is meaningful, so an unreset datapath register cannot be
+      // observed before it is written. This is the discipline MXFP4 and
+      // M2XFP4 already used; MXFP8 and MXFINAL are brought onto it here so
+      // all four engines are consistent. Costs ~900 DFFR_X1 -> DFF_X1 and
+      // takes those flops off the reset tree. The translate_off assertion at
+      // the bottom of this file is what actively checks the discipline:
+      // it fails in a 4-state simulator if any X ever escapes on a beat that
+      // claims to be valid.
+      in_valid_q     <= 1'b0;
+      prod_valid_q   <= 1'b0;
+      sum_valid_q    <= 1'b0;
+      lead_valid_q   <= 1'b0;
+      result_valid_q <= 1'b0;
     end else if (!stall) begin
       // Every stage shifts forward exactly one register per cycle. An invalid
       // slot's data is never looked at downstream (its own valid bit, shifted
@@ -495,5 +485,26 @@ module mxdotp_fp8_fused_engine
   );
 
   assign back3_result_comb = is_acc_q3 ? old_acc_q3 : back3_finalized;
+
+
+  // synthesis translate_off
+  //----------------------------------------------------------------------------
+  // Reset-discipline check. The datapath in this engine carries no reset, which
+  // is only sound if data is never observed on a beat that claims to be
+  // meaningful before that data has been written. This assertion is what turns
+  // that from an assumption into a checked property: it fires the moment an X
+  // escapes on such a beat.
+  //
+  // Under Verilator (2-state) this is vacuous, so `make` will not exercise it;
+  // it earns its keep in a 4-state simulator (Questa/VCS/Xcelium) and in
+  // gate-level sim - exactly where an unreset-register bug would otherwise hide.
+  //----------------------------------------------------------------------------
+  always_ff @(posedge clk_i) begin
+    if (rst_ni && result_valid_q) begin
+      assert (!$isunknown({result_data_q, result_id_q, result_rd_q})) else
+        $error("%m: X on a valid result beat - an unreset datapath register was read before it was written");
+    end
+  end
+  // synthesis translate_on
 
 endmodule

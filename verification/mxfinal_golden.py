@@ -167,9 +167,11 @@ def place_clamped(v, sh, own_width):
 
 
 def _finalize_word(word, tail_sticky, R, scale_exp):
-    """fp4_find_lead + fp4_finalize, transcribed faithfully (neg_adjust,
+    """mx_find_lead + mx_finalize, transcribed faithfully (neg_adjust,
     carry-out-of-all-ones renormalization, exponent clamps - all unchanged
-    from the plain-MXFP4 reference)."""
+    from the plain-MXFP4 reference these were originally named after,
+    fp4_find_lead/fp4_finalize, before Phase A.1 folded all four formats'
+    copies into the shared mx_find_lead/mx_finalize modules)."""
     sign = 1 if word < 0 else 0
     if sign and tail_sticky:
         mag = ~word                          # |word|-1, implied (1-eps) tail
@@ -529,7 +531,7 @@ def run_verification(R=REMAIN, verbose_fails=8, seed=0xF1A1):
 EMIT_SEED = 0x4D584651          # "MXFQ" in ASCII hex - arbitrary, fixed
 EMIT_N_RANDOM = 20000
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "mxfinal_unit_vectors.hex"
+DEFAULT_VECTORS_OUT = SCRIPT_DIR / ".." / "tb" / "hex_vectors" / "mxfinal_unit_vectors.hex"
 
 
 def _pack_rs1(sa, sar, sw):
@@ -614,6 +616,17 @@ def main():
     if result["fail"]:
         print(f"VERIFICATION FAILED ({result['fail']} mismatches) - "
               f"aborting without writing any vector file.", file=sys.stderr)
+        sys.exit(1)
+    # Same hard contract m2_golden.py/fp8_golden.py enforce. REMAIN=36 was
+    # derived specifically to close this class (see the constants-section
+    # derivation above; 35 fails on the same corner, 36 does not), so a
+    # nonzero count here means the closure no longer holds - a regression,
+    # not a tolerable corner. Previously tracked but never enforced here.
+    if result["corner_allowed"]:
+        print(f"VERIFICATION FAILED: {result['corner_allowed']} vectors hit the "
+              f"REMAIN corner class, which REMAIN=36 is supposed to close "
+              f"(see the derivation above / mxdotp_pkg.sv's MXF_REMAIN_BITS "
+              f"comment).", file=sys.stderr)
         sys.exit(1)
     print("VERDICT: bit-exact RNE vs exact-rational reference, 0 real mismatches.")
     print("=" * 76)

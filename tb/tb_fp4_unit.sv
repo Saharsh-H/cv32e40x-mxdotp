@@ -49,7 +49,7 @@ module tb_fp4_unit;
     // Pass 1: count lines (= vector count) so the array can be sized
     // exactly, rather than assuming a fixed N that would silently go stale
     // whenever the golden script's emitted vector count changes.
-    fd = $fopen("fp4_unit_vectors.hex", "r");
+    fd = $fopen("hex_vectors/fp4_unit_vectors.hex", "r");
     if (fd == 0) $fatal(1, "tb_fp4_unit: cannot open fp4_unit_vectors.hex - run `make fp4` from tb/, or regenerate it via verification/fp4_golden.py --emit-vectors");
     N = 0;
     while ($fgets(line, fd) != 0) begin
@@ -62,7 +62,7 @@ module tb_fp4_unit;
     // itself can't target a dynamic array in Verilator, so do it by hand;
     // $fgets keeps the trailing newline in `line`, which %h simply stops at.
     vec = new[N];
-    fd = $fopen("fp4_unit_vectors.hex", "r");
+    fd = $fopen("hex_vectors/fp4_unit_vectors.hex", "r");
     for (int i = 0; i < N; i++) begin
       c = $fgets(line, fd);
       if (c == 0) $fatal(1, "tb_fp4_unit: fp4_unit_vectors.hex ended early at line %0d/%0d", i, N);
