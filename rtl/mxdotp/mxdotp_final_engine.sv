@@ -304,13 +304,17 @@ module mxdotp_final_engine
 
   mxf_lead_result_t back2_lead_comb;
 
-  always_comb begin
-    // neg_adjust: a nonzero positive residue was floor-truncated below the
-    // word (the sticky-direction fix). For MXFINAL that is simply the
-    // aggregate tail sticky registered from BACK1 (any right-shifted term
-    // dropped a positive residue) - see mxf_find_lead / the frame header.
-    back2_lead_comb = mxf_find_lead(mxf_word_q, mxf_sticky_q);
-  end
+  // neg_adjust: a nonzero positive residue was floor-truncated below the
+  // word (the sticky-direction fix). For MXFINAL that is simply the
+  // aggregate tail sticky registered from BACK1 (any right-shifted term
+  // dropped a positive residue) - see mx_find_lead / the frame header.
+  mx_find_lead #(.W(MXF_LZC_WIDTH)) mxf_find_lead_i (
+    .word_i       (mxf_word_q),
+    .neg_adjust_i (mxf_sticky_q),
+    .sign_o       (back2_lead_comb.sign),
+    .lead_pos_o   (back2_lead_comb.lead_pos),
+    .mag_o        (back2_lead_comb.mag)
+  );
 
   //----------------------------------------------------------------------------
   // BACK3: mantissa extraction + sticky + round + exponent clamp
@@ -322,17 +326,27 @@ module mxdotp_final_engine
 
   logic [31:0] back3_result_comb;
 
-  always_comb begin
-    // Bypass wins over the frame result: when BACK1 flagged acc-dominates /
-    // products-zero / products-cancel-exact, the correct result is the old
-    // accumulator verbatim (registered in bypass_acc_q). Otherwise finalize
-    // the frame word, with the scale (anchor) re-entering here on the
-    // exponent only and the aggregate sticky ORed into the round decision.
-    if (mxf_is_acc_q)
-      back3_result_comb = bypass_acc_q;
-    else
-      back3_result_comb = mxf_finalize(lead_q, mxf_sticky_q, anchor_q);
-  end
+  logic [31:0] back3_finalized;
+
+  mx_finalize #(
+    .W      (MXF_LZC_WIDTH),
+    .REMAIN (MXF_REMAIN_BITS),
+    .ANCHOR (MXF_FRAME_ANCHOR)
+  ) mxf_finalize_i (
+    .sign_i       (lead_q.sign),
+    .lead_pos_i   (lead_q.lead_pos),
+    .mag_i        (lead_q.mag),
+    .acc_sticky_i (mxf_sticky_q),
+    .scale_exp_i  (anchor_q),
+    .result_o     (back3_finalized)
+  );
+
+  // Bypass wins over the frame result: when BACK1 flagged acc-dominates /
+  // products-zero / products-cancel-exact, the correct result is the old
+  // accumulator verbatim (registered in bypass_acc_q). Otherwise the
+  // finalized frame word, with the scale (anchor) re-entering on the
+  // exponent only and the aggregate sticky ORed into the round decision.
+  assign back3_result_comb = mxf_is_acc_q ? bypass_acc_q : back3_finalized;
 
   logic [X_RFW_WIDTH-1:0] result_data_q;
 

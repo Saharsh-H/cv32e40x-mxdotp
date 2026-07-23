@@ -458,107 +458,35 @@ module mxdotp_m2xfp4_fused_engine
   // sticky/bypass flags.
   //----------------------------------------------------------------------------
 
-  logic        acc_sign;
-  logic [7:0]  acc_exp_f;
-  logic [22:0] acc_mant_f;
-  logic        acc_is_normal;
-  logic signed [24:0] smant;      // 25-bit signed: |{implicit, mant23}| <= 2^24-1
-  mx_exp_t     acc_shift;         // = (E + is_subnormal) - 144 - scale_exp
-
-  int          lsh;               // left-shift amount, 0..18
-  int          rsh;               // right-shift amount (clamped), 1..25
-  int          dropped;           // shift below 'remaining' (clamped), 1..25
-  logic signed [M2_FRAME_WIDTH-1:0] acc_inframe;
-  logic signed [M2_FRAME_WIDTH-1:0] frame43;
-  logic signed [49:0]               rem_wide;   // smant << (0..25) fits in 50b
-  logic [M2_REMAIN_BITS-1:0]        remaining;
-  logic [25:0]                      drop_mask;
-
-  always_comb begin
-    acc_sign      = old_acc_q1[31];
-    acc_exp_f     = old_acc_q1[30:23];
-    acc_mant_f    = old_acc_q1[22:0];
-    acc_is_normal = (acc_exp_f != 8'd0);
-
-    // Subnormal accumulators are HONORED: no implicit bit, effective
-    // exponent = E + 1.
-    smant = acc_sign ? -$signed({1'b0, acc_is_normal, acc_mant_f})
-                     :  $signed({1'b0, acc_is_normal, acc_mant_f});
-
-    acc_shift = mx_exp_t'({8'd0, acc_exp_f}) + mx_exp_t'(!acc_is_normal)
-              - mx_exp_t'(M2_ACC_SHIFT_CONST) - sexp_q1;
-
-    back1_acc_sticky_comb = 1'b0;
-    back1_is_acc_comb     = 1'b0;
-    acc_inframe           = '0;
-    remaining             = '0;
-    rem_wide              = '0;
-    drop_mask             = '0;
-    lsh = 0; rsh = 0; dropped = 0;
-
-    if (acc_shift > mx_exp_t'(M2_MAX_ACC_SHIFT)) begin
-      // SoP too small to change the accumulator: |SoP| <= 75264 < 2^17 =
-      // half-ulp across a binade boundary at this shift, strictly (a factor
-      // of 1.74 of margin) - so RNE returns the accumulator exactly.
-      back1_is_acc_comb = 1'b1;
-    end else if (acc_shift >= mx_exp_t'(0)) begin
-      // In-frame left shift: mant top bit lands at <= bit 41, one below the
-      // sign bit; (2^24-1)*2^18 + 75264 = 2^42 - 186880 < 2^42, so the
-      // 43-bit add can never wrap - no saturation logic exists or is needed.
-      lsh         = int'(acc_shift);
-      acc_inframe = M2_FRAME_WIDTH'(smant) <<< lsh;
-    end else begin
-      // Right shift: floor-truncation at 25-fractional-bit resolution.
-      // Clamps at 25 for the same reason as the MXFP4 engine: smant is 25
-      // bits, so any arithmetic right shift >= 25 already yields pure sign
-      // bits and any drop mask >= 25 bits already covers the whole mantissa.
-      rsh         = (-int'(acc_shift) > 25) ? 25 : -int'(acc_shift);
-      acc_inframe = M2_FRAME_WIDTH'(smant) >>> rsh;
-      if (-int'(acc_shift) > M2_REMAIN_BITS) begin
-        dropped   = (-int'(acc_shift) - M2_REMAIN_BITS > 25)
-                  ? 25 : (-int'(acc_shift) - M2_REMAIN_BITS);
-        remaining = M2_REMAIN_BITS'(smant >>> dropped);
-        drop_mask = (26'd1 << dropped) - 26'd1;
-        back1_acc_sticky_comb = |(smant & drop_mask[24:0]);
-        // SoP==0 bypass: with accumulator bits already dropped, round-
-        // tripping would lose acc precision through the sticky path -
-        // return it verbatim instead (exact).
-        if (sop_q == '0) back1_is_acc_comb = 1'b1;
-      end else begin
-        rem_wide  = 50'(smant) <<< (M2_REMAIN_BITS + int'(acc_shift));
-        remaining = rem_wide[M2_REMAIN_BITS-1:0];
-      end
-    end
-
-    frame43 = M2_FRAME_WIDTH'(sop_q) + acc_inframe;
-
-    // m2_find_lead's sticky-negation condition: a nonzero positive residue
-    // was floor-truncated below this word.
-    back1_neg_adj_comb = (dropped != 0) && (smant != '0) && back1_acc_sticky_comb;
-
-    back1_word_comb = {frame43, remaining};
-  end
-
-  // synthesis translate_off
-  // Safety net for the knife-edge no-overflow proof: recompute the frame sum
-  // 2 bits wider and confirm the 43-bit result is identical.
-  logic signed [M2_FRAME_WIDTH+1:0] frame_chk;
-  always_comb begin
-    frame_chk = (M2_FRAME_WIDTH+2)'(sop_q) + (M2_FRAME_WIDTH+2)'(acc_inframe);
-    if (sop_valid_q && !back1_is_acc_comb)
-      assert (frame_chk == (M2_FRAME_WIDTH+2)'(frame43)) else
-        $error("mxdotp_m2xfp4_fused_engine: 43-bit frame overflow - violates the sizing proof");
-  end
-  // synthesis translate_on
+    mx_acc_slide #(
+    .FRAME_W         (M2_FRAME_WIDTH),
+    .REMAIN          (M2_REMAIN_BITS),
+    .MAX_ACC_SHIFT   (M2_MAX_ACC_SHIFT),
+    .ACC_SHIFT_CONST (M2_ACC_SHIFT_CONST),
+    .SOP_W           (M2_SOP_SIGNED_WIDTH)
+  ) m2_acc_slide_i (
+    .old_acc_i    (old_acc_q1),
+    .scale_exp_i  (sexp_q1),
+    .sop_i        (sop_q),
+    .valid_i      (sop_valid_q),
+    .word_o       (back1_word_comb),
+    .acc_sticky_o (back1_acc_sticky_comb),
+    .neg_adj_o    (back1_neg_adj_comb),
+    .is_acc_o     (back1_is_acc_comb)
+  );
 
   //----------------------------------------------------------------------------
   // BACK2: sign/magnitude (with the sticky-negation adjust) + leading-one
   // scan on the 68-bit extended word (mxdotp_pkg.sv's m2_find_lead).
   //----------------------------------------------------------------------------
 
-  always_comb begin
-    back2_lead_comb = m2_find_lead(sum_q, neg_adj_q2);
-  end
+  mx_find_lead #(.W(M2_LZC_WIDTH)) m2_find_lead_i (
+    .word_i       (sum_q),
+    .neg_adjust_i (neg_adj_q2),
+    .sign_o       (back2_lead_comb.sign),
+    .lead_pos_o   (back2_lead_comb.lead_pos),
+    .mag_o        (back2_lead_comb.mag)
+  );
 
   //----------------------------------------------------------------------------
   // BACK3: mantissa extraction + sticky + round + exponent clamp
@@ -566,9 +494,21 @@ module mxdotp_m2xfp4_fused_engine
   // only), or the verbatim accumulator bypass.
   //----------------------------------------------------------------------------
 
-  always_comb begin
-    back3_result_comb = is_acc_q3 ? old_acc_q3
-                                  : m2_finalize(lead_q, acc_sticky_q3, sexp_q3);
-  end
+  logic [31:0] back3_finalized;
+
+  mx_finalize #(
+    .W      (M2_LZC_WIDTH),
+    .REMAIN (M2_REMAIN_BITS),
+    .ANCHOR (M2_FRAME_ANCHOR)
+  ) m2_finalize_i (
+    .sign_i       (lead_q.sign),
+    .lead_pos_i   (lead_q.lead_pos),
+    .mag_i        (lead_q.mag),
+    .acc_sticky_i (acc_sticky_q3),
+    .scale_exp_i  (sexp_q3),
+    .result_o     (back3_finalized)
+  );
+
+  assign back3_result_comb = is_acc_q3 ? old_acc_q3 : back3_finalized;
 
 endmodule

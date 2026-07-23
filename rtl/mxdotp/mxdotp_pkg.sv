@@ -516,25 +516,6 @@ package mxdotp_pkg;
   //     scale, value = 2^(raw-127). Applying a scale is a pure exponent add. ---
   localparam int E8M0_BIAS = 127;
 
-  // --- Internal wide fixed-point accumulation buffer: 95-bit two's-
-  //     complement buffer, bit[ACC_ANCHOR] has weight 2^0. PRODSUM_WIDTH=67
-  //     is the SINGLE SHIFTED PRODUCT's signed width in the paper's own
-  //     datapath (sign + magnitude span [2^31 : 2^-34]; their
-  //     PROD_SHIFT_WIDTH = 1 + 32 + 34) - the sum of 8 needs 3 more bits.
-  //     Documentation-only constant, consumed nowhere; kept for reference.
-  //     GUARD_BITS=3 covers summing the
-  //     (at most 3) contributions MXFINAL ever combines (p1, p2, old
-  //     accumulator) without overflow. ---
-  localparam int ACC_WIDTH     = 95;
-  localparam int ACC_ANCHOR    = 34;
-  localparam int PRODSUM_WIDTH = 67;
-  localparam int GUARD_BITS    = 3;
-  localparam int ACC_FULL_WIDTH = ACC_WIDTH + GUARD_BITS;  // carries every MXFINAL
-                                                             // contribution and their
-                                                             // sum through to the one
-                                                             // and only rounding step
-                                                             // (acc_to_fp32) with no
-                                                             // intermediate narrowing
 
   // A generously-wide signed type for exponent arithmetic (folded-in E8M0
   // scale exponents and buffer shift amounts all comfortably fit with room
@@ -667,226 +648,19 @@ package mxdotp_pkg;
     return mx_exp_t'({8'd0, xa_raw}) + mx_exp_t'({8'd0, xb_raw}) - mx_exp_t'(2*E8M0_BIAS);
   endfunction
 
-  //----------------------------------------------------------------------------
-  // place_in_acc: shift an unsigned magnitude (caller zero-extends into a
-  // 32-bit container) into the ACC_WIDTH-bit two's-complement wide buffer,
-  // positioned so its LSB lands at bit (exp + ACC_ANCHOR).
-  //
-  // The usable *unsigned magnitude* range is ACC_WIDTH-1 bits (MAGW below) -
-  // bit ACC_WIDTH-1 is reserved purely as a sign-safety guard and is never
-  // written by the shifted magnitude itself. This matters: a shift landing
-  // exactly on bit ACC_WIDTH-1 would otherwise be misread as the two's-
-  // complement sign bit even though the true value is positive. Overflow is
-  // detected by explicitly checking whether any bits were shifted out above
-  // the MAGW-bit window (not just a coarse pre-check on shift_amt), so a
-  // shift landing anywhere near that boundary saturates correctly instead
-  // of silently truncating.
-  //----------------------------------------------------------------------------
-  function automatic logic signed [ACC_WIDTH-1:0] place_in_acc(
-    input logic     sign,
-    input mx_exp_t  exp,
-    input logic [31:0] mag
-  );
-    localparam int MAGW = ACC_WIDTH - 1;  // usable unsigned magnitude width
-    mx_exp_t                  shift_amt;
-    int                       shamt;
-    logic [MAGW+32-1:0]       wide_tmp;
-    logic [MAGW-1:0]          mag_mag;
-    logic signed [ACC_WIDTH-1:0] result;
-    begin
-      shift_amt = exp + mx_exp_t'(ACC_ANCHOR);
-      if (shift_amt >= mx_exp_t'(MAGW)) begin
-        mag_mag = {MAGW{1'b1}};                          // saturate: max representable magnitude
-      end else if (shift_amt <= -mx_exp_t'(32)) begin
-        mag_mag = '0;                                    // fully below resolution: negligible
-      end else if (shift_amt >= 0) begin
-        shamt    = int'(shift_amt);
-        wide_tmp = {{MAGW{1'b0}}, mag} << shamt;
-        if (|wide_tmp[MAGW+32-1:MAGW])
-          mag_mag = {MAGW{1'b1}};                        // true overflow: saturate
-        else
-          mag_mag = wide_tmp[MAGW-1:0];
-      end else begin
-        shamt   = int'(-shift_amt);
-        mag_mag = MAGW'(mag >> shamt);
-      end
-      result = sign ? (-$signed({1'b0, mag_mag})) : $signed({1'b0, mag_mag});
-      return result;
-    end
-  endfunction
 
-  //----------------------------------------------------------------------------
-  // fp32_to_acc: decode an FP32 value and place it into the wide buffer at
-  // its natural exponent position (used by MXFINAL to bring in the old
-  // accumulator). Denormals (biased exp==0) flush to zero.
-  //----------------------------------------------------------------------------
-  function automatic logic signed [ACC_WIDTH-1:0] fp32_to_acc(input logic [31:0] val);
-    logic        sign;
-    logic [7:0]  exp_biased;
-    logic [22:0] mant;
-    logic [23:0] sig24;
-    mx_exp_t     e;
-    begin
-      sign       = val[31];
-      exp_biased = val[30:23];
-      mant       = val[22:0];
-      if (exp_biased == 8'd0) begin
-        return '0;
-      end
-      sig24 = {1'b1, mant};
-      e     = mx_exp_t'({8'd0, exp_biased}) - mx_exp_t'(127) - mx_exp_t'(23);
-      return place_in_acc(sign, e, {8'd0, sig24});
-    end
-  endfunction
 
-  //----------------------------------------------------------------------------
-  // mx_lead_result_t: the contract between acc_find_lead (leading-one scan)
-  // and acc_finalize (mantissa extract + round + clamp) - the exact split
-  // point identified from Vivado's own timing report as the highest-leverage
-  // single pipeline cut in the whole back-end (see mxdotp_fused_engine.sv /
-  // mxdotp_final_engine.sv's BACK2/BACK3 stages). lead_pos is signed and
-  // sized to hold the -1 sentinel (acc was exactly zero) through
-  // ACC_FULL_WIDTH-1 (the maximum valid bit position) with room to spare -
-  // 9 bits comfortably covers -256..255 against an actual range of -1..97.
-  //----------------------------------------------------------------------------
-  typedef struct packed {
-    logic                      sign;
-    logic signed [8:0]         lead_pos;
-    logic [ACC_FULL_WIDTH-1:0] mag;
-  } mx_lead_result_t;
 
-  //----------------------------------------------------------------------------
-  // acc_find_lead / acc_finalize: acc_to_fp32 (below) split at its leading-
-  // one-scan boundary. This is Vivado's OWN evidence, not a guess: the
-  // report_timing critical path ran unbroken from rs3_q (an operand
-  // register) through place_in_acc/fp32_to_acc, the wide sum, the leading-
-  // one scan, and the mantissa/round/clamp logic - 79 logic levels, zero
-  // registers - because nothing in the original single-function
-  // acc_to_fp32 gave a caller anywhere to put one. Splitting the FUNCTION
-  // is what makes a real register possible at the call site: a caller now
-  // registers acc_find_lead's result (mx_lead_result_t) before calling
-  // acc_finalize on it, instead of the whole chain running in one
-  // unbroken combinational cycle.
-  //----------------------------------------------------------------------------
 
-  // First half: two's-complement -> sign/magnitude, then the leading-one
-  // scan (a simple descending priority scan - unchanged algorithm from
-  // before this split; only its position in the pipeline changed).
-  function automatic mx_lead_result_t acc_find_lead(input logic signed [ACC_FULL_WIDTH-1:0] acc);
-    logic                      sign;
-    logic [ACC_FULL_WIDTH-1:0] mag;
-    int                        lead_pos;
-    int                        i;
-    mx_lead_result_t           result;
-    begin
-      sign = acc[ACC_FULL_WIDTH-1];
-      mag  = sign ? (-acc) : acc;  // two's-complement negation, reinterpreted as
-                                    // unsigned magnitude via same-width assignment
-      lead_pos = -1;
-      for (i = ACC_FULL_WIDTH-1; i >= 0; i--) begin
-        if (lead_pos == -1 && mag[i]) lead_pos = i;
-      end
-      result.sign     = sign;
-      result.lead_pos = 9'(lead_pos);  // sign-extends -1 correctly into the signed field
-      result.mag      = mag;
-      return result;
-    end
-  endfunction
 
-  // Second half: mantissa extraction, sticky/round, exponent clamp - takes
-  // an ALREADY-COMPUTED sign/lead_pos/mag (e.g. from a registered
-  // acc_find_lead call one cycle earlier) instead of recomputing them from
-  // acc directly. Includes the acc==0 special case (here: lead_pos==-1, the
-  // sentinel acc_find_lead produces for that input - mag==0 iff acc==0 for
-  // a two's-complement value, and the leading-one loop only ever fails to
-  // set lead_pos when mag is entirely zero, so this is exactly equivalent
-  // to the original function's `if (acc == '0) return 32'd0;`).
-  function automatic logic [31:0] acc_finalize(input mx_lead_result_t lr);
-    int          lead_pos;
-    mx_exp_t     unbiased_exp;
-    logic [22:0] mant_out;
-    logic        round_bit, sticky_bit;
-    logic [23:0] mant_ext;
-    logic [7:0]  exp_out;
-    int          i;
-    begin
-      lead_pos = int'(lr.lead_pos);
-      if (lead_pos == -1) return 32'd0;
-
-      unbiased_exp = mx_exp_t'(lead_pos) - mx_exp_t'(ACC_ANCHOR);
-
-      mant_out   = '0;
-      round_bit  = 1'b0;
-      sticky_bit = 1'b0;
-      for (i = 0; i < 23; i++) begin
-        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
-      end
-      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
-      // Fixed-bound loop (ACC_FULL_WIDTH is a compile-time constant), guarded
-      // by a data-dependent `if` - the same pattern the mant_out loop just
-      // above uses. lead_pos-24 alone was a data-dependent trip count that
-      // Vivado couldn't statically unroll ([Synth 8-3380] "loop condition
-      // does not converge") - the bound is widened to the provably-safe
-      // constant ACC_FULL_WIDTH (mag's own bit range is 0..ACC_FULL_WIDTH-1,
-      // so no valid i is ever excluded) and the original bound enforced as a
-      // guard instead. Semantically identical, not an approximation: every i
-      // beyond the original bound is guarded off and contributes nothing.
-      for (i = 0; i < ACC_FULL_WIDTH; i++) begin
-        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
-      end
-
-      mant_ext = {1'b0, mant_out};
-      if (round_bit && (sticky_bit || mant_out[0])) begin  // round-to-nearest-even
-        mant_ext = mant_ext + 24'd1;
-      end
-
-      if (mant_ext[23]) begin
-        // BUG FIX (found by fp4_golden.py's exact-rational sweep, latent
-        // since this function was written): a carry out of the 23-bit
-        // fraction is only ever reachable when the pre-round fraction was
-        // ALL ONES (1.111...1 rounding up to 2.0), so the renormalized
-        // fraction is exactly ZERO. The previous mant_ext[23:1] kept the
-        // carry bit as the new fraction MSB, producing 1.5*2^(e+1) instead
-        // of 1.0*2^(e+1) - a half-magnitude error. Never hit by the
-        // existing test vectors (none round up from an all-ones fraction);
-        // affects MXFINAL results only in that corner (MXFP8 moved to its
-        // own fp8_finalize, which carries the same fix).
-        unbiased_exp = unbiased_exp + mx_exp_t'(1);
-        mant_out     = '0;
-      end else begin
-        mant_out = mant_ext[22:0];
-      end
-
-      if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
-        exp_out = 8'd0; mant_out = '0;
-      end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
-        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
-      end else begin
-        exp_out = 8'(unbiased_exp + mx_exp_t'(127));
-      end
-
-      return {lr.sign, exp_out, mant_out};
-    end
-  endfunction
-
-  //----------------------------------------------------------------------------
-  // acc_to_fp32: normalize + single round-to-nearest-even of the final wide
-  // fixed-point sum back down to FP32 - the *only* rounding step in the
-  // whole datapath (matching the "single rounding" property of both
-  // reference papers). Takes the full ACC_FULL_WIDTH (ACC_WIDTH+GUARD_BITS)
-  // value directly - callers should never narrow to ACC_WIDTH before this
-  // call. The exponent clamp near the end (over/underflow to the FP32
-  // representable range) is the *only* range-limiting step in the whole
-  // datapath, and it's the legitimate final one, not an early one.
-  //
-  // Now just a thin composition of acc_find_lead + acc_finalize above (kept
-  // for any caller that doesn't need a pipeline cut here - neither
-  // mxdotp_final_engine.sv nor mxdotp_fused_engine.sv call this directly
-  // any more; both call the split halves with a real register in between).
-  //----------------------------------------------------------------------------
-  function automatic logic [31:0] acc_to_fp32(input logic signed [ACC_FULL_WIDTH-1:0] acc);
-    return acc_finalize(acc_find_lead(acc));
-  endfunction
+  // The absolute-window accumulation buffer (ACC_WIDTH=95 / ACC_ANCHOR=34,
+  // place_in_acc / fp32_to_acc / acc_find_lead / acc_finalize / acc_to_fp32,
+  // mx_lead_result_t, PRODSUM_WIDTH, GUARD_BITS) was removed here. It had
+  // been unreferenced since MXFINAL got its own sliding frame (v11 SS10) and
+  // was the datapath responsible for the 68.96% mismatch rate measured in
+  // v11 SS5. Every engine now uses a per-format sliding frame plus the shared
+  // mx_find_lead / mx_finalize / mx_acc_slide blocks. Recover from git if a
+  // side-by-side comparison against the old scheme is ever wanted again.
 
 
   //============================================================================
@@ -953,6 +727,13 @@ package mxdotp_pkg;
   // from it to close the gap.
   //----------------------------------------------------------------------------
 
+  // Frame bit b has value weight 2^(b - FP4_FRAME_ANCHOR). Named here rather
+  // than left as a bare literal in fp4_finalize's exponent term: the anchor is
+  // load-bearing in two independent places (the exponent below and
+  // FP4_ACC_SHIFT_CONST), and a literal in one of them cannot be kept in step
+  // with the other by anything but memory. Sibling of FP8_FRAME_ANCHOR /
+  // M2_FRAME_ANCHOR, which were already named.
+  localparam int FP4_FRAME_ANCHOR  = 2;
   localparam int FP4_FRAME_WIDTH   = 38;                    // see layout above
   localparam int FP4_MAX_ACC_SHIFT = FP4_FRAME_WIDTH - 24 - 1;  // = 13
   localparam int FP4_REMAIN_BITS   = 25;                    // DST precision (24->25: closes
@@ -963,7 +744,7 @@ package mxdotp_pkg;
   // Accumulator-shift constant: mant24 LSB (weight 2^(e-23)) lands at frame
   // bit (e - 21 - scale_exp) since frame bit b has value weight 2^(b-2);
   // with e = E_biased + is_subnormal - 127 this is E + is_sub - 148 - scale.
-  localparam int FP4_ACC_SHIFT_CONST = 148;                 // 127 + 23 - 2
+  localparam int FP4_ACC_SHIFT_CONST = 127 + 23 - FP4_FRAME_ANCHOR;  // = 148
 
   // acc_find_lead/acc_finalize sibling contract, sized for the 63-bit word.
   // lead_pos: -1 sentinel .. 62, signed 8 bits with room to spare.
@@ -978,31 +759,9 @@ package mxdotp_pkg;
   // scan. neg_adjust_i must be BACK1's registered
   // (right_shift > FP4_REMAIN_BITS) && acc_sticky && (smant != 0) - i.e.
   // "a nonzero positive residue was floor-truncated below this word".
-  function automatic fp4_lead_result_t fp4_find_lead(
-    input logic signed [FP4_LZC_WIDTH-1:0] word,
-    input logic                            neg_adjust_i
-  );
-    logic                     sign;
-    logic [FP4_LZC_WIDTH-1:0] mag;
-    int                       lead_pos;
-    int                       i;
-    fp4_lead_result_t         result;
-    begin
-      sign = word[FP4_LZC_WIDTH-1];
-      if (sign && neg_adjust_i)
-        mag = ~word;        // |word| - 1, with the implied (1-eps) tail below
-      else
-        mag = sign ? (-word) : word;
-      lead_pos = -1;
-      for (i = FP4_LZC_WIDTH-1; i >= 0; i--) begin
-        if (lead_pos == -1 && mag[i]) lead_pos = i;
-      end
-      result.sign     = sign;
-      result.lead_pos = 8'(lead_pos);
-      result.mag      = mag;
-      return result;
-    end
-  endfunction
+  // fp4_find_lead() moved to mx_find_lead.sv (Phase A.1).
+  // Instantiated as fp4_find_lead_i inside the engine that used it, so the
+  // per-format name now survives into the netlist instead of being inlined away.
 
   // Second half (BACK3): mantissa extraction + round/sticky + exponent
   // clamp on the 63-bit word. Differences from the shared acc_finalize:
@@ -1014,63 +773,9 @@ package mxdotp_pkg;
   //     (acc_finalize was independently patched for the same issue, found by
   //     the same fp4_golden.py sweep - see acc_finalize's BUG FIX comment
   //     above; both functions now agree)
-  function automatic logic [31:0] fp4_finalize(
-    input fp4_lead_result_t lr,
-    input logic             acc_sticky_i,
-    input mx_exp_t          scale_exp_i
-  );
-    int          lead_pos;
-    mx_exp_t     unbiased_exp;
-    logic [22:0] mant_out;
-    logic        round_bit, sticky_bit;
-    logic [23:0] mant_ext;
-    logic [7:0]  exp_out;
-    int          i;
-    begin
-      lead_pos = int'(lr.lead_pos);
-      if (lead_pos == -1) return 32'd0;
-
-      unbiased_exp = mx_exp_t'(lead_pos) - mx_exp_t'(FP4_REMAIN_BITS + 2)
-                   + scale_exp_i;
-
-      mant_out   = '0;
-      round_bit  = 1'b0;
-      sticky_bit = acc_sticky_i;
-      for (i = 0; i < 23; i++) begin
-        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
-      end
-      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
-      // Fixed-bound loop, data-dependent guard inside - same synthesizable
-      // pattern as acc_finalize (see its comment for the Vivado history).
-      for (i = 0; i < FP4_LZC_WIDTH; i++) begin
-        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
-      end
-
-      mant_ext = {1'b0, mant_out};
-      if (round_bit && (sticky_bit || mant_out[0])) begin  // round-to-nearest-even
-        mant_ext = mant_ext + 24'd1;
-      end
-
-      if (mant_ext[23]) begin
-        // Carry out of the 23-bit fraction: only reachable from an
-        // all-ones fraction, so the renormalized fraction is exactly 0.
-        unbiased_exp = unbiased_exp + mx_exp_t'(1);
-        mant_out     = '0;
-      end else begin
-        mant_out = mant_ext[22:0];
-      end
-
-      if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
-        exp_out = 8'd0; mant_out = '0;
-      end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
-        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
-      end else begin
-        exp_out = 8'(unbiased_exp + mx_exp_t'(127));
-      end
-
-      return {lr.sign, exp_out, mant_out};
-    end
-  endfunction
+  // fp4_finalize() moved to mx_finalize.sv (Phase A.1).
+  // Instantiated as fp4_finalize_i inside the engine that used it, so the
+  // per-format name now survives into the netlist instead of being inlined away.
 
   //----------------------------------------------------------------------------
   // MXFP8 SLIDING-ACCUMULATOR FRAME (mxdotp_fp8_fused_engine.sv)
@@ -1133,7 +838,7 @@ package mxdotp_pkg;
   // Accumulator-shift constant: mant24 LSB (weight 2^(e-23)) lands at frame
   // bit (e - 23 + 32) = e + 9 since frame bit b has value weight 2^(b-32);
   // with e = E_biased + is_subnormal - 127 this is E + is_sub - 118 - scale.
-  localparam int FP8_ACC_SHIFT_CONST = 118;                 // 127 + 23 - 32
+  localparam int FP8_ACC_SHIFT_CONST = 127 + 23 - FP8_FRAME_ANCHOR;  // = 118
 
   // fp8_find_lead/fp8_finalize sibling contract, sized for the 120-bit word.
   // lead_pos: -1 sentinel .. 119, signed 8 bits (-128..127) with room.
@@ -1151,31 +856,9 @@ package mxdotp_pkg;
   // Identical algorithm to fp4_find_lead; duplicated because SV package
   // functions cannot be width-parameterized (same sibling convention as
   // fp4_find_lead itself vs acc_find_lead).
-  function automatic fp8_lead_result_t fp8_find_lead(
-    input logic signed [FP8_LZC_WIDTH-1:0] word,
-    input logic                            neg_adjust_i
-  );
-    logic                     sign;
-    logic [FP8_LZC_WIDTH-1:0] mag;
-    int                       lead_pos;
-    int                       i;
-    fp8_lead_result_t         result;
-    begin
-      sign = word[FP8_LZC_WIDTH-1];
-      if (sign && neg_adjust_i)
-        mag = ~word;        // |word| - 1, with the implied (1-eps) tail below
-      else
-        mag = sign ? (-word) : word;
-      lead_pos = -1;
-      for (i = FP8_LZC_WIDTH-1; i >= 0; i--) begin
-        if (lead_pos == -1 && mag[i]) lead_pos = i;
-      end
-      result.sign     = sign;
-      result.lead_pos = 8'(lead_pos);
-      result.mag      = mag;
-      return result;
-    end
-  endfunction
+  // fp8_find_lead() moved to mx_find_lead.sv (Phase A.1).
+  // Instantiated as fp8_find_lead_i inside the engine that used it, so the
+  // per-format name now survives into the netlist instead of being inlined away.
 
   // Second half (BACK3): mantissa extraction + round/sticky + exponent
   // clamp on the 120-bit word. Same structure as fp4_finalize; only the
@@ -1186,64 +869,9 @@ package mxdotp_pkg;
   //   - acc_sticky_i (bits dropped below the remaining field) ORs into
   //     the sticky term
   //   - carry-out of an all-ones fraction renormalizes to fraction = 0
-  function automatic logic [31:0] fp8_finalize(
-    input fp8_lead_result_t lr,
-    input logic             acc_sticky_i,
-    input mx_exp_t          scale_exp_i
-  );
-    int          lead_pos;
-    mx_exp_t     unbiased_exp;
-    logic [22:0] mant_out;
-    logic        round_bit, sticky_bit;
-    logic [23:0] mant_ext;
-    logic [7:0]  exp_out;
-    int          i;
-    begin
-      lead_pos = int'(lr.lead_pos);
-      if (lead_pos == -1) return 32'd0;
-
-      unbiased_exp = mx_exp_t'(lead_pos)
-                   - mx_exp_t'(FP8_REMAIN_BITS + FP8_FRAME_ANCHOR)
-                   + scale_exp_i;
-
-      mant_out   = '0;
-      round_bit  = 1'b0;
-      sticky_bit = acc_sticky_i;
-      for (i = 0; i < 23; i++) begin
-        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
-      end
-      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
-      // Fixed-bound loop, data-dependent guard inside - same synthesizable
-      // pattern as acc_finalize (see its comment for the Vivado history).
-      for (i = 0; i < FP8_LZC_WIDTH; i++) begin
-        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
-      end
-
-      mant_ext = {1'b0, mant_out};
-      if (round_bit && (sticky_bit || mant_out[0])) begin  // round-to-nearest-even
-        mant_ext = mant_ext + 24'd1;
-      end
-
-      if (mant_ext[23]) begin
-        // Carry out of the 23-bit fraction: only reachable from an
-        // all-ones fraction, so the renormalized fraction is exactly 0.
-        unbiased_exp = unbiased_exp + mx_exp_t'(1);
-        mant_out     = '0;
-      end else begin
-        mant_out = mant_ext[22:0];
-      end
-
-      if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
-        exp_out = 8'd0; mant_out = '0;
-      end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
-        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
-      end else begin
-        exp_out = 8'(unbiased_exp + mx_exp_t'(127));
-      end
-
-      return {lr.sign, exp_out, mant_out};
-    end
-  endfunction
+  // fp8_finalize() moved to mx_finalize.sv (Phase A.1).
+  // Instantiated as fp8_finalize_i inside the engine that used it, so the
+  // per-format name now survives into the netlist instead of being inlined away.
 
 
   //----------------------------------------------------------------------------
@@ -1406,7 +1034,7 @@ package mxdotp_pkg;
   // Accumulator-shift constant: mant24 LSB (weight 2^(e-23)) lands at frame
   // bit (e - 17 - scale_exp) since frame bit b has value weight 2^(b-6);
   // with e = E_biased + is_subnormal - 127 this is E + is_sub - 144 - scale.
-  localparam int M2_ACC_SHIFT_CONST = 144;                  // 127 + 23 - 6
+  localparam int M2_ACC_SHIFT_CONST = 127 + 23 - M2_FRAME_ANCHOR;    // = 144
 
   // rs3 packing (upper 32 bits, from rs3+1) for MX_FMT_M2XFP4:
   //   [63:57] reserved (7 bits still spare)
@@ -1595,93 +1223,16 @@ package mxdotp_pkg;
   // First half (BACK2): identical in structure to fp4_find_lead, sized for
   // the 68-bit word. neg_adjust_i must be BACK1's registered
   // (right_shift > M2_REMAIN_BITS) && acc_sticky && (smant != 0).
-  function automatic m2_lead_result_t m2_find_lead(
-    input logic signed [M2_LZC_WIDTH-1:0] word,
-    input logic                           neg_adjust_i
-  );
-    logic                    sign;
-    logic [M2_LZC_WIDTH-1:0] mag;
-    int                      lead_pos;
-    int                      i;
-    m2_lead_result_t         result;
-    begin
-      sign = word[M2_LZC_WIDTH-1];
-      if (sign && neg_adjust_i)
-        mag = ~word;        // |word| - 1, with the implied (1-eps) tail below
-      else
-        mag = sign ? (-word) : word;
-      lead_pos = -1;
-      for (i = M2_LZC_WIDTH-1; i >= 0; i--) begin
-        if (lead_pos == -1 && mag[i]) lead_pos = i;
-      end
-      result.sign     = sign;
-      result.lead_pos = 8'(lead_pos);
-      result.mag      = mag;
-      return result;
-    end
-  endfunction
+  // m2_find_lead() moved to mx_find_lead.sv (Phase A.1).
+  // Instantiated as m2_find_lead_i inside the engine that used it, so the
+  // per-format name now survives into the netlist instead of being inlined away.
 
   // Second half (BACK3): identical in structure to fp4_finalize, sized for
   // the 68-bit word. Exponent = lead_pos - 31 + scale_exp (25 remaining bits
   // + the -6 code anchor); the scale re-enters HERE, on an exponent wire only.
-  function automatic logic [31:0] m2_finalize(
-    input m2_lead_result_t lr,
-    input logic            acc_sticky_i,
-    input mx_exp_t         scale_exp_i
-  );
-    int          lead_pos;
-    mx_exp_t     unbiased_exp;
-    logic [22:0] mant_out;
-    logic        round_bit, sticky_bit;
-    logic [23:0] mant_ext;
-    logic [7:0]  exp_out;
-    int          i;
-    begin
-      lead_pos = int'(lr.lead_pos);
-      if (lead_pos == -1) return 32'd0;
-
-      unbiased_exp = mx_exp_t'(lead_pos)
-                   - mx_exp_t'(M2_REMAIN_BITS + M2_FRAME_ANCHOR)
-                   + scale_exp_i;
-
-      mant_out   = '0;
-      round_bit  = 1'b0;
-      sticky_bit = acc_sticky_i;
-      for (i = 0; i < 23; i++) begin
-        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
-      end
-      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
-      // Fixed-bound loop, data-dependent guard inside - same synthesizable
-      // pattern as fp4_finalize/fp8_finalize.
-      for (i = 0; i < M2_LZC_WIDTH; i++) begin
-        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
-      end
-
-      mant_ext = {1'b0, mant_out};
-      if (round_bit && (sticky_bit || mant_out[0])) begin  // round-to-nearest-even
-        mant_ext = mant_ext + 24'd1;
-      end
-
-      if (mant_ext[23]) begin
-        // Carry out of the 23-bit fraction: only reachable from an
-        // all-ones fraction, so the renormalized fraction is exactly 0.
-        unbiased_exp = unbiased_exp + mx_exp_t'(1);
-        mant_out     = '0;
-      end else begin
-        mant_out = mant_ext[22:0];
-      end
-
-      if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
-        exp_out = 8'd0; mant_out = '0;
-      end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
-        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
-      end else begin
-        exp_out = 8'(unbiased_exp + mx_exp_t'(127));
-      end
-
-      return {lr.sign, exp_out, mant_out};
-    end
-  endfunction
+  // m2_finalize() moved to mx_finalize.sv (Phase A.1).
+  // Instantiated as m2_finalize_i inside the engine that used it, so the
+  // per-format name now survives into the netlist instead of being inlined away.
 
 
   //----------------------------------------------------------------------------
@@ -1772,14 +1323,20 @@ package mxdotp_pkg;
   //     exactly 73 bits = MXF_LZC_WIDTH-1, the sign-safe limit.
   //
   //   MXF_MAX_ACC_SHIFT = 13 = MXF_FRAME_WIDTH - 24 - 1, unchanged from FP4.
-  //   MXF_ACC_SHIFT_CONST = 148 = 127 + 23 - 2, unchanged from FP4.
+  //   MXF_ACC_SHIFT_CONST = 148 = 127 + 23 - MXF_FRAME_ANCHOR, unchanged from FP4.
   //----------------------------------------------------------------------------
 
+  // Frame bit b has value weight 2^(b - MXF_FRAME_ANCHOR); same anchor as FP4
+  // (MXFINAL's terms are fp4-code products), named for the same reason - see
+  // the FP4_FRAME_ANCHOR comment. This is the '-2 fp4-code anchor correction'
+  // that v11 SS10 found applied twice; carrying it as a named constant applied
+  // in exactly one place (mxf_finalize) is what keeps that from recurring.
+  localparam int MXF_FRAME_ANCHOR  = 2;
   localparam int MXF_FRAME_WIDTH   = 38;                    // knife-edge proof above
   localparam int MXF_MAX_ACC_SHIFT = MXF_FRAME_WIDTH - 24 - 1;  // = 13
   localparam int MXF_REMAIN_BITS   = 36;                    // derived above (35 fails)
   localparam int MXF_LZC_WIDTH     = MXF_FRAME_WIDTH + MXF_REMAIN_BITS;  // = 74
-  localparam int MXF_ACC_SHIFT_CONST = 148;                 // 127 + 23 - 2
+  localparam int MXF_ACC_SHIFT_CONST = 127 + 23 - MXF_FRAME_ANCHOR;  // = 148
 
   // Per-term clamped placement, shared by SECOND (own_width=13) and the
   // accumulator mantissa (own_width=25). Returns the (signed) contribution to
@@ -1836,95 +1393,21 @@ package mxdotp_pkg;
     logic [MXF_LZC_WIDTH-1:0]      mag;
   } mxf_lead_result_t;
 
-  function automatic mxf_lead_result_t mxf_find_lead(
-    input logic signed [MXF_LZC_WIDTH-1:0] word,
-    input logic                            neg_adjust_i
-  );
-    logic                     sign;
-    logic [MXF_LZC_WIDTH-1:0] mag;
-    int                       lead_pos;
-    int                       i;
-    mxf_lead_result_t         result;
-    begin
-      sign = word[MXF_LZC_WIDTH-1];
-      if (sign && neg_adjust_i)
-        mag = ~word;        // |word|-1, implied (1-eps) tail below
-      else
-        mag = sign ? (-word) : word;
-      lead_pos = -1;
-      for (i = MXF_LZC_WIDTH-1; i >= 0; i--) begin
-        if (lead_pos == -1 && mag[i]) lead_pos = i;
-      end
-      result.sign     = sign;
-      result.lead_pos = 8'(lead_pos);
-      result.mag      = mag;
-      return result;
-    end
-  endfunction
+  // mxf_find_lead() moved to mx_find_lead.sv (Phase A.1).
+  // Instantiated as mxf_find_lead_i inside the engine that used it, so the
+  // per-format name now survives into the netlist instead of being inlined away.
 
   // Mantissa extract + round/sticky + exponent clamp on the 74-bit word.
   // Structural sibling of fp4_finalize; scale re-enters HERE via scale_exp_i
   // (= the selected anchor), on an exponent wire only. Same conventions:
-  //   - exponent = lead_pos - (MXF_REMAIN_BITS + 2) + scale_exp
+  //   - exponent = lead_pos - (MXF_REMAIN_BITS + MXF_FRAME_ANCHOR) + scale_exp
   //   - acc_sticky_i (bits dropped below the word) ORs into the sticky term
   //   - carry-out of an all-ones fraction renormalizes to fraction = 0
   //   - subnormal RESULT flushes to signed zero; overflow clamps to
   //     sign|0xFE|0x7FFFFF (Known Limitation #3 - the RTL cannot emit Inf)
-  function automatic logic [31:0] mxf_finalize(
-    input mxf_lead_result_t lr,
-    input logic             acc_sticky_i,
-    input mx_exp_t          scale_exp_i
-  );
-    int          lead_pos;
-    mx_exp_t     unbiased_exp;
-    logic [22:0] mant_out;
-    logic        round_bit, sticky_bit;
-    logic [23:0] mant_ext;
-    logic [7:0]  exp_out;
-    int          i;
-    begin
-      lead_pos = int'(lr.lead_pos);
-      if (lead_pos == -1) return 32'd0;
-
-      unbiased_exp = mx_exp_t'(lead_pos) - mx_exp_t'(MXF_REMAIN_BITS + 2)
-                   + scale_exp_i;
-
-      mant_out   = '0;
-      round_bit  = 1'b0;
-      sticky_bit = acc_sticky_i;
-      for (i = 0; i < 23; i++) begin
-        if (lead_pos - 1 - i >= 0) mant_out[22-i] = lr.mag[lead_pos-1-i];
-      end
-      if (lead_pos - 24 >= 0) round_bit = lr.mag[lead_pos-24];
-      for (i = 0; i < MXF_LZC_WIDTH; i++) begin
-        if (i < lead_pos-24 && lr.mag[i]) sticky_bit = 1'b1;
-      end
-
-      mant_ext = {1'b0, mant_out};
-      if (round_bit && (sticky_bit || mant_out[0])) begin  // round-to-nearest-even
-        mant_ext = mant_ext + 24'd1;
-      end
-
-      if (mant_ext[23]) begin
-        // Carry out of the 23-bit fraction: only reachable from an all-ones
-        // fraction, so the renormalized fraction is exactly 0.
-        unbiased_exp = unbiased_exp + mx_exp_t'(1);
-        mant_out     = '0;
-      end else begin
-        mant_out = mant_ext[22:0];
-      end
-
-      if ((unbiased_exp + mx_exp_t'(127)) <= mx_exp_t'(0)) begin
-        exp_out = 8'd0; mant_out = '0;
-      end else if ((unbiased_exp + mx_exp_t'(127)) >= mx_exp_t'(255)) begin
-        exp_out = 8'hFE; mant_out = 23'h7FFFFF;
-      end else begin
-        exp_out = 8'(unbiased_exp + mx_exp_t'(127));
-      end
-
-      return {lr.sign, exp_out, mant_out};
-    end
-  endfunction
+  // mxf_finalize() moved to mx_finalize.sv (Phase A.1).
+  // Instantiated as mxf_finalize_i inside the engine that used it, so the
+  // per-format name now survives into the netlist instead of being inlined away.
 
 
 endpackage

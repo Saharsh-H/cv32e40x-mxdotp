@@ -28,6 +28,8 @@
 # testbench exist is exactly three lines - see "Standalone unit-engine
 # testbenches" below:
 #   1. add the engine's RTL source(s) to a new <name>_ENGINE_SRCS variable
+#      (the shared mx_*.sv blocks come in automatically via MXDOTP_SHARED_SRCS
+#       - list only the engine's OWN sources here)
 #   2. add <name> to UNIT_TESTS
 #   3. drop tb_<name>_unit.sv into tb/
 # Nothing else in this file needs to change; the template generates the
@@ -83,8 +85,25 @@ TB_SRCS := \
 # MXDOTP sources
 #----------------------------------------------------------------------------
 
+# Shared, format-parameterized datapath blocks (Phase A.1). Every engine
+# instantiates these with its own frame widths, so they belong to the common
+# set rather than to any one engine's <name>_ENGINE_SRCS. Listing them here
+# (and in the unit-test template below) means a NEW unit test picks them up
+# with no extra wiring, exactly the way it already picks up mxdotp_pkg.sv.
+#
+# These must be real prerequisites, not just findable via -I$(MXDOTP_RTL_DIR):
+# a file reachable only through the include search path does not trigger a
+# rebuild when it is edited. That was a real latent bug in this Makefile once
+# already (mxdotp_fp8_fused_engine.sv, found in the M2XFP4 pass) - do not let
+# it come back through the shared blocks.
+MXDOTP_SHARED_SRCS := \
+	$(MXDOTP_RTL_DIR)/mx_find_lead.sv \
+	$(MXDOTP_RTL_DIR)/mx_finalize.sv \
+	$(MXDOTP_RTL_DIR)/mx_acc_slide.sv
+
 MXDOTP_SRCS := \
 	$(MXDOTP_RTL_DIR)/mxdotp_pkg.sv \
+	$(MXDOTP_SHARED_SRCS) \
 	$(MXDOTP_RTL_DIR)/mxdotp_decoder.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_dotp_engine.sv \
 	$(MXDOTP_RTL_DIR)/mxdotp_final_engine.sv \
@@ -184,7 +203,9 @@ $(EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
 #
 # TO ADD A NEW ONE: define <name>_ENGINE_SRCS (and <name>_GOLDEN, if it has
 # a golden-model script), add <name> to UNIT_TESTS, and drop
-# tb_<name>_unit.sv into tb/. That's the entire integration.
+# tb_<name>_unit.sv into tb/. That's the entire integration - the shared
+# mx_*.sv datapath blocks are added by the template itself, so
+# <name>_ENGINE_SRCS lists only that engine's own file(s).
 #==============================================================================
 
 VERIFICATION_DIR := $(ROOT_DIR)/verification
@@ -269,11 +290,11 @@ $(1): $(1)-vectors $$($(1)_EXECUTABLE)
 # Run from $(TB_DIR) (where the Makefile itself lives) so any relative
 # $$readmemh path in tb_$(1)_unit.sv (e.g. fp4_unit_vectors.hex) resolves
 # against tb/ without warnings, regardless of where `make` was invoked from.
-$$($(1)_EXECUTABLE): $(MXDOTP_RTL_DIR)/mxdotp_pkg.sv $$($(1)_ENGINE_SRCS) $$($(1)_TB_SRC)
+$$($(1)_EXECUTABLE): $(MXDOTP_RTL_DIR)/mxdotp_pkg.sv $(MXDOTP_SHARED_SRCS) $$($(1)_ENGINE_SRCS) $$($(1)_TB_SRC)
 	$(VERILATOR) $(UNIT_VERILATOR_FLAGS) \
 		--top-module $$($(1)_TOP) \
 		--Mdir $$($(1)_BUILD_DIR) \
-		$(MXDOTP_RTL_DIR)/mxdotp_pkg.sv $$($(1)_ENGINE_SRCS) $$($(1)_TB_SRC)
+		$(MXDOTP_RTL_DIR)/mxdotp_pkg.sv $(MXDOTP_SHARED_SRCS) $$($(1)_ENGINE_SRCS) $$($(1)_TB_SRC)
 
 endef
 
