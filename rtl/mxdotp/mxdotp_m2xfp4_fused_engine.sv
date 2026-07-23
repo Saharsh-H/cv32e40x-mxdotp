@@ -223,13 +223,32 @@ module mxdotp_m2xfp4_fused_engine
   assign result_data_o  = result_data_q;
 
   //----------------------------------------------------------------------------
-  // FRONT-END. Four steps, all combinational, all inside one stage:
+  // FRONT-END. Narrow-multiplier decomposition (see mxdotp_pkg.sv's
+  // "NARROW-MULTIPLIER DECOMPOSITION" header for the derivation and the
+  // synthesis timing data that motivated it - v1 of this engine typed every
+  // lane's code at 7 bits uniformly; this version types all 16 lanes at
+  // CODE_WIDTH=5 (identical to mxdotp_fused_engine.sv's own per-lane width)
+  // and adds back ONE small, tree-gated correction term per subgroup:
+  //
+  //   psum[sj] = baseline_psum[sj] (8 lanes x 5x5 multiply, tree-INDEPENDENT,
+  //              same structure/speed as the plain MXFP4 engine's own FRONT)
+  //            + correction[sj]    (ONE 5x5 multiply, gated behind the top-1
+  //              tree via an 8:1 select on b_code and delta_code)
+  //
+  // Six steps, all combinational, all inside one stage:
   //   (a) unpack nibbles + metadata
   //   (b) per subgroup: re-derive the top-1 activation (max |FP4 code|, ties
-  //       -> lowest index) as a one-hot
-  //   (c) per lane: pick the wide Elem-EM code (top-1) or the plain code,
-  //       multiply by the weight code, sum within the subgroup
-  //   (d) per subgroup: apply Sg-EM (1 + k/4) as shift-and-add, then combine
+  //       -> lowest index) as a one-hot - tournament tree, unchanged from the
+  //       tree-balanced rewrite (see module header)
+  //   (c) baseline per-lane products (ALL 16 lanes, tree-independent) +
+  //       balanced 8-term reduction, per subgroup
+  //   (d) delta-code lookup for all 8 lanes per subgroup (tree-independent -
+  //       only depends on that lane's nibble and the subgroup's Elem-EM,
+  //       both already registered), then ONE 8:1 select (gated by the tree's
+  //       one-hot) and ONE small multiply for the correction term
+  //   (e) per subgroup: baseline + correction, then apply Sg-EM (1 + k/4) as
+  //       shift-and-add
+  //   (f) combine the two subgroups
   // plus the HOISTED scale-exponent adder, exactly as the MXFP4 engine does.
   //
   // The SoP is the format mux's only client: MX_FMT_M2XFP4 passes the real
@@ -248,15 +267,49 @@ module mxdotp_m2xfp4_fused_engine
   // |fp4_to_code| is a plain 4-bit unsigned compare - the paper's 16-entry
   // FP4->UINT LUT (Fig. 10) exists only to make its sign-inclusive ordering
   // monotonic, and is unnecessary under the Alg. 1 tie-break we follow.
+  // Balanced tournament tree (depth 3): pairwise compare-and-select carries
+  // BOTH the running max magnitude and its one-hot location together, so the
+  // priority-encode falls out of the same tree as the max-finding instead of
+  // being a second, serially-dependent 8-deep ripple chain stacked after it -
+  // using >= at every level means ties resolve toward the LOWER original
+  // index, matching Alg. 1's tie-break exactly (verified: see
+  // verification/m2_golden.py's directed tournament-tie-break vectors).
   logic signed [CODE_WIDTH-1:0]        a_code_raw [0:MX_K-1];
   logic [3:0]                          a_mag      [0:MX_K-1];   // |code| <= 12
-  logic [3:0]                          sub_vmax   [0:M2_SUBGROUPS-1];
   logic [M2_SUBGROUP_LEN-1:0]          top1_oh    [0:M2_SUBGROUPS-1];
-  logic                                top1_found;
 
-  logic signed [M2_XCODE_WIDTH-1:0]    a_xcode [0:MX_K-1];      // 8*X'
-  logic signed [CODE_WIDTH-1:0]        b_code  [0:MX_K-1];      // 2*W
-  logic signed [M2_PROD_WIDTH-1:0]     prod    [0:MX_K-1];      // 16*W*X'
+  logic [3:0]                          tree_m1 [0:M2_SUBGROUPS-1][0:3];
+  logic [M2_SUBGROUP_LEN-1:0]          tree_h1 [0:M2_SUBGROUPS-1][0:3];
+  logic [3:0]                          tree_m2 [0:M2_SUBGROUPS-1][0:1];
+  logic [M2_SUBGROUP_LEN-1:0]          tree_h2 [0:M2_SUBGROUPS-1][0:1];
+
+  // (c) baseline: ALL 16 lanes, tree-independent, identical width/structure
+  // to mxdotp_fused_engine.sv's own per-lane product (CODE_WIDTH=5 x
+  // CODE_WIDTH=5 -> PROD_WIDTH=9), promoted to this engine's 1/16-unit
+  // convention by a FREE (wiring-only) left-shift by 2 - not a wider
+  // multiply. 4*fp4_to_code(nib) (a plain lane's code in the OLD 7-bit
+  // convention) is PROVABLY always a multiple of 4 (its low 2 bits are
+  // always zero - the whole reason this decomposition is exact), so
+  // shifting the NARROW product left by 2 is bit-identical to widening the
+  // operand first and multiplying wide.
+  logic signed [CODE_WIDTH-1:0]        b_code            [0:MX_K-1];   // 2*W
+  logic signed [PROD_WIDTH-1:0]        baseline_prod_1_4 [0:MX_K-1];   // 4*W*X, 1/4 units
+  logic signed [M2_PROD_WIDTH-1:0]     baseline_prod_1_16[0:MX_K-1];   // <<<2, 1/16 units
+
+  logic signed [M2_PSUM_WIDTH-1:0]     base_tree_l1 [0:M2_SUBGROUPS-1][0:3];
+  logic signed [M2_PSUM_WIDTH-1:0]     base_tree_l2 [0:M2_SUBGROUPS-1][0:1];
+  logic signed [M2_PSUM_WIDTH-1:0]     baseline_psum[0:M2_SUBGROUPS-1];
+
+  // (d) correction: delta-code lookup for all 8 lanes (tree-independent -
+  // only needs that lane's nibble + the subgroup's Elem-EM, both already
+  // registered), then ONE 8:1 select per subgroup (gated by the tree) and
+  // ONE small 5x5 multiply - replacing what was, in the previous version, a
+  // full 7-bit decode+multiply on EVERY lane gated behind the tree.
+  logic signed [M2_DELTA_WIDTH-1:0]    delta_code   [0:MX_K-1];
+  logic signed [M2_DELTA_WIDTH-1:0]    delta_sel    [0:M2_SUBGROUPS-1];
+  logic signed [CODE_WIDTH-1:0]        bcode_sel    [0:M2_SUBGROUPS-1];
+  logic signed [M2_CORR_PROD_WIDTH-1:0] correction  [0:M2_SUBGROUPS-1];
+
   logic signed [M2_PSUM_WIDTH-1:0]     psum    [0:M2_SUBGROUPS-1];
   logic signed [M2_SOP_SIGNED_WIDTH-1:0] psum_w    [0:M2_SUBGROUPS-1];
   logic signed [M2_SOP_SIGNED_WIDTH-1:0] sg_scaled [0:M2_SUBGROUPS-1];
@@ -277,47 +330,82 @@ module mxdotp_m2xfp4_fused_engine
 
     for (fi = 0; fi < MX_K; fi++) begin
       a_code_raw[fi] = fp4_to_code(a_nib[fi]);
-      a_mag[fi]      = 4'(a_code_raw[fi][CODE_WIDTH-1] ? -a_code_raw[fi]
-                                                       :  a_code_raw[fi]);
+      // Magnitude for the tree comes DIRECTLY from fp4_mag - not by negating
+      // a_code_raw a second time. fp4_to_code already computes this exact
+      // value internally (a plain case-statement LUT) before ever applying
+      // the sign; undoing that sign afterward would be a real, avoidable
+      // negate sitting on the tree's own input path - see mxdotp_pkg.sv's
+      // fp4_mag for why this is a genuine redundancy, not a style choice.
+      a_mag[fi]      = fp4_mag(a_nib[fi][2:0]);
     end
 
-    // (b) per-subgroup max, then lowest-index one-hot (the priority encoder
-    // IS paper Alg. 1's min(C_idx) tie-break - no index bits are stored or
-    // compared, unlike Fig. 10's comparator tree which carries idx around).
+    // (b) per-subgroup balanced tournament: max-finding and lowest-index
+    // tie-break resolved together in the same 3 levels.
     for (sj = 0; sj < M2_SUBGROUPS; sj++) begin
-      sub_vmax[sj] = 4'd0;
-      for (si = 0; si < M2_SUBGROUP_LEN; si++) begin
-        if (a_mag[sj*M2_SUBGROUP_LEN + si] > sub_vmax[sj])
-          sub_vmax[sj] = a_mag[sj*M2_SUBGROUP_LEN + si];
-      end
-      top1_oh[sj] = '0;
-      top1_found  = 1'b0;
-      for (si = 0; si < M2_SUBGROUP_LEN; si++) begin
-        if (!top1_found && (a_mag[sj*M2_SUBGROUP_LEN + si] == sub_vmax[sj])) begin
-          top1_oh[sj][si] = 1'b1;
-          top1_found      = 1'b1;
+      for (si = 0; si < 4; si++) begin
+        if (a_mag[sj*M2_SUBGROUP_LEN + 2*si] >= a_mag[sj*M2_SUBGROUP_LEN + 2*si + 1]) begin
+          tree_m1[sj][si] = a_mag[sj*M2_SUBGROUP_LEN + 2*si];
+          tree_h1[sj][si] = M2_SUBGROUP_LEN'(1) << (2*si);
+        end else begin
+          tree_m1[sj][si] = a_mag[sj*M2_SUBGROUP_LEN + 2*si + 1];
+          tree_h1[sj][si] = M2_SUBGROUP_LEN'(1) << (2*si + 1);
         end
       end
-    end
-
-    // (c) lane codes + products + intra-subgroup sum
-    for (sj = 0; sj < M2_SUBGROUPS; sj++) begin
-      psum[sj] = '0;
-      for (si = 0; si < M2_SUBGROUP_LEN; si++) begin
-        fi = sj*M2_SUBGROUP_LEN + si;
-        // Elem-EM lane vs plain lane. Both are 8*value, so they add directly
-        // with no alignment: the whole rs1 side lives in units of 1/8.
-        a_xcode[fi] = top1_oh[sj][si] ? m2_x_to_code(a_nib[fi], elem_em[sj])
-                                      : m2_plain_to_code(a_nib[fi]);
-        b_code[fi]  = fp4_to_code(b_nib[fi]);
-        prod[fi]    = M2_PROD_WIDTH'(a_xcode[fi] * b_code[fi]);
-        psum[sj]    = psum[sj] + M2_PSUM_WIDTH'(prod[fi]);
+      for (si = 0; si < 2; si++) begin
+        if (tree_m1[sj][2*si] >= tree_m1[sj][2*si + 1]) begin
+          tree_m2[sj][si] = tree_m1[sj][2*si];
+          tree_h2[sj][si] = tree_h1[sj][2*si];
+        end else begin
+          tree_m2[sj][si] = tree_m1[sj][2*si + 1];
+          tree_h2[sj][si] = tree_h1[sj][2*si + 1];
+        end
       end
+      if (tree_m2[sj][0] >= tree_m2[sj][1]) top1_oh[sj] = tree_h2[sj][0];
+      else                                  top1_oh[sj] = tree_h2[sj][1];
     end
 
-    // (d) Sg-EM: P*(1 + k/4) == P*(4+k) in 1/64 units == (P<<2) + k1*(P<<1)
-    // + k0*P. Three shifted addends, no multiplier, exact - this is the step
-    // that moves the frame anchor from MXFP4's 2 to 6.
+    // (c) baseline: every lane, tree-independent - runs in parallel with (b).
+    for (fi = 0; fi < MX_K; fi++) begin
+      b_code[fi]             = fp4_to_code(b_nib[fi]);
+      baseline_prod_1_4[fi]  = PROD_WIDTH'(a_code_raw[fi]) * PROD_WIDTH'(b_code[fi]);
+      baseline_prod_1_16[fi] = M2_PROD_WIDTH'(baseline_prod_1_4[fi]) <<< 2;
+    end
+    for (sj = 0; sj < M2_SUBGROUPS; sj++) begin
+      for (si = 0; si < 4; si++) begin
+        fi = sj*M2_SUBGROUP_LEN + 2*si;
+        base_tree_l1[sj][si] = M2_PSUM_WIDTH'(baseline_prod_1_16[fi])
+                             + M2_PSUM_WIDTH'(baseline_prod_1_16[fi + 1]);
+      end
+      base_tree_l2[sj][0] = base_tree_l1[sj][0] + base_tree_l1[sj][1];
+      base_tree_l2[sj][1] = base_tree_l1[sj][2] + base_tree_l1[sj][3];
+      baseline_psum[sj]   = base_tree_l2[sj][0] + base_tree_l2[sj][1];
+    end
+
+    // (d) correction: delta lookup for all 8 lanes (tree-independent), then
+    // ONE select + ONE small multiply per subgroup, gated by the tree.
+    for (fi = 0; fi < MX_K; fi++) begin
+      delta_code[fi] = m2_delta_code(a_nib[fi], elem_em[fi / M2_SUBGROUP_LEN]);
+    end
+    for (sj = 0; sj < M2_SUBGROUPS; sj++) begin
+      delta_sel[sj] = '0;
+      bcode_sel[sj] = '0;
+      for (si = 0; si < M2_SUBGROUP_LEN; si++) begin
+        if (top1_oh[sj][si]) begin
+          delta_sel[sj] = delta_code[sj*M2_SUBGROUP_LEN + si];
+          bcode_sel[sj] = b_code[sj*M2_SUBGROUP_LEN + si];
+        end
+      end
+      correction[sj] = M2_CORR_PROD_WIDTH'(bcode_sel[sj]) * M2_CORR_PROD_WIDTH'(delta_sel[sj]);
+    end
+
+    // (e) baseline + correction, then Sg-EM: P*(1 + k/4) == P*(4+k) in 1/64
+    // units == (P<<2) + k1*(P<<1) + k0*P. Three shifted addends, no
+    // multiplier, exact - this is the step that moves the frame anchor from
+    // MXFP4's 2 to 6.
+    for (sj = 0; sj < M2_SUBGROUPS; sj++) begin
+      psum[sj] = baseline_psum[sj] + M2_PSUM_WIDTH'(correction[sj]);
+    end
+
     sop_sum = '0;
     for (sj = 0; sj < M2_SUBGROUPS; sj++) begin
       psum_w[sj]    = M2_SOP_SIGNED_WIDTH'(psum[sj]);
@@ -341,6 +429,10 @@ module mxdotp_m2xfp4_fused_engine
   // FRONT sizing proofs. The per-subgroup bound is the tight one (the top-1
   // caps the other 7 lanes at 6.0, so 7*(12*48) + 12*56 = 4704, not 8*672);
   // the SoP bound is the loose one used in the frame's knife-edge proof.
+  // Both bounds are on the FINAL psum VALUE, which is unchanged by this
+  // decomposition (baseline+correction computes the exact same mathematical
+  // quantity the old wide-multiplier design did) - so the bounds themselves
+  // don't change, only how psum is built.
   always_comb begin
     if (in_valid_q && (mx_format_q == MX_FMT_M2XFP4)) begin
       for (int cj = 0; cj < M2_SUBGROUPS; cj++) begin

@@ -609,6 +609,36 @@ package mxdotp_pkg;
     end
   endfunction
 
+  // Magnitude-only companion to fp4_to_code, for consumers that need |value|
+  // directly (e.g. a tournament/max-finding tree) and would otherwise have to
+  // recover it by negating fp4_to_code's OWN signed result a second time -
+  // fp4_to_code already computes this exact `mag` internally via a plain
+  // case-statement LUT (no carry chain) before ever applying the sign, so
+  // undoing that sign afterward is a real, avoidable negate sitting on
+  // whatever critical path consumes it. Deliberately a STANDALONE duplicate
+  // of fp4_to_code's case statement rather than a refactor of fp4_to_code
+  // itself (which mxdotp_dotp_engine.sv, mxdotp_final_engine.sv and
+  // mxdotp_fused_engine.sv also depend on) - touching a function four
+  // engines share needs re-verifying all four, not just the one consumer
+  // that needed this. The two tables are proven identical exhaustively (see
+  // verification), not just by inspection.
+  function automatic logic [3:0] fp4_mag(input logic [2:0] mag3);
+    logic [3:0] mag;
+    begin
+      unique case (mag3)
+        3'b000: mag = 4'd0;   // 0.0
+        3'b001: mag = 4'd1;   // 0.5
+        3'b010: mag = 4'd2;   // 1.0
+        3'b011: mag = 4'd3;   // 1.5
+        3'b100: mag = 4'd4;   // 2.0
+        3'b101: mag = 4'd6;   // 3.0
+        3'b110: mag = 4'd8;   // 4.0
+        3'b111: mag = 4'd12;  // 6.0
+      endcase
+      return mag;
+    end
+  endfunction
+
   //----------------------------------------------------------------------------
   // mx_raw_contrib_t: the contract between a mxdotp_fused_engine.sv FRONT-END
   // (format-specific unpack/multiply/sum) and its shared BACK-END (scale +
@@ -1452,6 +1482,115 @@ package mxdotp_pkg;
       return M2_XCODE_WIDTH'(fp4_to_code(nib)) <<< 2;
     end
   endfunction
+
+  //----------------------------------------------------------------------------
+  // NARROW-MULTIPLIER DECOMPOSITION (added post-synthesis, see below).
+  //
+  // The original FRONT (above/mxdotp_m2xfp4_fused_engine.sv v1) typed EVERY
+  // lane's activation code at M2_XCODE_WIDTH=7 bits uniformly, so all 16 of a
+  // subgroup-pair's multipliers synthesized at 7x5 even though only the ONE
+  // actual top-1 lane per subgroup ever needs more than 5 bits: a plain lane's
+  // code (4*fp4_to_code(nib)) is PROVABLY always a multiple of 4 (its low 2
+  // bits are always zero), so it only ever needs CODE_WIDTH=5 bits of real
+  // information. A synthesis timing report (10ns/100MHz constraint) showed
+  // this was the dominant cost: FRONT's worst slack (6.57ns) was ~1.58ns
+  // tighter than the equivalent stage in mxdotp_fused_engine.sv's own FRONT
+  // (8.15ns), by far the largest gap of any pipeline stage - BACK1/2/3's
+  // gaps against their own FP4 equivalents were all under 0.2ns, i.e. noise-
+  // level, not structural.
+  //
+  // Fix: use the distributive identity explicitly (this is the paper's own
+  // Fig. 11 split, Sec 5.4's W*X' = W*X + W*dX - deliberately not used in v1
+  // because full-parallel-lane-decode made it seem unnecessary; the timing
+  // data says otherwise):
+  //
+  //   W * X'_top1 = W * X_plain + W * (X'_top1 - X_plain)
+  //               = baseline (5x5, ALL 16 lanes, tree-INDEPENDENT, identical
+  //                 structure/speed to mxdotp_fused_engine.sv's own FRONT)
+  //               + correction (ONE 5x5 multiply PER SUBGROUP, not per lane -
+  //                 gated behind the top-1 tree, but narrow and singular
+  //                 instead of wide and per-lane)
+  //
+  // delta_code(nib,meta) := m2_x_to_code(nib,meta) - 4*fp4_to_code(nib), i.e.
+  // 8*(X'_top1 - X_plain), computed and verified exhaustively over all 8 FP4
+  // magnitudes x 4 meta values (32 combinations): every value is in
+  // {-8,-4,-2,-1,0,1,2,4,8} - proof that quantifies the paper's own Sec 4.4
+  // observation ("a value quantized to FP4 x has only five potential E2M3
+  // correspondents") into an exact, small, sign-antisymmetric correction.
+  // Implemented as a direct 32-entry lookup (not by computing the full
+  // exponent-dependent m2_x_to_code barrel-shift for all 8 lanes and then
+  // subtracting - that would just relocate the expensive computation, not
+  // remove it). M2_DELTA_WIDTH=5 holds the full +/-8 range; the correction
+  // product (CODE_WIDTH=5 x M2_DELTA_WIDTH=5, |.|<=12*8=96) needs
+  // M2_CORR_PROD_WIDTH=8 bits signed.
+  //----------------------------------------------------------------------------
+
+  localparam int M2_DELTA_WIDTH      = 5;   // signed, holds the full +/-8 delta range
+  localparam int M2_CORR_PROD_WIDTH  = 8;   // b_code(5) x delta_code(5), |.| <= 96
+
+  // Magnitude-only delta lookup: mag3 = nib[2:0] (the E2M1 magnitude field,
+  // sign excluded - delta is exactly antisymmetric in sign, verified over all
+  // 16x4=64 (nib,meta) combinations). 32-entry case, generated directly from
+  // (and checked bit-for-bit against) the exhaustive sweep in m2_golden.py -
+  // not hand-derived, to eliminate transcription risk on the one part of this
+  // engine that has no other independent check until the full-engine
+  // regression runs.
+  function automatic logic signed [M2_DELTA_WIDTH-1:0] m2_delta_mag(
+    input logic [2:0] mag3,
+    input logic [1:0] meta
+  );
+    begin
+      case ({mag3, meta})
+        5'b000_00: return  5'sd0;
+        5'b000_01: return  5'sd0;
+        5'b000_10: return  5'sd1;
+        5'b000_11: return  5'sd2;
+        5'b001_00: return -5'sd1;
+        5'b001_01: return  5'sd0;
+        5'b001_10: return  5'sd1;
+        5'b001_11: return  5'sd2;
+        5'b010_00: return -5'sd1;
+        5'b010_01: return  5'sd0;
+        5'b010_10: return  5'sd1;
+        5'b010_11: return  5'sd2;
+        5'b011_00: return -5'sd1;
+        5'b011_01: return  5'sd0;
+        5'b011_10: return  5'sd1;
+        5'b011_11: return  5'sd2;
+        5'b100_00: return -5'sd1;
+        5'b100_01: return  5'sd0;
+        5'b100_10: return  5'sd2;
+        5'b100_11: return  5'sd4;
+        5'b101_00: return -5'sd2;
+        5'b101_01: return  5'sd0;
+        5'b101_10: return  5'sd2;
+        5'b101_11: return  5'sd4;
+        5'b110_00: return -5'sd2;
+        5'b110_01: return  5'sd0;
+        5'b110_10: return  5'sd4;
+        5'b110_11: return  5'sd8;
+        5'b111_00: return -5'sd4;
+        5'b111_01: return  5'sd0;
+        5'b111_10: return  5'sd4;
+        5'b111_11: return  5'sd8;
+        default:   return  5'sd0;   // unreachable (5-bit case is exhaustive)
+      endcase
+    end
+  endfunction
+
+  // Full delta, sign re-applied from the nibble's own sign bit - same
+  // convention as m2_x_to_code's own `nib[3] ? -mag : mag`.
+  function automatic logic signed [M2_DELTA_WIDTH-1:0] m2_delta_code(
+    input logic [3:0] nib,
+    input logic [1:0] meta
+  );
+    logic signed [M2_DELTA_WIDTH-1:0] mag;
+    begin
+      mag = m2_delta_mag(nib[2:0], meta);
+      return nib[3] ? -mag : mag;
+    end
+  endfunction
+
 
   // First half (BACK2): identical in structure to fp4_find_lead, sized for
   // the 68-bit word. neg_adjust_i must be BACK1's registered
