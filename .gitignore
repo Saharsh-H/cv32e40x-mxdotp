@@ -15,3 +15,6 @@ tb/hex_vectors/
 
 # Simulation files
 tb/tb_mxdotp_core.vcd
+
+# ReadMe files
+syn/README.md
