@@ -363,6 +363,15 @@ module tb_mxdotp_core;
   wire [4:0]  exp_m2w_rd    = u_instr_rom.REG_M2W_RESULT;    // x20
   wire [31:0] exp_m2w_data  = u_instr_rom.MXFP8_W_EXPECTED;  // 8.0
 
+  // Test 5: MXDOTP/MXFINAL mailbox robustness + 2nd numeric residue case (see
+  // instr_rom.sv's Test 5 header). Destinations REUSE x9 (fused) and x21
+  // (final); the ARMED writeback latches below capture Test 5's own writes,
+  // not the earlier first-write-wins ones.
+  wire [4:0]  exp_t5_fused_rd    = u_instr_rom.REG_T5_FUSED_RESULT;      // x9
+  wire [31:0] exp_t5_fused_data  = u_instr_rom.T5_FUSED_EXPECTED;        // 32.0
+  wire [4:0]  exp_t5_rfinal_rd   = u_instr_rom.REG_T5_RFINAL_RESULT;     // x21
+  wire [31:0] exp_t5_rfinal_data = u_instr_rom.MXFP4_RESIDUAL2_EXPECTED; // 84.0
+
   //----------------------------------------------------------------------------
   // Protocol assertion: once result_valid is asserted without being accepted
   // the same cycle, it must remain asserted until result_ready arrives.
@@ -381,7 +390,7 @@ module tb_mxdotp_core;
   // Issue -> Commit -> Result -> Register file writeback
   //----------------------------------------------------------------------------
 
-  typedef enum logic [4:0] {
+  typedef enum logic [5:0] {
     SB_WAIT_P_ISSUE,
     SB_WAIT_Q_ISSUE,
     SB_WAIT_R_ISSUE,
@@ -411,6 +420,8 @@ module tb_mxdotp_core;
     SB_WAIT_M2U_WB,
     SB_WAIT_M2V_WB,
     SB_WAIT_M2W_WB,
+    SB_WAIT_T5_FUSED_WB,
+    SB_WAIT_T5_RFINAL_WB,
     SB_DONE,
     SB_FAIL
   } sb_state_e;
@@ -864,6 +875,69 @@ module tb_mxdotp_core;
         M2ORD_V: if (rf_waddr_wb_o == exp_m2v_rd) m2_ord_q <= M2ORD_W; else m2_ord_bad <= 1'b1;
         M2ORD_W: if (rf_waddr_wb_o == exp_m2w_rd) m2_ord_q <= M2ORD_DONE; else m2_ord_bad <= 1'b1;
         default: m2_ord_bad <= 1'b1;  // an extra write to one of these after all three - unexpected
+      endcase
+    end
+  end
+
+  //----------------------------------------------------------------------------
+  // Test 5 (residue mailbox robustness) writeback capture - ARMED, not
+  // first-write-wins. Test 5's destinations x9 (interleaved fused) and x21
+  // (MXFINAL res2) were each already written once earlier (P and Test 2's
+  // MXFINAL), so the first-write-wins latches above already hold those earlier
+  // values. These two latches are instead gated (armed) by wb_seen11_q - Test
+  // 4's last writeback (W): since Test 5's instructions are strictly later in
+  // the program than Test 4's, their writebacks retire after W's, so "the
+  // first x9/x21 write seen once wb_seen11_q is set" is unambiguously Test 5's
+  // own. Same decoupled-per-instruction rationale as every wb_seenN_q above.
+  //----------------------------------------------------------------------------
+  logic        wb_seen12_q;  logic [31:0] wb_data12_q;   // interleaved fused (x9)
+  logic        wb_seen13_q;  logic [31:0] wb_data13_q;   // MXFINAL res2 (x21)
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen12_q <= 1'b0; wb_data12_q <= '0;
+    end else if (!wb_seen12_q && wb_seen11_q && rf_we_wb_o && (rf_waddr_wb_o == exp_t5_fused_rd)) begin
+      wb_seen12_q <= 1'b1; wb_data12_q <= rf_wdata_wb_o;
+    end
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      wb_seen13_q <= 1'b0; wb_data13_q <= '0;
+    end else if (!wb_seen13_q && wb_seen11_q && rf_we_wb_o && (rf_waddr_wb_o == exp_t5_rfinal_rd)) begin
+      wb_seen13_q <= 1'b1; wb_data13_q <= rf_wdata_wb_o;
+    end
+  end
+
+  //----------------------------------------------------------------------------
+  // Test 5 program-order monitor - the mixed order-queue check, on the RESULT
+  // channel (not WB, because the MXDOTP retires with no writeback). The three
+  // Test 5 offloads must retire in program order:
+  //   MXDOTP(res2)   - we=0 (no architectural result)
+  //   MXFUSED(fp4)   - we=1, rd=x9
+  //   MXFINAL(res2)  - we=1, rd=x21
+  // Gated by wb_seen11_q so it only watches Test 5's window (everything from
+  // Tests 1-4 has already retired by the time W's writeback - wb_seen11_q -
+  // has fired; the next result-channel handshake is MXDOTP(res2)'s). This is
+  // the one ordering case Tests 3/4 do not cover: a DOTP (no-writeback) and a
+  // FINAL slot interleaved with a FUSED slot, all ordered by the one order
+  // queue. Any out-of-order retirement sets t5_ord_bad, checked at the end.
+  //----------------------------------------------------------------------------
+  typedef enum logic [1:0] { T5ORD_DOTP, T5ORD_FUSED, T5ORD_FINAL, T5ORD_DONE } t5_ord_e;
+  t5_ord_e t5_ord_q;
+  logic    t5_ord_bad;
+
+  wire t5_res_hit = wb_seen11_q && xif_result_valid && xif_result_ready;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      t5_ord_q   <= T5ORD_DOTP;
+      t5_ord_bad <= 1'b0;
+    end else if (t5_res_hit) begin
+      unique case (t5_ord_q)
+        T5ORD_DOTP:  if (!xif_result_we)                                       t5_ord_q <= T5ORD_FUSED; else t5_ord_bad <= 1'b1;
+        T5ORD_FUSED: if (xif_result_we && (xif_result_rd == exp_t5_fused_rd))  t5_ord_q <= T5ORD_FINAL; else t5_ord_bad <= 1'b1;
+        T5ORD_FINAL: if (xif_result_we && (xif_result_rd == exp_t5_rfinal_rd)) t5_ord_q <= T5ORD_DONE;  else t5_ord_bad <= 1'b1;
+        default: t5_ord_bad <= 1'b1;  // a 4th result in Test 5's window - unexpected
       endcase
     end
   end
@@ -1391,8 +1465,45 @@ module tb_mxdotp_core;
               $display("[%0t] FUSED8(W,E4M3) WB ok: x%0d <= 0x%0h", $time, exp_m2w_rd, wb_data11_q);
               $display("[%0t] THREE-ENGINE ORDER ok: U(x%0d,m2) -> V(x%0d,fp4) -> W(x%0d,fp8) retired in program order",
                         $time, exp_m2u_rd, exp_m2v_rd, exp_m2w_rd);
+              sb_state <= SB_WAIT_T5_FUSED_WB;
+            end
+          end
+        end
+
+        //----------------------------------------------------------------
+        // Test 5: MXDOTP/MXFINAL mailbox robustness + 2nd numeric residue.
+        // An UNRELATED MXFUSED(fp4) sits between the DOTP and the FINAL. The
+        // mailbox must carry p1'/p2' across it (proven by MXFINAL's value
+        // being correct despite the intervening instruction), and the
+        // DOTP/FUSED/FINAL trio must retire in program order (t5_ord). WBs
+        // arrive as FUSED(x9) then FINAL(x21) - the DOTP has no writeback.
+        // See instr_rom.sv's Test 5 header.
+        //----------------------------------------------------------------
+        SB_WAIT_T5_FUSED_WB: begin
+          if (wb_seen12_q) begin
+            if (wb_data12_q !== exp_t5_fused_data) begin
+              sb_fail($sformatf("Test 5 interleaved MXFUSED(MXFP4) result mismatch: x%0d = 0x%0h, expected 0x%0h",
+                                 exp_t5_fused_rd, wb_data12_q, exp_t5_fused_data));
+            end else begin
+              $display("[%0t] T5 FUSED(interleaved) WB ok: x%0d <= 0x%0h", $time, exp_t5_fused_rd, wb_data12_q);
+              sb_state <= SB_WAIT_T5_RFINAL_WB;
+            end
+          end
+        end
+
+        SB_WAIT_T5_RFINAL_WB: begin
+          if (wb_seen13_q) begin
+            if (wb_data13_q !== exp_t5_rfinal_data) begin
+              sb_fail($sformatf("Test 5 MXFINAL(res2) result mismatch: x%0d = 0x%0h, expected 0x%0h - the mailbox p1/p2 did not survive the interleaved MXFUSED, or the 2nd residue case is miscomputed",
+                                 exp_t5_rfinal_rd, wb_data13_q, exp_t5_rfinal_data));
+            end else if (t5_ord_bad) begin
+              sb_fail("Test 5 ordering violation: MXDOTP/MXFUSED/MXFINAL did not retire in program order - the order queue mishandled a DOTP(no-writeback) and FINAL slot interleaved with a FUSED slot");
+            end else begin
+              $display("[%0t] T5 MXFINAL(res2) WB ok: x%0d <= 0x%0h (mailbox survived interleaved MXFUSED)", $time, exp_t5_rfinal_rd, wb_data13_q);
+              $display("[%0t] T5 ORDER ok: MXDOTP(no-wb) -> MXFUSED(x%0d) -> MXFINAL(x%0d) retired in program order",
+                        $time, exp_t5_fused_rd, exp_t5_rfinal_rd);
               $display("=====================================================");
-              $display(" PASS: MXFUSED(P,Q,R overlap) -> MXDUALREAD_TEST -> MXDOTP/MXFINAL(residual) -> MXFP8(E4M3,E5M2)+overlap -> M2XFP4+3-engine overlap all traversed");
+              $display(" PASS: MXFUSED(P,Q,R overlap) -> MXDUALREAD_TEST -> MXDOTP/MXFINAL(residual) -> MXFP8(E4M3,E5M2)+overlap -> M2XFP4+3-engine overlap -> MXDOTP/MXFINAL mailbox robustness all traversed");
               $display("=====================================================");
               pass_count++;
               sb_state <= SB_DONE;

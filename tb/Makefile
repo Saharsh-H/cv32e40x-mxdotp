@@ -4,9 +4,13 @@
 #------------------------------------------------------------------------------
 # Targets:
 #   make / make full     full system regression (tb_mxdotp_core).
-#                        (`make mxdotp` and `make all` still work as aliases -
-#                        "mxdotp" stopped meaning "the whole design" once it
-#                        became one engine name among several after Phase A.)
+#                        (`make all` is still kept as an alias.)
+#   make mxdotp          standalone dot-product-engine unit test (tb_mxdotp_unit.sv
+#                        driving mxdotp_dotp_engine.sv directly, no core/XIF) -
+#                        see UNIT_TESTS below. NOT an alias for the full build:
+#                        it used to be, before "mxdotp" became a registered unit
+#                        test name in its own right (Phase where fp4r was
+#                        renamed to mxdotp) - see the note at UNIT_TESTS.
 #   make fp4             standalone FP4 fused-engine unit test (tb_fp4_unit.sv
 #                        driving mxdotp_fp4_fused_engine.sv directly, no core/XIF).
 #   make fp8             standalone FP8 fused-engine unit test (tb_fp8_unit.sv
@@ -81,11 +85,18 @@ VERILATOR_FLIST := $(BUILD_DIR)/verilator.f
 #==============================================================================
 # make full (default) - full system regression
 #------------------------------------------------------------------------------
-# Was `make mxdotp`. Renamed because "mxdotp" stopped being a good name for
-# "the whole design" once Phase A gave the project several same-named-ish
-# engines (mxdotp_fp4_fused_engine, mxdotp_final_engine, ...) - `make mxdotp`
-# read as if it built one specific engine. `mxdotp` and `all` are both kept as
-# backward-compatible aliases below.
+# Was `make mxdotp`, back when "mxdotp" meant "the whole design". Renamed
+# because Phase A gave the project several same-named-ish engines
+# (mxdotp_fp4_fused_engine, mxdotp_final_engine, ...) - `make mxdotp` read as
+# if it built one specific engine. `all` is kept as a backward-compatible
+# alias below. `mxdotp` itself is NOT kept as an alias here: it was reused as
+# the registered name of the dot-product-engine unit test (the renamed fp4r
+# unit test), and a target can't be both - see UNIT_TESTS below, where
+# `mxdotp` is now defined for real. Keeping both definitions in one Makefile
+# previously left GNU Make silently taking the later (unit-test) recipe and
+# dropping this alias with no visible warning without -d - `make mxdotp` was
+# actually already running the unit test, not `full`, despite this alias
+# still being declared. Removed rather than left as a misleading no-op.
 #==============================================================================
 
 #----------------------------------------------------------------------------
@@ -194,7 +205,7 @@ $(VERILATOR_FLIST): $(MANIFEST)
 # Build + run
 #----------------------------------------------------------------------------
 
-.PHONY: full mxdotp all
+.PHONY: full all
 full: $(EXECUTABLE)
 	@echo
 	@echo "==============================="
@@ -202,9 +213,8 @@ full: $(EXECUTABLE)
 	@echo "==============================="
 	$(EXECUTABLE)
 
-# Backward-compatible aliases - `make mxdotp` / `make all` both behaved
-# exactly like this before the rename.
-mxdotp: full
+# `all` is kept as a backward-compatible alias for `full`. `mxdotp` is NOT -
+# see the comment block above this section for why.
 all: full
 
 $(EXECUTABLE): $(VERILATOR_FLIST) $(MXDOTP_SRCS) $(TB_SRCS) $(CXX_FILES)
@@ -245,7 +255,10 @@ VERIFICATION_DIR := $(ROOT_DIR)/verification
 
 # --- registered unit tests ---------------------------------------------------
 
-UNIT_TESTS := fp4 fp8 m2 mxfinal
+UNIT_TESTS := fp4 fp8 m2 mxdotp mxfinal
+
+mxdotp_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_dotp_engine.sv
+mxdotp_GOLDEN      := $(VERIFICATION_DIR)/mxdotp_golden.py
 
 fp4_ENGINE_SRCS := $(MXDOTP_RTL_DIR)/mxdotp_fp4_fused_engine.sv
 fp4_GOLDEN      := $(VERIFICATION_DIR)/fp4_golden.py

@@ -374,6 +374,78 @@ module instr_rom
     REG_M2W_RESULT, REG_M2W_AB_BASE, REG_M2W_AB_BASE, REG_M2_RS3
   );
 
+  //----------------------------------------------------------------------------
+  // Test 5: MXDOTP/MXFINAL mailbox robustness + a 2nd numeric residue case.
+  //
+  // Test 2 proves ONE MXDOTP->MXFINAL pair with the two instructions adjacent
+  // (only integer LUI/ADDI loads between them). What no test proved until now:
+  // that the single-entry mailbox carrying p1/p2 from MXDOTP to MXFINAL
+  // survives an unrelated *MX* instruction landing between them, and that all
+  // three retire in program order through the order queue with the DOTP
+  // (no-writeback) and FINAL slots interleaved with a FUSED slot - a mix
+  // Tests 3/4 (all FUSED-slot) never exercise. Sequence:
+  //     MXDOTP(res2)  -> fills the mailbox with p1'/p2' (writes no register)
+  //     MXFUSED(fp4)  -> UNRELATED plain MXFP4; runs on the fp4 fused engine,
+  //                      which never touches the mailbox - the check is that
+  //                      it cannot disturb the staged p1'/p2'
+  //     MXFINAL(res2) -> drains the mailbox; must still see p1'/p2' intact
+  // The residue operands are deliberately DIFFERENT from Test 2 (B=2.0 not
+  // 1.0, a real Sa>Sar residue slide of delta=1, and a nonzero accumulator),
+  // so this doubles as a second, independent numeric residue case.
+  //
+  // Expected values are GOLDEN-DERIVED, not hand-computed:
+  //   python3 verification/mxdotp_golden.py --emit-system-consts
+  // prints MXFP4_RESIDUAL2_EXPECTED (and reproduces Test 2's
+  // MXFP4_RESIDUAL_EXPECTED as a cross-check). T5_FUSED_EXPECTED is a plain
+  // MXFP4 A2.B2 at unit scale = 32.0.
+  //
+  // Destinations REUSE Test 1's x9 (fused) and Test 2's x21 (final): both are
+  // written once earlier in the program, so Test 5's own writes are captured
+  // by ARMED writeback latches in tb_mxdotp_core.sv (armed once Test 4's last
+  // writeback retires), NOT the first-write-wins latches the earlier tests
+  // use - see that file's Test 5 section. This is why no pristine register is
+  // needed here (none remain free by this point in the program).
+  //----------------------------------------------------------------------------
+  localparam logic [3:0]  MXFP4_TWO      = 4'h4;   // E2M1 encoding of 2.0 (sign=0,exp=10,mant=0)
+  localparam logic [7:0]  E8M0_SCALE_TWO = 8'd128; // 2^1 = 2.0
+
+  localparam logic [4:0] REG_T5A_BASE         = 5'd13; // x13/x14: A2
+  localparam logic [4:0] REG_T5B_BASE         = 5'd15; // x15/x16: B2
+  localparam logic [4:0] REG_T5AR_BASE        = 5'd17; // x17/x18: AR2 (residue)
+  localparam logic [4:0] REG_T5_FUSED_RS3     = 5'd5;  // x5/x6: interleaved fused rs3 {scales=1,acc=0}
+  localparam logic [4:0] REG_T5_SCALES        = 5'd29; // x29: MXFINAL scales {a,ar,b,rsvd}
+  localparam logic [4:0] REG_T5_OLD_ACC       = 5'd30; // x30: MXFINAL old accumulator
+  localparam logic [4:0] REG_T5_FUSED_RESULT  = 5'd9;  // x9 : interleaved fused rd (reused; armed latch)
+  localparam logic [4:0] REG_T5_RFINAL_RESULT = 5'd21; // x21: MXFINAL(res2) rd (reused; armed latch)
+
+  localparam logic [63:0] T5A_VAL  = {16{MXFP4_ONE}};   // 16x 1.0 -> 0x2222_2222_2222_2222
+  localparam logic [63:0] T5B_VAL  = {16{MXFP4_TWO}};   // 16x 2.0 -> 0x4444_4444_4444_4444
+  localparam logic [63:0] T5AR_VAL = {16{MXFP4_HALF}};  // 16x 0.5 -> 0x1111_1111_1111_1111
+  // interleaved fused rs3: {hi = {reserved,b_scale=1,a_scale=1}, lo = old_acc=0}
+  localparam logic [63:0] T5_FUSED_RS3_VAL = {F_SCALES_HI_VAL, 32'h0000_0000};
+  // MXFINAL scales: a_scale=2^1, ar_scale=2^0, b_scale=2^0 -> delta = Sa-Sar = 1
+  localparam logic [31:0] T5_RSCALES_VAL  = {E8M0_SCALE_TWO, E8M0_SCALE_ONE, E8M0_SCALE_ONE, 8'd0};
+  localparam logic [31:0] T5_OLD_ACC_VAL  = 32'h4080_0000;  // 4.0f
+
+  // Golden-derived (verification/mxdotp_golden.py --emit-system-consts):
+  localparam logic [31:0] MXFP4_RESIDUAL2_EXPECTED = 32'h42A8_0000;  // 84.0f (residue #2)
+  localparam logic [31:0] T5_FUSED_EXPECTED        = 32'h4200_0000;  // 32.0f (plain MXFP4 A2.B2, unit scale)
+
+  localparam logic [31:0] INSTR_MXDOTP_RES2 = encode_r4(
+    MX_OPCODE, MX_FUNCT3_DOTP, MX_FMT_MXFP4_RESIDUAL,
+    5'd0 /*rd unused - no writeback*/, REG_T5A_BASE, REG_T5B_BASE, REG_T5AR_BASE
+  );
+  // The UNRELATED instruction interleaved between DOTP and FINAL: plain MXFP4
+  // of A2.B2 at unit scale (rs3 = {scales=1, acc=0}) -> 32.0.
+  localparam logic [31:0] INSTR_MXFUSED_T5 = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FUSED, MX_FMT_MXFP4,
+    REG_T5_FUSED_RESULT, REG_T5A_BASE, REG_T5B_BASE, REG_T5_FUSED_RS3
+  );
+  localparam logic [31:0] INSTR_MXFINAL_RES2 = encode_r4(
+    MX_OPCODE, MX_FUNCT3_FINAL, MX_FMT_MXFP4_RESIDUAL,
+    REG_T5_RFINAL_RESULT, REG_T5_SCALES, REG_T5_OLD_ACC, 5'd0 /*rs3 unused*/
+  );
+
   localparam logic [31:0] INSTR_JAL_SELF = encode_j(OPCODE_JAL, 5'd0, 21'd0); // infinite self-loop
   localparam logic [31:0] INSTR_NOP      = encode_i(OPCODE_OPIMM, 3'b000, 5'd0, 5'd0, 12'd0);
 
@@ -405,6 +477,12 @@ module instr_rom
     logic [31:0] lui_m2r3_lo, addi_m2r3_lo, lui_m2r3_hi, addi_m2r3_hi;
     logic [31:0] lui_m2v_lo,  addi_m2v_lo,  lui_m2v_hi,  addi_m2v_hi;
     logic [31:0] lui_m2w_lo,  addi_m2w_lo,  lui_m2w_hi,  addi_m2w_hi;
+    // Test 5 (residue mailbox robustness) operand loads
+    logic [31:0] lui_t5a_lo,  addi_t5a_lo,  lui_t5a_hi,  addi_t5a_hi;
+    logic [31:0] lui_t5b_lo,  addi_t5b_lo,  lui_t5b_hi,  addi_t5b_hi;
+    logic [31:0] lui_t5ar_lo, addi_t5ar_lo, lui_t5ar_hi, addi_t5ar_hi;
+    logic [31:0] lui_t5fr3_lo,addi_t5fr3_lo,lui_t5fr3_hi,addi_t5fr3_hi;
+    logic [31:0] lui_t5sc,    addi_t5sc,    lui_t5acc,   addi_t5acc;
 
     for (i = 0; i < NUM_WORDS; i++) rom[i] = INSTR_NOP;
 
@@ -460,6 +538,18 @@ module instr_rom
     encode_li32(REG_M2V_AB_BASE + 5'd1, M2V_AB_VAL[63:32], lui_m2v_hi,  addi_m2v_hi);
     encode_li32(REG_M2W_AB_BASE,        M2W_AB_VAL[31:0],  lui_m2w_lo,  addi_m2w_lo);
     encode_li32(REG_M2W_AB_BASE + 5'd1, M2W_AB_VAL[63:32], lui_m2w_hi,  addi_m2w_hi);
+
+    // Test 5 operands (loaded fresh - Test 4 overwrote x5/x6/x13-x18/x29/x30).
+    encode_li32(REG_T5A_BASE,         T5A_VAL[31:0],   lui_t5a_lo,   addi_t5a_lo);
+    encode_li32(REG_T5A_BASE + 5'd1,  T5A_VAL[63:32],  lui_t5a_hi,   addi_t5a_hi);
+    encode_li32(REG_T5B_BASE,         T5B_VAL[31:0],   lui_t5b_lo,   addi_t5b_lo);
+    encode_li32(REG_T5B_BASE + 5'd1,  T5B_VAL[63:32],  lui_t5b_hi,   addi_t5b_hi);
+    encode_li32(REG_T5AR_BASE,        T5AR_VAL[31:0],  lui_t5ar_lo,  addi_t5ar_lo);
+    encode_li32(REG_T5AR_BASE + 5'd1, T5AR_VAL[63:32], lui_t5ar_hi,  addi_t5ar_hi);
+    encode_li32(REG_T5_FUSED_RS3,        T5_FUSED_RS3_VAL[31:0],  lui_t5fr3_lo, addi_t5fr3_lo);
+    encode_li32(REG_T5_FUSED_RS3 + 5'd1, T5_FUSED_RS3_VAL[63:32], lui_t5fr3_hi, addi_t5fr3_hi);
+    encode_li32(REG_T5_SCALES,  T5_RSCALES_VAL, lui_t5sc,  addi_t5sc);
+    encode_li32(REG_T5_OLD_ACC, T5_OLD_ACC_VAL, lui_t5acc, addi_t5acc);
 
     // --- Test 1: MXFUSED x3 back-to-back (P, Q, R) ---
     // ALL operands for P, Q, and R are loaded FIRST, before any of the three
@@ -570,10 +660,29 @@ module instr_rom
     rom[98]  = INSTR_MXFUSED_M2V;  // V: MXFP4,  rd=x19, expect 16.0 - right after U, no gap
     rom[99]  = INSTR_MXFUSED_M2W;  // W: MXFP8,  rd=x20, expect  8.0 - right after V, no gap
 
-    rom[100] = INSTR_JAL_SELF;
+    // --- Test 5: MXDOTP/MXFINAL mailbox robustness + 2nd numeric residue ---
+    // Operands loaded fresh (Test 4 overwrote x5/x6/x13-x18/x29/x30).
+    rom[100] = lui_t5a_lo;   rom[101] = addi_t5a_lo;    // x13 <- A2[31:0]
+    rom[102] = lui_t5a_hi;   rom[103] = addi_t5a_hi;    // x14 <- A2[63:32]
+    rom[104] = lui_t5b_lo;   rom[105] = addi_t5b_lo;    // x15 <- B2[31:0]
+    rom[106] = lui_t5b_hi;   rom[107] = addi_t5b_hi;    // x16 <- B2[63:32]
+    rom[108] = lui_t5ar_lo;  rom[109] = addi_t5ar_lo;   // x17 <- AR2[31:0]
+    rom[110] = lui_t5ar_hi;  rom[111] = addi_t5ar_hi;   // x18 <- AR2[63:32]
+    rom[112] = lui_t5fr3_lo; rom[113] = addi_t5fr3_lo;  // x5  <- fused rs3[31:0] (old_acc=0)
+    rom[114] = lui_t5fr3_hi; rom[115] = addi_t5fr3_hi;  // x6  <- fused rs3[63:32] (scales=1)
+    rom[116] = lui_t5sc;     rom[117] = addi_t5sc;      // x29 <- MXFINAL scales2
+    rom[118] = lui_t5acc;    rom[119] = addi_t5acc;     // x30 <- MXFINAL old_acc (4.0)
+    // The sequence under test - an UNRELATED MXFUSED sits between the DOTP and
+    // the FINAL. The mailbox must carry p1'/p2' across it, and all three must
+    // retire in program order (DOTP no-wb, then FUSED, then FINAL).
+    rom[120] = INSTR_MXDOTP_RES2;   // res2 DOTP  -> mailbox (writes no register)
+    rom[121] = INSTR_MXFUSED_T5;    // unrelated MXFP4 (rd=x9) -> must not disturb mailbox
+    rom[122] = INSTR_MXFINAL_RES2;  // res2 FINAL (rd=x21) -> drains mailbox
+
+    rom[123] = INSTR_JAL_SELF;
 
     // Add further instructions here, e.g.:
-    //   rom[101] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
+    //   rom[124] = encode_i(OPCODE_OPIMM, 3'b000, 5'd6, 5'd0, 12'd1);
   end
 
   //----------------------------------------------------------------------------
