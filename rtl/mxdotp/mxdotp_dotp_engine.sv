@@ -36,42 +36,24 @@ module mxdotp_dotp_engine
     // the real override - silently fell back to an old, invalid default
     // and Vivado correctly flagged the resulting out-of-range part-select).
     parameter int X_RFR_WIDTH    = 64,
-    parameter int LATENCY_CYCLES = 2   // must be >= 1; not yet re-tuned for the
-                                        // real datapath's actual critical path -
-                                        // correctness-first, timing later.
+    parameter int X_ID_WIDTH     = 4
 )
 (
     input  logic                   clk_i,
     input  logic                   rst_ni,
 
     input  logic                   start_i,
-    output logic                   busy_o,
-    output logic                   done_o,
+    output logic                   ready_o,
+    output logic                   result_valid_o,
+    input  logic                   result_ready_i,
+
+    input  logic [X_ID_WIDTH-1:0]  id_i,
+    output logic [X_ID_WIDTH-1:0]  result_id_o,
 
     input  logic [X_RFR_WIDTH-1:0] rs1_i,  // A
     input  logic [X_RFR_WIDTH-1:0] rs2_i,  // B
     input  logic [X_RFR_WIDTH-1:0] rs3_i,  // AR
 
-    // Held stable from the done_o edge onward until the next start_i -
-    // same "latch on the done_o edge" discipline mxdotp_execute.sv's
-    // result_data_q used to follow, for the same reason: a live
-    // combinational function of internal state would be exactly the kind of
-    // thing that could race against whatever consumes p1_o/p2_o afterward.
-    //
-    // IMPORTANT: this is NOT an internally-latched register (see below for
-    // why) - p1_o/p2_o are the live combinational p1_sum/p2_sum, valid the
-    // instant done_o first asserts and for as long as needed afterward
-    // (rs1_q/rs2_q/rs3_q cannot change until the next start_i, which cannot
-    // happen until mxdotp_xif.sv's mailbox has already captured this
-    // result - see that file's dotp_mailbox_write). An internal one-cycle-
-    // delayed output latch (driven by "if (done_o) p1_q <= p1_sum") was
-    // tried here first and was wrong: mxdotp_xif.sv's mailbox capture reacts
-    // to done_o in the SAME cycle in the common (mailbox-already-empty)
-    // case, whereas a registered p1_q/p2_q would not show the new value
-    // until the cycle AFTER done_o - a real, caught-in-simulation race
-    // (mailbox captured stale zero values). The mailbox itself is the
-    // register that needs to hold this value stable now; this engine
-    // doesn't need to duplicate that.
     output logic signed [PSUM_WIDTH-1:0] p1_o,
     output logic signed [PSUM_WIDTH-1:0] p2_o
 );
@@ -91,50 +73,103 @@ module mxdotp_dotp_engine
   end
   // synthesis translate_on
 
+// PIPELINE STAGES INTRODUCED (5 stages / 4 cycles latency):
+// - Stage 1 (in_valid_q): Input capture. rs1_i, rs2_i, rs3_i are latched into rs1_q, rs2_q, rs3_q.
+// - Stage 2 (st2_valid_q): Multipliers + 1st reduction (16->8). 16 terms are multiplied and reduced to 8 sums, latched into st2_p1_q[0..7] and st2_p2_q[0..7].
+// - Stage 3 (st3_valid_q): 2nd reduction (8->4). 8 sums are reduced to 4 sums, latched into st3_p1_q[0..3] and st3_p2_q[0..3].
+// - Stage 4 (st4_valid_q): 3rd reduction (4->2). 4 sums are reduced to 2 sums, latched into st4_p1_q[0..1] and st4_p2_q[0..1].
+// - Stage 5 (result_valid_q): 4th reduction (2->1). 2 sums are reduced to 1 final sum, latched into p1_q and p2_q.
+// NEW CROSSED SIGNALS: The 8-term (st2), 4-term (st3), and 2-term (st4) intermediate sums now cross new register boundaries to break the massive 2.14 ns combinational adder tree.
+
   //----------------------------------------------------------------------------
-  // Input capture (on start_i)
+  // Pipelined control and data capture
   //----------------------------------------------------------------------------
 
+  logic in_valid_q;
+  logic st2_valid_q;
+  logic st3_valid_q;
+  logic st4_valid_q;
+  logic result_valid_q;
+
+  logic [X_ID_WIDTH-1:0] id_q1, id_q2, id_q3, id_q4, id_q5;
   logic [X_RFR_WIDTH-1:0] rs1_q, rs2_q, rs3_q;
 
-  //----------------------------------------------------------------------------
-  // Latency counter / busy tracking
-  //----------------------------------------------------------------------------
+  logic signed [PSUM_WIDTH-1:0] st2_p1_q [0:7];
+  logic signed [PSUM_WIDTH-1:0] st2_p2_q [0:7];
 
-  localparam int CNT_WIDTH = (LATENCY_CYCLES <= 1) ? 1 : $clog2(LATENCY_CYCLES + 1);
+  logic signed [PSUM_WIDTH-1:0] st3_p1_q [0:3];
+  logic signed [PSUM_WIDTH-1:0] st3_p2_q [0:3];
 
-  logic [CNT_WIDTH-1:0] cycle_cnt_q;
-  logic                 busy_q;
+  logic signed [PSUM_WIDTH-1:0] st4_p1_q [0:1];
+  logic signed [PSUM_WIDTH-1:0] st4_p2_q [0:1];
+
+  logic signed [PSUM_WIDTH-1:0] p1_q, p2_q;
+
+  wire stall = result_valid_q && !result_ready_i;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      // Control state only - see the note in the fused engines. rs1_q/rs2_q/
-      // rs3_q are read only under busy_q, which is reset and is set by the
-      // same branch that writes them.
-      busy_q      <= 1'b0;
-      cycle_cnt_q <= '0;
-    end else if (start_i && !busy_q) begin
-      busy_q      <= 1'b1;
-      cycle_cnt_q <= CNT_WIDTH'(LATENCY_CYCLES - 1);
-      rs1_q       <= rs1_i;
-      rs2_q       <= rs2_i;
-      rs3_q       <= rs3_i;
-    end else if (busy_q) begin
-      if (cycle_cnt_q == '0)
-        busy_q <= 1'b0;
-      else
-        cycle_cnt_q <= cycle_cnt_q - 1'b1;
+      in_valid_q     <= 1'b0;
+      st2_valid_q    <= 1'b0;
+      st3_valid_q    <= 1'b0;
+      st4_valid_q    <= 1'b0;
+      result_valid_q <= 1'b0;
+    end else if (!stall) begin
+      in_valid_q     <= start_i;
+      st2_valid_q    <= in_valid_q;
+      st3_valid_q    <= st2_valid_q;
+      st4_valid_q    <= st3_valid_q;
+      result_valid_q <= st4_valid_q;
     end
   end
 
-  assign busy_o = busy_q;
-  assign done_o = busy_q && (cycle_cnt_q == '0);
+  // Combinational intermediates
+  logic signed [PSUM_WIDTH-1:0] st2_p1_comb [0:7];
+  logic signed [PSUM_WIDTH-1:0] st2_p2_comb [0:7];
+  logic signed [PSUM_WIDTH-1:0] st3_p1_comb [0:3];
+  logic signed [PSUM_WIDTH-1:0] st3_p2_comb [0:3];
+  logic signed [PSUM_WIDTH-1:0] st4_p1_comb [0:1];
+  logic signed [PSUM_WIDTH-1:0] st4_p2_comb [0:1];
+  logic signed [PSUM_WIDTH-1:0] result_p1_comb;
+  logic signed [PSUM_WIDTH-1:0] result_p2_comb;
+
+  always_ff @(posedge clk_i) begin
+    if (!stall) begin
+      if (start_i) begin
+        id_q1 <= id_i;
+        rs1_q <= rs1_i;
+        rs2_q <= rs2_i;
+        rs3_q <= rs3_i;
+      end
+      if (in_valid_q) begin
+        id_q2    <= id_q1;
+        st2_p1_q <= st2_p1_comb;
+        st2_p2_q <= st2_p2_comb;
+      end
+      if (st2_valid_q) begin
+        id_q3    <= id_q2;
+        st3_p1_q <= st3_p1_comb;
+        st3_p2_q <= st3_p2_comb;
+      end
+      if (st3_valid_q) begin
+        id_q4    <= id_q3;
+        st4_p1_q <= st4_p1_comb;
+        st4_p2_q <= st4_p2_comb;
+      end
+      if (st4_valid_q) begin
+        id_q5 <= id_q4;
+        p1_q  <= result_p1_comb;
+        p2_q  <= result_p2_comb;
+      end
+    end
+  end
+
+  assign ready_o = !stall;
+  assign result_valid_o = result_valid_q;
+  assign result_id_o = id_q5;
 
   //----------------------------------------------------------------------------
-  // Datapath: unpack A/B/AR, MX_K=16 nibbles each spanning the full 64-bit
-  // dual-read operand (element i at bit 4*i for i=0..15 - this falls out of
-  // dual-read's {reg+1,reg} concatenation lining up exactly with a
-  // contiguous 16-nibble pack across the register pair).
+  // Datapath (Pipelined Adder Tree)
   //----------------------------------------------------------------------------
 
   logic [3:0] a_nib  [0:MX_K-1];
@@ -145,73 +180,72 @@ module mxdotp_dotp_engine
   logic signed [CODE_WIDTH-1:0] b_code  [0:MX_K-1];
   logic signed [CODE_WIDTH-1:0] ar_code [0:MX_K-1];
 
-  logic signed [PROD_WIDTH-1:0] p1_term [0:MX_K-1];  // A_i * B_i
-  logic signed [PROD_WIDTH-1:0] p2_term [0:MX_K-1];  // AR_i * B_i
-
-  logic signed [PSUM_WIDTH-1:0] p1_sum;  // sum(A.B), raw/unscaled
-  logic signed [PSUM_WIDTH-1:0] p2_sum;  // sum(AR.B), raw/unscaled
+  logic signed [PROD_WIDTH-1:0] p1_term [0:MX_K-1];
+  logic signed [PROD_WIDTH-1:0] p2_term [0:MX_K-1];
 
   int i;
 
   always_comb begin
+    // STAGE 2 COMB: 16->8 Reduction
     for (i = 0; i < MX_K; i++) begin
       a_nib[i]  = rs1_q[4*i +: 4];
       b_nib[i]  = rs2_q[4*i +: 4];
       ar_nib[i] = rs3_q[4*i +: 4];
-    end
-
-    for (i = 0; i < MX_K; i++) begin
       a_code[i]  = fp4_to_code(a_nib[i]);
       b_code[i]  = fp4_to_code(b_nib[i]);
       ar_code[i] = fp4_to_code(ar_nib[i]);
-      // Signed*signed multiply, both operands sign-extended to PROD_WIDTH by
-      // the assignment - exact, no rounding (see mxdotp_pkg.sv for the
-      // 9-bit single-product derivation).
       p1_term[i] = PROD_WIDTH'(a_code[i]  * b_code[i]);
       p2_term[i] = PROD_WIDTH'(ar_code[i] * b_code[i]);
     end
 
-    // Summed via a loop, not a hardcoded expression, so this stays correct
-    // for whatever MX_K mxdotp_pkg.sv defines. No clamp: p1_sum/p2_sum carry
-    // full PSUM_WIDTH precision, which was derived specifically to make this
-    // summation lossless (see mxdotp_pkg.sv).
-    p1_sum = '0;
-    p2_sum = '0;
-    for (i = 0; i < MX_K; i++) begin
-      p1_sum = p1_sum + PSUM_WIDTH'(p1_term[i]);
-      p2_sum = p2_sum + PSUM_WIDTH'(p2_term[i]);
+    for (i = 0; i < 8; i++) begin
+      st2_p1_comb[i] = PSUM_WIDTH'(p1_term[2*i]) + PSUM_WIDTH'(p1_term[2*i+1]);
+      st2_p2_comb[i] = PSUM_WIDTH'(p2_term[2*i]) + PSUM_WIDTH'(p2_term[2*i+1]);
     end
+
+    // STAGE 3 COMB: 8->4 Reduction
+    for (i = 0; i < 4; i++) begin
+      st3_p1_comb[i] = st2_p1_q[2*i] + st2_p1_q[2*i+1];
+      st3_p2_comb[i] = st2_p2_q[2*i] + st2_p2_q[2*i+1];
+    end
+
+    // STAGE 4 COMB: 4->2 Reduction
+    for (i = 0; i < 2; i++) begin
+      st4_p1_comb[i] = st3_p1_q[2*i] + st3_p1_q[2*i+1];
+      st4_p2_comb[i] = st3_p2_q[2*i] + st3_p2_q[2*i+1];
+    end
+
+    // STAGE 5 COMB: 2->1 Reduction
+    result_p1_comb = st4_p1_q[0] + st4_p1_q[1];
+    result_p2_comb = st4_p2_q[0] + st4_p2_q[1];
   end
 
   //----------------------------------------------------------------------------
-  // p1_o/p2_o are the live combinational p1_sum/p2_sum, not a registered
-  // latch - see the port declaration comment above for exactly why. Valid
-  // from the moment done_o first asserts (busy_q is still 1 that cycle, so
-  // rs1_q/rs2_q/rs3_q are already the correct, captured operands) and stays
-  // valid afterward for as long as this slot holds them, since a new
-  // start_i cannot occur before the consumer has captured this result.
+  // Pipeline output
   //----------------------------------------------------------------------------
 
-  assign p1_o = p1_sum;
-  assign p2_o = p2_sum;
-
+  assign p1_o = p1_q;
+  assign p2_o = p2_q;
 
   // synthesis translate_off
   //----------------------------------------------------------------------------
-  // Reset-discipline check. The datapath in this engine carries no reset, which
-  // is only sound if data is never observed on a beat that claims to be
-  // meaningful before that data has been written. This assertion is what turns
-  // that from an assumption into a checked property: it fires the moment an X
-  // escapes on such a beat.
+  // Reset-discipline check, mirroring mxdotp_final_engine.sv's own version
+  // verbatim (same "no reset on the datapath itself, only on the valid
+  // bits" discipline here: st2_p1_q/st2_p2_q/st3_*/st4_*/p1_q/p2_q are never
+  // reset, which is only sound if a beat claiming to be meaningful
+  // (result_valid_q) is never observed before that data has genuinely been
+  // written). This assertion is what turns that from an assumption into a
+  // checked property: it fires the moment an X escapes on such a beat.
   //
-  // Under Verilator (2-state) this is vacuous, so `make` will not exercise it;
-  // it earns its keep in a 4-state simulator (Questa/VCS/Xcelium) and in
-  // gate-level sim - exactly where an unreset-register bug would otherwise hide.
+  // Under Verilator (2-state) this is vacuous, so `make` will not exercise
+  // it; it earns its keep in a 4-state simulator (Questa/VCS/Xcelium) and in
+  // gate-level sim - exactly where an unreset-register bug would otherwise
+  // hide.
   //----------------------------------------------------------------------------
   always_ff @(posedge clk_i) begin
-    if (rst_ni && done_o) begin
-      assert (!$isunknown({p1_o, p2_o})) else
-        $error("%m: X on p1_o/p2_o at done_o - an unreset datapath register was read before it was written");
+    if (rst_ni && result_valid_q) begin
+      assert (!$isunknown(p1_q) && !$isunknown(p2_q)) else
+        $error("%m: X on the result being latched - an unreset datapath register was read before it was written");
     end
   end
   // synthesis translate_on

@@ -7,44 +7,61 @@
 //
 //   Pipelined (see mxdotp_pkg.sv's "pipelined coprocessor" milestone header
 //   for the full rationale): MXDOTP, MXFINAL, MX_FUNCT3_DUALREAD_TEST, and
-//   MXFUSED each have their own independent slot - own mxdotp_state_t
-//   register, own saved-operand/id/rd registers, own execute engine with its
-//   own busy/start/done - instead of one shared FSM/engine for all of them.
-//   This replaces the earlier single-in-flight design (issue_ready asserted
-//   only in one shared MX_IDLE), which was a real, measured throughput cost,
-//   not a theoretical one, and was never required by the XIF protocol itself
-//   - every channel (issue_req/commit/result) in if_xif.sv already carries an
-//   id field specifically to let multiple offloaded instructions be
-//   outstanding at once.
+//   MXFUSED each have their own independent slot - own saved-operand/id/rd
+//   tracking, own execute engine - instead of one shared FSM/engine for all
+//   of them. This replaces the earlier single-in-flight design (issue_ready
+//   asserted only in one shared MX_IDLE), which was a real, measured
+//   throughput cost, not a theoretical one, and was never required by the
+//   XIF protocol itself - every channel (issue_req/commit/result) in
+//   if_xif.sv already carries an id field specifically to let multiple
+//   offloaded instructions be outstanding at once.
 //
-//   MILESTONE (current): true overlap for the FUSED slot specifically (DOTP/
-//   FINAL/DUALREAD_TEST are UNCHANGED by this milestone - still exactly one
-//   outstanding each, by construction, same mxdotp_state_t FSM as before).
-//   FUSED no longer has a single mxdotp_state_t register at all: it's
-//   replaced by (1) a small pending-commit FIFO (fused_pending_q -
-//   mxdotp_pkg.sv's MX_FUSED_PENDING_DEPTH) holding instructions that have
-//   been accepted at issue but not yet resolved by commit, and (2)
-//   mxdotp_fused_engine.sv's own internal 5-register-point pipeline, which
-//   can now hold multiple committed instructions simultaneously at
-//   different stages of computing (see that file's own milestone header).
-//   issue_ready for FUSED now reflects the pending-commit queue's own
-//   fullness, not a single-instruction busy bit.
+//   MILESTONE (current): true overlap for MXDOTP, MXFINAL, AND MXFUSED.
+//   MXDOTP and MXFINAL each now have their own small pending-commit FIFO
+//   (dotp_pending_q / final_pending_q, both MX_*_PENDING_DEPTH=2 below -
+//   same structure and rationale as fused_pending_q, holding instructions
+//   accepted at issue but not yet resolved by commit) feeding their own
+//   newly-pipelined engines (mxdotp_dotp_engine.sv / mxdotp_final_engine.sv
+//   - see those files' own headers for the back-end pipelining rationale),
+//   each of which can now hold multiple committed instructions
+//   simultaneously at different pipeline stages, exactly like
+//   mxdotp_fused_engine.sv already did. issue_ready for MXDOTP/MXFINAL now
+//   reflects their own pending queue's fullness, not a single-instruction
+//   busy bit - the same change FUSED went through in the prior milestone.
+//   MX_FUNCT3_DUALREAD_TEST alone remains genuinely single-outstanding,
+//   still via the shared mxdotp_state_t FSM (dr_state_q) - it was never
+//   part of any throughput milestone and stays at its original, simple
+//   fixed-latency implementation.
+//
+//   KNOWN LIMITATION carried over from before this milestone, now with a
+//   larger blast radius: the in-order result queue below (order_q) has no
+//   awareness of a kill landing on anything other than whatever is
+//   currently at its own head - there is no per-entry id tag, so a killed
+//   MXDOTP/MXFINAL/MXFUSED instruction that is NOT order_q's current head
+//   (now substantially more likely, since MXDOTP and MXFINAL can each have
+//   two outstanding instead of one) silently vanishes from its own pending
+//   queue without ever telling order_q to skip it, orphaning that entry.
+//   This is believed unreachable in practice: a kill can only reach an
+//   already-accepted XIF instruction via kill_ex (confirmed directly
+//   against cv32e40x_controller_fsm.sv - a plain taken branch only asserts
+//   kill_if/kill_id, never kill_ex), and every event that DOES assert
+//   kill_ex (NMI/IRQ/exception-in-WB/fencei/dret) requires something this
+//   project's test/benchmark programs deliberately never use (interrupts
+//   enabled, an exception, fencei, or debug entry). If that assumption ever
+//   changes, order_q needs the same id-tagged tombstone treatment across
+//   all three pending queues before kill correctness can be relied on.
 //
 //   MXDOTP/MXFINAL are RESIDUE-STYLE FORMATS ONLY as of the fused-fast-path
 //   milestone (see mxdotp_pkg.sv's MX_SLOT_FUSED milestone header): plain
 //   (non-residue) MXFP4/MXFP8 never reach those two slots any more - they go
 //   exclusively through the FUSED slot.
 //
-//   A single-entry mailbox (mailbox_valid_q/mailbox_p1_q/mailbox_p2_q)
-//   carries MXDOTP's raw p1/p2 to MXFINAL: MXDOTP's engine posts into it once
-//   free, MXFINAL's engine snapshots (consumes) it the instant its own
-//   engine starts, immediately freeing it for the next MXDOTP. MXDOTP's own
-//   COMPUTE->RESULT transition is gated on the mailbox actually being free
-//   (not just on its own engine being done) - if two MXDOTPs are ever issued
-//   back-to-back with no intervening MXFINAL (not the expected software
-//   pattern, but not something the hardware should silently corrupt on
-//   either), the second one simply stalls in COMPUTE until the mailbox is
-//   freed, rather than overwriting an unconsumed result.
+//   The mailbox carrying MXDOTP's raw p1/p2 to MXFINAL is a MAILBOX_DEPTH=4
+//   FIFO (see that section below for the depth's derivation and its own
+//   correctness argument), not a single entry - it had to stop being
+//   single-entry the moment MXDOTP gained more than one outstanding
+//   instruction, since a second MXDOTP's result could otherwise arrive
+//   before MXFINAL had consumed the first.
 //
 //   Results are delivered through a small in-order queue (see mx_slot_e/
 //   MX_ORDER_DEPTH in mxdotp_pkg.sv): only the oldest still-outstanding
@@ -133,21 +150,50 @@ module mxdotp_xif
     // Per-slot state registers
     //--------------------------------------------------------------------------
 
-    mxdotp_state_t dotp_state_q,  dotp_state_d;
-    mxdotp_state_t final_state_q, final_state_d;
     mxdotp_state_t dr_state_q,    dr_state_d;
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
-            dotp_state_q  <= MX_IDLE;
-            final_state_q <= MX_IDLE;
             dr_state_q    <= MX_IDLE;
         end else begin
-            dotp_state_q  <= dotp_state_d;
-            final_state_q <= final_state_d;
             dr_state_q    <= dr_state_d;
         end
     end
+
+    typedef enum logic [1:0] { FUSED_PENDING, FUSED_COMMIT_OK, FUSED_COMMIT_KILL } fused_commit_status_e;
+
+    //--------------------------------------------------------------------------
+    // DOTP & FINAL Pending Queues
+    //--------------------------------------------------------------------------
+    typedef struct packed {
+        logic [X_ID_WIDTH-1:0]  id;
+        logic [X_RFR_WIDTH-1:0] rs1;
+        logic [X_RFR_WIDTH-1:0] rs2;
+        logic [X_RFR_WIDTH-1:0] rs3;
+        fused_commit_status_e   status;
+    } dotp_pending_entry_t;
+    
+    typedef struct packed {
+        logic [X_ID_WIDTH-1:0]  id;
+        logic [4:0]             rd;
+        logic [X_RFR_WIDTH-1:0] rs1;
+        logic [X_RFR_WIDTH-1:0] rs2;
+        fused_commit_status_e   status;
+    } final_pending_entry_t;
+
+    localparam int MX_DOTP_PENDING_DEPTH = 2;
+    dotp_pending_entry_t dotp_pending_q [0:MX_DOTP_PENDING_DEPTH-1];
+    logic [$clog2(MX_DOTP_PENDING_DEPTH)-1:0] dotp_pending_head_ptr, dotp_pending_tail_ptr;
+    logic [$clog2(MX_DOTP_PENDING_DEPTH+1)-1:0] dotp_pending_count;
+    wire dotp_pending_full  = (dotp_pending_count == MX_DOTP_PENDING_DEPTH);
+    wire dotp_pending_empty = (dotp_pending_count == '0);
+
+    localparam int MX_FINAL_PENDING_DEPTH = 2;
+    final_pending_entry_t final_pending_q [0:MX_FINAL_PENDING_DEPTH-1];
+    logic [$clog2(MX_FINAL_PENDING_DEPTH)-1:0] final_pending_head_ptr, final_pending_tail_ptr;
+    logic [$clog2(MX_FINAL_PENDING_DEPTH+1)-1:0] final_pending_count;
+    wire final_pending_full  = (final_pending_count == MX_FINAL_PENDING_DEPTH);
+    wire final_pending_empty = (final_pending_count == '0);
 
     //--------------------------------------------------------------------------
     // Issue Interface
@@ -163,8 +209,8 @@ module mxdotp_xif
 
     assign issue_if.issue_ready =
         !is_mx                                    ? 1'b1 :
-        (mx_operation == MX_FUNCT3_DOTP)           ? (dotp_state_q  == MX_IDLE) :
-        (mx_operation == MX_FUNCT3_FINAL)          ? (final_state_q == MX_IDLE) :
+        (mx_operation == MX_FUNCT3_DOTP)           ? !dotp_pending_full :
+        (mx_operation == MX_FUNCT3_FINAL)          ? !final_pending_full :
         (mx_operation == MX_FUNCT3_DUALREAD_TEST)  ? (dr_state_q    == MX_IDLE) :
         (mx_operation == MX_FUNCT3_FUSED)          ? !fused_pending_full :
         1'b1;
@@ -240,47 +286,9 @@ module mxdotp_xif
     // Saved instruction registers - one independent set per slot
     //--------------------------------------------------------------------------
 
-    // DOTP: rs1=A, rs2=B, rs3=AR. No saved_rd/saved_format - DOTP never
-    // writes and its own arithmetic never depends on format (see
-    // mxdotp_pkg.sv). Residue-style formats only, post-split.
-    logic [X_ID_WIDTH-1:0]  dotp_saved_id;
-    logic [X_RFR_WIDTH-1:0] dotp_saved_rs1, dotp_saved_rs2, dotp_saved_rs3;
+    
 
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-        if (!rst_ni) begin
-            dotp_saved_id  <= '0;
-            dotp_saved_rs1 <= '0;
-            dotp_saved_rs2 <= '0;
-            dotp_saved_rs3 <= '0;
-        end else if (accept_dotp) begin
-            dotp_saved_id  <= issue_if.issue_req.id;
-            dotp_saved_rs1 <= issue_if.issue_req.rs[0];
-            dotp_saved_rs2 <= issue_if.issue_req.rs[1];
-            dotp_saved_rs3 <= issue_if.issue_req.rs[2];
-        end
-    end
-
-    // FINAL: rs1=scales, rs2=old_acc. Residue-style formats only, post-
-    // split - always includes the residue/p2 contribution unconditionally
-    // now (see mxdotp_final_engine.sv), so no saved_format register is
-    // needed any more; only saved_rd (architectural destination) remains.
-    logic [X_ID_WIDTH-1:0]  final_saved_id;
-    logic [4:0]             final_saved_rd;
-    logic [X_RFR_WIDTH-1:0] final_saved_rs1, final_saved_rs2;
-
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-        if (!rst_ni) begin
-            final_saved_id  <= '0;
-            final_saved_rd  <= '0;
-            final_saved_rs1 <= '0;
-            final_saved_rs2 <= '0;
-        end else if (accept_final) begin
-            final_saved_id  <= issue_if.issue_req.id;
-            final_saved_rd  <= rd;
-            final_saved_rs1 <= issue_if.issue_req.rs[0];
-            final_saved_rs2 <= issue_if.issue_req.rs[1];
-        end
-    end
+    
 
     // MX_FUNCT3_DUALREAD_TEST: rs1=base register only (rs2/rs3 are read per
     // the interface's global dualread bit but never looked at - see
@@ -298,6 +306,93 @@ module mxdotp_xif
             dr_saved_id  <= issue_if.issue_req.id;
             dr_saved_rd  <= rd;
             dr_saved_rs1 <= issue_if.issue_req.rs[0];
+        end
+    end
+
+    
+    // DOTP Queue Control
+    wire dotp_pending_head_valid = !dotp_pending_empty;
+    wire dotp_pending_head_committed_now = dotp_pending_head_valid && commit_if.commit_valid && (commit_if.commit.id == dotp_pending_q[dotp_pending_head_ptr].id) && (dotp_pending_q[dotp_pending_head_ptr].status == FUSED_PENDING);
+    wire dotp_pending_head_ok = dotp_pending_head_valid && ((dotp_pending_q[dotp_pending_head_ptr].status == FUSED_COMMIT_OK) || (dotp_pending_head_committed_now && !commit_if.commit.commit_kill));
+    wire dotp_pending_head_kill = dotp_pending_head_valid && ((dotp_pending_q[dotp_pending_head_ptr].status == FUSED_COMMIT_KILL) || (dotp_pending_head_committed_now && commit_if.commit.commit_kill));
+    
+    wire dotp_pending_push = accept_dotp;
+    wire dotp_engine_start, dotp_engine_ready;
+    wire dotp_pending_pop = dotp_pending_head_kill || dotp_engine_start;
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            dotp_pending_head_ptr <= '0; dotp_pending_tail_ptr <= '0; dotp_pending_count <= '0;
+        end else begin
+            if (dotp_pending_push) dotp_pending_tail_ptr <= (dotp_pending_tail_ptr == MX_DOTP_PENDING_DEPTH-1) ? '0 : dotp_pending_tail_ptr + 1'b1;
+            if (dotp_pending_pop) dotp_pending_head_ptr <= (dotp_pending_head_ptr == MX_DOTP_PENDING_DEPTH-1) ? '0 : dotp_pending_head_ptr + 1'b1;
+            case ({dotp_pending_push, dotp_pending_pop})
+                2'b10: dotp_pending_count <= dotp_pending_count + 1'b1;
+                2'b01: dotp_pending_count <= dotp_pending_count - 1'b1;
+            endcase
+        end
+    end
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+        end else begin
+            if (dotp_pending_push) begin
+                // synthesis translate_off
+                assert (!dotp_pending_full) else
+                    $error("mxdotp_xif: DOTP pending-commit queue overflowed (depth=%0d) - MX_DOTP_PENDING_DEPTH here in mxdotp_xif.sv is too small for this workload's actual issue-to-commit latency; deepen it, don't silently overwrite.",
+                            MX_DOTP_PENDING_DEPTH);
+                // synthesis translate_on
+                dotp_pending_q[dotp_pending_tail_ptr].id <= issue_if.issue_req.id;
+                dotp_pending_q[dotp_pending_tail_ptr].rs1 <= issue_if.issue_req.rs[0];
+                dotp_pending_q[dotp_pending_tail_ptr].rs2 <= issue_if.issue_req.rs[1];
+                dotp_pending_q[dotp_pending_tail_ptr].rs3 <= issue_if.issue_req.rs[2];
+                dotp_pending_q[dotp_pending_tail_ptr].status <= FUSED_PENDING;
+            end
+            if (dotp_pending_head_committed_now && !dotp_pending_pop) begin
+                dotp_pending_q[dotp_pending_head_ptr].status <= commit_if.commit.commit_kill ? FUSED_COMMIT_KILL : FUSED_COMMIT_OK;
+            end
+        end
+    end
+
+    // FINAL Queue Control
+    wire final_pending_head_valid = !final_pending_empty;
+    wire final_pending_head_committed_now = final_pending_head_valid && commit_if.commit_valid && (commit_if.commit.id == final_pending_q[final_pending_head_ptr].id) && (final_pending_q[final_pending_head_ptr].status == FUSED_PENDING);
+    wire final_pending_head_ok = final_pending_head_valid && ((final_pending_q[final_pending_head_ptr].status == FUSED_COMMIT_OK) || (final_pending_head_committed_now && !commit_if.commit.commit_kill));
+    wire final_pending_head_kill = final_pending_head_valid && ((final_pending_q[final_pending_head_ptr].status == FUSED_COMMIT_KILL) || (final_pending_head_committed_now && commit_if.commit.commit_kill));
+
+    wire final_pending_push = accept_final;
+    wire final_engine_start, final_engine_ready;
+    wire final_pending_pop = final_pending_head_kill || final_engine_start;
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            final_pending_head_ptr <= '0; final_pending_tail_ptr <= '0; final_pending_count <= '0;
+        end else begin
+            if (final_pending_push) final_pending_tail_ptr <= (final_pending_tail_ptr == MX_FINAL_PENDING_DEPTH-1) ? '0 : final_pending_tail_ptr + 1'b1;
+            if (final_pending_pop) final_pending_head_ptr <= (final_pending_head_ptr == MX_FINAL_PENDING_DEPTH-1) ? '0 : final_pending_head_ptr + 1'b1;
+            case ({final_pending_push, final_pending_pop})
+                2'b10: final_pending_count <= final_pending_count + 1'b1;
+                2'b01: final_pending_count <= final_pending_count - 1'b1;
+            endcase
+        end
+    end
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+        end else begin
+            if (final_pending_push) begin
+                // synthesis translate_off
+                assert (!final_pending_full) else
+                    $error("mxdotp_xif: FINAL pending-commit queue overflowed (depth=%0d) - MX_FINAL_PENDING_DEPTH here in mxdotp_xif.sv is too small for this workload's actual issue-to-commit latency; deepen it, don't silently overwrite.",
+                            MX_FINAL_PENDING_DEPTH);
+                // synthesis translate_on
+                final_pending_q[final_pending_tail_ptr].id <= issue_if.issue_req.id;
+                final_pending_q[final_pending_tail_ptr].rd <= rd;
+                final_pending_q[final_pending_tail_ptr].rs1 <= issue_if.issue_req.rs[0];
+                final_pending_q[final_pending_tail_ptr].rs2 <= issue_if.issue_req.rs[1];
+                final_pending_q[final_pending_tail_ptr].status <= FUSED_PENDING;
+            end
+            if (final_pending_head_committed_now && !final_pending_pop) begin
+                final_pending_q[final_pending_head_ptr].status <= commit_if.commit.commit_kill ? FUSED_COMMIT_KILL : FUSED_COMMIT_OK;
+            end
         end
     end
 
@@ -319,7 +414,7 @@ module mxdotp_xif
     // needed, only a head-pointer check.
     //--------------------------------------------------------------------------
 
-    typedef enum logic [1:0] { FUSED_PENDING, FUSED_COMMIT_OK, FUSED_COMMIT_KILL } fused_commit_status_e;
+    
 
     typedef struct packed {
         logic [X_ID_WIDTH-1:0]  id;
@@ -437,22 +532,73 @@ module mxdotp_xif
     end
 
     //--------------------------------------------------------------------------
-    // Mailbox: single-entry producer/consumer buffer carrying MXDOTP's raw
-    // p1/p2 to MXFINAL. See file header for the full protocol. RESIDUE-STYLE
-    // FORMATS ONLY now - MXFUSED never touches this; it has no cross-
-    // instruction hand-off at all (see mxdotp_fused_engine.sv's own internal
-    // front-end/back-end register instead).
+    // Mailbox: MAILBOX_DEPTH-entry FIFO carrying MXDOTP's raw p1/p2 to
+    // MXFINAL. See file header for the full protocol. RESIDUE-STYLE FORMATS
+    // ONLY now - MXFUSED never touches this; it has no cross-instruction
+    // hand-off at all (see mxdotp_fused_engine.sv's own internal front-end/
+    // back-end register instead).
+    //
+    // MAILBOX_DEPTH=4 sizing: this is a throughput knob, not a correctness
+    // one - mailbox_push only fires when !mailbox_full (see below), and the
+    // DOTP engine's own result_ready_i is tied to that same !mailbox_full,
+    // so a full mailbox stalls the DOTP engine's own pipeline rather than
+    // overflowing or overwriting an unconsumed entry, for ANY depth >= 1.
+    // The theoretical worst case is higher than 4: MXDOTP's engine is a
+    // 5-stage pipeline (mxdotp_dotp_engine.sv) that could have up to 5
+    // results completed back-to-back before MXFINAL has consumed any of
+    // them, plus MX_DOTP_PENDING_DEPTH=2 more instructions that could then
+    // enter that pipeline right behind them - so up to ~7 unconsumed
+    // results are possible in a pathological burst with no interleaved
+    // MXFINAL at all. 4 was picked as a plausible middle ground rather than
+    // derived from that bound; since correctness doesn't depend on the
+    // exact number, this is a candidate for future tuning (e.g. counting
+    // mailbox-full stall cycles in a real DOTP-heavy workload) rather than
+    // something that needs resolving now.
     //--------------------------------------------------------------------------
 
-    logic                          mailbox_valid_q;
-    logic signed [PSUM_WIDTH-1:0]  mailbox_p1_q, mailbox_p2_q;
+    
+    localparam int MAILBOX_DEPTH = 4;
+    typedef struct packed { logic signed [PSUM_WIDTH-1:0] p1, p2; } mailbox_entry_t;
+    mailbox_entry_t mailbox_q [0:MAILBOX_DEPTH-1];
+    logic [$clog2(MAILBOX_DEPTH)-1:0] mailbox_head_ptr, mailbox_tail_ptr;
+    logic [$clog2(MAILBOX_DEPTH+1)-1:0] mailbox_count;
+    
+    wire mailbox_full = (mailbox_count == MAILBOX_DEPTH);
+    wire mailbox_empty = (mailbox_count == '0);
+    wire mailbox_valid_q = !mailbox_empty;
+    wire signed [PSUM_WIDTH-1:0] mailbox_p1_q = mailbox_q[mailbox_head_ptr].p1;
+    wire signed [PSUM_WIDTH-1:0] mailbox_p2_q = mailbox_q[mailbox_head_ptr].p2;
+    
+    wire dotp_result_valid;
+    logic [X_ID_WIDTH-1:0] dotp_result_id;  // was missing entirely - Verilator was silently
+                                             // creating this as an implicit 1-bit net, truncating
+                                             // dotp_engine's real X_ID_WIDTH-bit result_id_o down
+                                             // to its LSB before it ever reached result_if.result.id
+    wire mailbox_push = dotp_result_valid && !mailbox_full;
+    wire mailbox_pop = final_engine_start;
+    
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            mailbox_head_ptr <= '0; mailbox_tail_ptr <= '0; mailbox_count <= '0;
+        end else begin
+            if (mailbox_push) mailbox_tail_ptr <= (mailbox_tail_ptr == MAILBOX_DEPTH-1) ? '0 : mailbox_tail_ptr + 1'b1;
+            if (mailbox_pop) mailbox_head_ptr <= (mailbox_head_ptr == MAILBOX_DEPTH-1) ? '0 : mailbox_head_ptr + 1'b1;
+            case ({mailbox_push, mailbox_pop})
+                2'b10: mailbox_count <= mailbox_count + 1'b1;
+                2'b01: mailbox_count <= mailbox_count - 1'b1;
+            endcase
+        end
+    end
+    always_ff @(posedge clk_i) begin
+        if (mailbox_push) begin
+            mailbox_q[mailbox_tail_ptr].p1 <= dotp_engine_p1;
+            mailbox_q[mailbox_tail_ptr].p2 <= dotp_engine_p2;
+        end
+    end
 
-    //--------------------------------------------------------------------------
-    // DOTP slot: engine, mailbox-write handshake, FSM
-    //--------------------------------------------------------------------------
-
-    logic dotp_engine_start, dotp_engine_busy, dotp_engine_done;
     logic signed [PSUM_WIDTH-1:0] dotp_engine_p1, dotp_engine_p2;
+    assign dotp_engine_start = dotp_pending_head_ok && dotp_engine_ready;
+
 
     mxdotp_dotp_engine #(
         .X_RFR_WIDTH (X_RFR_WIDTH)
@@ -460,159 +606,51 @@ module mxdotp_xif
         .clk_i   (clk_i),
         .rst_ni  (rst_ni),
         .start_i (dotp_engine_start),
-        .busy_o  (dotp_engine_busy),
-        .done_o  (dotp_engine_done),
-        .rs1_i   (dotp_saved_rs1),
-        .rs2_i   (dotp_saved_rs2),
-        .rs3_i   (dotp_saved_rs3),
+        .ready_o (dotp_engine_ready),
+        .result_valid_o (dotp_result_valid),
+        .result_ready_i (!mailbox_full),
+        .id_i (dotp_pending_q[dotp_pending_head_ptr].id),
+        .result_id_o (dotp_result_id),
+        .rs1_i (dotp_pending_q[dotp_pending_head_ptr].rs1),
+        .rs2_i (dotp_pending_q[dotp_pending_head_ptr].rs2),
+        .rs3_i (dotp_pending_q[dotp_pending_head_ptr].rs3),
         .p1_o    (dotp_engine_p1),
         .p2_o    (dotp_engine_p2)
     );
 
-    assign dotp_engine_start = (dotp_state_q == MX_WAIT_COMMIT) &&
-                                commit_if.commit_valid &&
-                                (commit_if.commit.id == dotp_saved_id) &&
-                                !commit_if.commit.commit_kill;
-
-    // Result-pending latch: survives the one-cycle dotp_engine_done pulse
-    // until the mailbox is actually free to receive it. dotp_mailbox_write
-    // covers both the common "mailbox already free the instant done_o
-    // fires" fast path and the "mailbox was still occupied, wait" delayed
-    // path with the same combinational expression - see mxdotp_pkg.sv's
-    // milestone header for why the delayed path exists at all (protects
-    // against two MXDOTPs issued back-to-back with no intervening MXFINAL).
-    logic dotp_result_pending_q;
-    logic dotp_mailbox_write;
-
-    assign dotp_mailbox_write = (dotp_engine_done || dotp_result_pending_q) && !mailbox_valid_q;
-
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-        if (!rst_ni) begin
-            dotp_result_pending_q <= 1'b0;
-        end else if (dotp_mailbox_write) begin
-            dotp_result_pending_q <= 1'b0;  // just consumed into the mailbox this cycle
-        end else if (dotp_engine_done) begin
-            dotp_result_pending_q <= 1'b1;  // mailbox was occupied - remember and retry
-        end
-    end
-
-    always_comb begin
-        dotp_state_d = dotp_state_q;
-        unique case (dotp_state_q)
-            MX_IDLE: begin
-                if (accept_dotp) dotp_state_d = MX_WAIT_COMMIT;
-            end
-            MX_WAIT_COMMIT: begin
-                if (commit_if.commit_valid && (commit_if.commit.id == dotp_saved_id)) begin
-                    dotp_state_d = commit_if.commit.commit_kill ? MX_IDLE : MX_COMPUTE;
-                end
-            end
-            MX_COMPUTE: begin
-                if (dotp_mailbox_write) dotp_state_d = MX_RESULT;
-            end
-            MX_RESULT: begin
-                if ((order_head_tag == MX_SLOT_DOTP) && result_if.result_valid && result_if.result_ready)
-                    dotp_state_d = MX_IDLE;
-            end
-            default: dotp_state_d = MX_IDLE;
-        endcase
-    end
+    
 
     //--------------------------------------------------------------------------
     // FINAL slot: engine, mailbox-read handshake, FSM
     //--------------------------------------------------------------------------
 
-    logic final_engine_start, final_engine_busy, final_engine_done;
+    logic final_result_valid, final_result_ready;
+    logic [X_ID_WIDTH-1:0] final_result_id;
+    logic [4:0] final_result_rd;
     logic [X_RFW_WIDTH-1:0] final_result_data;
+    assign final_engine_start = final_pending_head_ok && mailbox_valid_q && final_engine_ready;
 
     mxdotp_final_engine #(
         .X_RFR_WIDTH (X_RFR_WIDTH),
-        .X_RFW_WIDTH (X_RFW_WIDTH)
+        .X_RFW_WIDTH (X_RFW_WIDTH),
+        .X_ID_WIDTH  (X_ID_WIDTH)
     ) final_engine_i (
         .clk_i       (clk_i),
         .rst_ni      (rst_ni),
         .start_i     (final_engine_start),
-        .busy_o      (final_engine_busy),
-        .done_o      (final_engine_done),
-        .rs1_i       (final_saved_rs1),
-        .rs2_i       (final_saved_rs2),
+        .ready_o     (final_engine_ready),
+        .result_valid_o (final_result_valid),
+        .result_ready_i (final_result_ready),
+        .id_i        (final_pending_q[final_pending_head_ptr].id),
+        .rd_i        (final_pending_q[final_pending_head_ptr].rd),
+        .result_id_o (final_result_id),
+        .result_rd_o (final_result_rd),
+        .rs1_i       (final_pending_q[final_pending_head_ptr].rs1),
+        .rs2_i       (final_pending_q[final_pending_head_ptr].rs2),
         .p1_i        (mailbox_p1_q),
         .p2_i        (mailbox_p2_q),
         .result_data (final_result_data)
     );
-
-    // The genuine data dependency: FINAL's engine cannot start until the
-    // mailbox actually holds valid data. Two disjuncts, not one - this
-    // matters for timing, not just correctness:
-    //   1) (WAIT_COMMIT && commit_valid && ... && mailbox_valid_q): the
-    //      common case - mailbox is ALREADY valid the same cycle commit
-    //      arrives, so start immediately, same cycle, exactly like DOTP's
-    //      own engine start below. An earlier version of this only had
-    //      disjunct 2 (gated on final_state_q==MX_COMPUTE, which is itself
-    //      one cycle after commit_valid, a registered transition) - that
-    //      cost a real, unnecessary extra cycle in this common case,
-    //      caught by comparing before/after cycle counts on the same test:
-    //      FINAL's commit->result went from 3 cycles to 4, a regression,
-    //      not an improvement, for exactly the pair this milestone was
-    //      supposed to speed up.
-    //   2) (MX_COMPUTE && mailbox_valid_q): the genuine-wait case - commit
-    //      already happened (state is already MX_COMPUTE) but the mailbox
-    //      wasn't ready yet at that moment; fire the instant it becomes
-    //      ready on a later cycle. This is the only case that should ever
-    //      cost an extra cycle, because it reflects an actual, unavoidable
-    //      data dependency, not an artifact of how the condition was written.
-    // The two disjuncts don't double-fire: disjunct 1 firing clears
-    // mailbox_valid_q the same edge, so by the time final_state_q has
-    // registered into MX_COMPUTE (next cycle), disjunct 2's mailbox_valid_q
-    // term is already false.
-    assign final_engine_start =
-        ((final_state_q == MX_WAIT_COMMIT) && commit_if.commit_valid &&
-         (commit_if.commit.id == final_saved_id) && !commit_if.commit.commit_kill &&
-         mailbox_valid_q && !final_engine_busy) ||
-        ((final_state_q == MX_COMPUTE) && mailbox_valid_q && !final_engine_busy);
-
-    always_comb begin
-        final_state_d = final_state_q;
-        unique case (final_state_q)
-            MX_IDLE: begin
-                if (accept_final) final_state_d = MX_WAIT_COMMIT;
-            end
-            MX_WAIT_COMMIT: begin
-                if (commit_if.commit_valid && (commit_if.commit.id == final_saved_id)) begin
-                    final_state_d = commit_if.commit.commit_kill ? MX_IDLE : MX_COMPUTE;
-                end
-            end
-            MX_COMPUTE: begin
-                if (final_engine_done) final_state_d = MX_RESULT;
-            end
-            MX_RESULT: begin
-                if ((order_head_tag == MX_SLOT_FINAL) && result_if.result_valid && result_if.result_ready)
-                    final_state_d = MX_IDLE;
-            end
-            default: final_state_d = MX_IDLE;
-        endcase
-    end
-
-    // Mailbox update: dotp_mailbox_write (mailbox empty -> full) and
-    // final_engine_start (mailbox full -> empty) are mutually exclusive by
-    // construction - the former requires !mailbox_valid_q, the latter
-    // requires mailbox_valid_q - so there is no priority-ordering question
-    // between these two branches; at most one can be true in any cycle.
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-        if (!rst_ni) begin
-            mailbox_valid_q <= 1'b0;
-            mailbox_p1_q    <= '0;
-            mailbox_p2_q    <= '0;
-        end else begin
-            if (dotp_mailbox_write) begin
-                mailbox_valid_q <= 1'b1;
-                mailbox_p1_q    <= dotp_engine_p1;
-                mailbox_p2_q    <= dotp_engine_p2;
-            end else if (final_engine_start) begin
-                mailbox_valid_q <= 1'b0;
-            end
-        end
-    end
 
     //--------------------------------------------------------------------------
     // MX_FUNCT3_DUALREAD_TEST slot: validation-only, not part of the real
@@ -825,6 +863,8 @@ module mxdotp_xif
     // back into global program order. Same gating rationale as the single-
     // engine design, just one instance of it per engine/slot - the engines
     // have no visibility into the shared order queue, so this must live here.
+    assign final_result_ready = (order_head_tag == MX_SLOT_FINAL) && result_if.result_ready;
+    wire dotp_result_ready_xif = (order_head_tag == MX_SLOT_DOTP) && result_if.result_ready;
     assign fused4_result_ready  = (order_head_tag == MX_SLOT_FUSED)    && result_if.result_ready;
     assign fused8_result_ready  = (order_head_tag == MX_SLOT_FUSED8)   && result_if.result_ready;
     assign fusedm2_result_ready = (order_head_tag == MX_SLOT_FUSED_M2) && result_if.result_ready;
@@ -905,19 +945,19 @@ module mxdotp_xif
         if (!order_empty) begin
             unique case (order_head_tag)
                 MX_SLOT_DOTP: begin
-                    if (dotp_state_q == MX_RESULT) begin
+                    if (dotp_result_valid) begin
                         result_if.result_valid = 1'b1;
-                        result_if.result.id    = dotp_saved_id;
+                        result_if.result.id    = dotp_result_id;
                         result_if.result.rd    = 5'd0;
                         result_if.result.we    = 1'b0;
                         result_if.result.data  = '0;
                     end
                 end
                 MX_SLOT_FINAL: begin
-                    if (final_state_q == MX_RESULT) begin
+                    if (final_result_valid) begin
                         result_if.result_valid = 1'b1;
-                        result_if.result.id    = final_saved_id;
-                        result_if.result.rd    = final_saved_rd;
+                        result_if.result.id    = final_result_id;
+                        result_if.result.rd    = final_result_rd;
                         result_if.result.we    = 1'b1;
                         result_if.result.data  = final_result_data;
                     end

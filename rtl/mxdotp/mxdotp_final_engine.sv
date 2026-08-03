@@ -42,10 +42,11 @@
 //   to be one combinational stage (LATENCY_CYCLES-gated, but really just
 //   one cycle's worth of logic regardless of the counter value) is now
 //   THREE real stages:
-//     - BACK1: decode scales, place_in_acc x2 (contrib1, contrib2) +
-//       fp32_to_acc (acc_contrib), sum all three -> registers sum_q (the
-//       X|Y cut).
-//     - BACK2: mxdotp_pkg.sv's acc_find_lead (leading-one scan) on sum_q ->
+//   - BACK1A: decode scales, calculate shift amounts, and perform variable shifts (place_in_acc).
+//       Registers the three 74-bit shifted operands and their stickies. (The new cut).
+//   - BACK1B: the 74-bit wide adder tree (summing the shifted operands).
+//       Registers sum_q (the X|Y cut).
+//   - BACK2: mxdotp_pkg.sv's acc_find_lead (leading-one scan) on sum_q ->
 //       registers lead_q (the Y|Z cut - the single highest-leverage cut
 //       identified from Vivado's timing report).
 //     - BACK3: mxdotp_pkg.sv's acc_finalize (mantissa extract + sticky +
@@ -95,15 +96,22 @@ module mxdotp_final_engine
     // header) and would work correctly at 32 too. No elaboration-time
     // guard needed here for that reason.
     parameter int X_RFR_WIDTH    = 64,
-    parameter int X_RFW_WIDTH    = 32
+    parameter int X_RFW_WIDTH    = 32,
+    parameter int X_ID_WIDTH     = 4
 )
 (
     input  logic                   clk_i,
     input  logic                   rst_ni,
 
     input  logic                   start_i,
-    output logic                   busy_o,
-    output logic                   done_o,
+    output logic                   ready_o,
+    output logic                   result_valid_o,
+    input  logic                   result_ready_i,
+
+    input  logic [X_ID_WIDTH-1:0]     id_i,
+    input  logic [4:0]                rd_i,
+    output logic [X_ID_WIDTH-1:0]     result_id_o,
+    output logic [4:0]                result_rd_o,
 
     input  logic [X_RFR_WIDTH-1:0]    rs1_i,  // scales
     input  logic [X_RFR_WIDTH-1:0]    rs2_i,  // old FP32 accumulator
@@ -118,78 +126,130 @@ module mxdotp_final_engine
   // see file header for why that's the entire "snapshot" mechanism.
   //----------------------------------------------------------------------------
 
+// PIPELINE STAGES INTRODUCED (5 stages / 4 cycles latency):
+// - Stage 1 (in_valid_q): Input capture. rs1_i, rs2_i, p1_i, p2_i are latched.
+// - Stage 2 (back1a_valid_q): Scale decode + Shifters. The massive BACK1 combinational path is sliced in half. This stage calculates shift amounts and shifts the three terms (F, SECOND, acc), latching the three 74-bit shifted values and their stickies into back1a_*_q.
+// - Stage 3 (back1b_valid_q): Wide Adder Tree. The three 74-bit shifted values are summed together into mxf_word_q.
+// - Stage 4 (back2_valid_q): Leading-one scan (mxf_find_lead). Latches into lead_q.
+// - Stage 5 (result_valid_q): Mantissa rounding/finalize (mxf_finalize). Latches into result_data_q.
+// NEW CROSSED SIGNALS: The 74-bit shifted contributions from place_F, place_SECOND, and place_acc (and their stickies) now cross a new register boundary (back1a) before entering the wide adder tree.
+
+  logic in_valid_q, back1a_valid_q, back1b_valid_q, back2_valid_q, result_valid_q;
+  
+  logic [X_ID_WIDTH-1:0] id_q1, id_q2, id_q3, id_q4, id_q5;
+  logic [4:0] rd_q1, rd_q2, rd_q3, rd_q4, rd_q5;
+
   logic [X_RFR_WIDTH-1:0] rs1_q, rs2_q;
   logic signed [PSUM_WIDTH-1:0] p1_q, p2_q;
 
-  //----------------------------------------------------------------------------
-  // Three-phase busy tracking: BACK1 (scale+accumulate) -> BACK2 (leading-
-  // one scan) -> BACK3 (mantissa/round/clamp) - see file header. Each is a
-  // REAL single cycle by construction; no counter needed (unlike this
-  // engine's previous single-phase LATENCY_CYCLES placeholder, now removed
-  // entirely since it no longer means anything true).
-  //----------------------------------------------------------------------------
+  // BACK1A registers
+  logic signed [MXF_LZC_WIDTH-1:0] f_contrib_q, sec_contrib_q, acc_contrib_q;
+  logic f_sticky_q, sec_sticky_q, acc_sticky_q;
+  mx_exp_t anchor_q1;
+  logic mxf_is_acc_q1;
+  logic [31:0] bypass_acc_q1;
 
-  typedef enum logic [1:0] { FINAL_BACK1, FINAL_BACK2, FINAL_BACK3 } final_phase_e;
-  final_phase_e phase_q;
+  // BACK1B registers
+  logic signed [MXF_LZC_WIDTH-1:0] mxf_word_q;
+  mx_exp_t                         anchor_q;
+  logic                            mxf_sticky_q;
+  logic                            mxf_is_acc_q;
+  logic [31:0]                     bypass_acc_q;
+  mxf_lead_result_t                lead_q;
 
-  logic busy_q;
+  // Stage-4 (BACK2) registers. anchor_q/mxf_sticky_q/mxf_is_acc_q/
+  // bypass_acc_q above settle at the SAME back1a_valid_q->back1b_valid_q
+  // boundary as mxf_word_q (stage 3), but are consumed later - alongside
+  // lead_q - during stage 4 (mxf_finalize_i reads acc_sticky_i/scale_exp_i,
+  // and back3_result_comb reads mxf_is_acc_q/bypass_acc_q for its mux),
+  // exactly where lead_q is ALSO consumed. lead_q gets that extra stage of
+  // propagation (captured at the back1b_valid_q gate, alongside id_q4/
+  // rd_q4); these four never did - they were left reading the stage-3
+  // register directly, one stage too early. Under genuine back-to-back
+  // overlap (this engine's whole point, post-pipelining) a second
+  // instruction entering back1a_valid_q behind the first overwrites
+  // anchor_q/mxf_sticky_q/mxf_is_acc_q/bypass_acc_q before the first
+  // instruction reaches stage 4 to read them - confirmed as a real,
+  // deterministic failure by tb_mxfinal_unit.sv's rewritten (overlap +
+  // randomized-backpressure) unit test against the real golden model.
+  mx_exp_t           anchor_q_stage4;
+  logic               mxf_sticky_q_stage4;
+  logic               mxf_is_acc_q_stage4;
+  logic [31:0]        bypass_acc_q_stage4;
 
-  // BACK1 -> BACK2 hand-off (the X|Y cut). The old ACC_FULL_WIDTH sum_q of the
-  // absolute-window path is REPLACED by the sliding-frame's MXF_LZC_WIDTH word
-  // (option (a): a new register of the correct width, sum_q left removed
-  // rather than resized, to keep the diff minimal and the intent clear). The
-  // per-instruction anchor (scale_exp) and the aggregate sticky / neg_adjust /
-  // acc-bypass flags are registered alongside it, since BACK2/BACK3 need them.
-  logic signed [MXF_LZC_WIDTH-1:0] mxf_word_q;   // NEW - the X|Y cut
-  mx_exp_t                         anchor_q;     // selected scale_exp for finalize
-  logic                            mxf_sticky_q; // aggregate tail sticky
-  logic                            mxf_is_acc_q; // bypass: return old_acc verbatim
-  logic [31:0]                     bypass_acc_q; // the old_acc to return on bypass
-  mxf_lead_result_t                lead_q;       // BACK2 -> BACK3 hand-off (Y|Z cut)
-
+  wire stall = result_valid_q && !result_ready_i;
+  
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      // Reset: CONTROL state only. Datapath registers are deliberately not
-      // reset - a stage's data is never looked at unless its own control bit
-      // says it is meaningful, so an unreset datapath register cannot be
-      // observed before it is written. This is the discipline MXFP4 and
-      // M2XFP4 already used; MXFP8 and MXFINAL are brought onto it here so
-      // all four engines are consistent. Costs ~900 DFFR_X1 -> DFF_X1 and
-      // takes those flops off the reset tree. The translate_off assertion at
-      // the bottom of this file is what actively checks the discipline:
-      // it fails in a 4-state simulator if any X ever escapes on a beat that
-      // claims to be valid.
-      busy_q  <= 1'b0;
-      phase_q <= FINAL_BACK1;
-    end else if (start_i && !busy_q) begin
-      busy_q  <= 1'b1;
-      phase_q <= FINAL_BACK1;
-      rs1_q   <= rs1_i;
-      rs2_q   <= rs2_i;
-      p1_q    <= p1_i;
-      p2_q    <= p2_i;
-    end else if (busy_q && (phase_q == FINAL_BACK1)) begin
-      // X|Y cut: register the sliding-frame word (plus the scalars BACK2/BACK3
-      // consume) before the leading-one scan runs on it.
-      mxf_word_q   <= back1_word_comb;
-      anchor_q     <= back1_anchor_comb;
-      mxf_sticky_q <= back1_sticky_comb;
-      mxf_is_acc_q <= back1_is_acc_comb;
-      bypass_acc_q <= old_acc;
-      phase_q      <= FINAL_BACK2;
-    end else if (busy_q && (phase_q == FINAL_BACK2)) begin
-      // Y|Z cut: register the leading-one scan's result before mantissa
-      // extraction/round/clamp run on it - the single highest-leverage cut
-      // identified from Vivado's timing report (see file header).
-      lead_q  <= back2_lead_comb;
-      phase_q <= FINAL_BACK3;
-    end else if (busy_q && (phase_q == FINAL_BACK3)) begin
-      busy_q <= 1'b0;
+      in_valid_q     <= 1'b0;
+      back1a_valid_q <= 1'b0;
+      back1b_valid_q <= 1'b0;
+      back2_valid_q  <= 1'b0;
+      result_valid_q <= 1'b0;
+    end else if (!stall) begin
+      in_valid_q     <= start_i;
+      back1a_valid_q <= in_valid_q;
+      back1b_valid_q <= back1a_valid_q;
+      back2_valid_q  <= back1b_valid_q;
+      result_valid_q <= back2_valid_q;
     end
   end
 
-  assign busy_o = busy_q;
-  assign done_o = busy_q && (phase_q == FINAL_BACK3);
+  // Comb signals for BACK1A
+  logic signed [MXF_LZC_WIDTH-1:0] back1a_f_contrib_comb, back1a_sec_contrib_comb, back1a_acc_contrib_comb;
+  logic back1a_f_sticky_comb, back1a_sec_sticky_comb, back1a_acc_sticky_comb;
+
+  // Comb signals for BACK1B
+  logic signed [MXF_LZC_WIDTH-1:0] back1b_word_comb;
+  logic                            back1b_sticky_comb;
+
+  always_ff @(posedge clk_i) begin
+    if (!stall) begin
+      if (start_i) begin
+        id_q1   <= id_i;
+        rd_q1   <= rd_i;
+        rs1_q   <= rs1_i;
+        rs2_q   <= rs2_i;
+        p1_q    <= p1_i;
+        p2_q    <= p2_i;
+      end
+      if (in_valid_q) begin
+        id_q2         <= id_q1;
+        rd_q2         <= rd_q1;
+        f_contrib_q   <= back1a_f_contrib_comb;
+        f_sticky_q    <= back1a_f_sticky_comb;
+        sec_contrib_q <= back1a_sec_contrib_comb;
+        sec_sticky_q  <= back1a_sec_sticky_comb;
+        acc_contrib_q <= back1a_acc_contrib_comb;
+        acc_sticky_q  <= back1a_acc_sticky_comb;
+        anchor_q1     <= back1_anchor_comb;
+        mxf_is_acc_q1 <= back1_is_acc_comb;
+        bypass_acc_q1 <= old_acc;
+      end
+      if (back1a_valid_q) begin
+        id_q3        <= id_q2;
+        rd_q3        <= rd_q2;
+        mxf_word_q   <= back1b_word_comb;
+        mxf_sticky_q <= back1b_sticky_comb;
+        anchor_q     <= anchor_q1;
+        mxf_is_acc_q <= mxf_is_acc_q1;
+        bypass_acc_q <= bypass_acc_q1;
+      end
+      if (back1b_valid_q) begin
+        id_q4   <= id_q3;
+        rd_q4   <= rd_q3;
+        lead_q  <= back2_lead_comb;
+        anchor_q_stage4     <= anchor_q;
+        mxf_sticky_q_stage4 <= mxf_sticky_q;
+        mxf_is_acc_q_stage4 <= mxf_is_acc_q;
+        bypass_acc_q_stage4 <= bypass_acc_q;
+      end
+      // Result is written to result_data_q later below, handled similarly
+    end
+  end
+
+  assign ready_o = !stall;
+  assign result_valid_o = result_valid_q;
 
   //----------------------------------------------------------------------------
   // BACK1: decode rs1_q=scales / rs2_q=old_acc, apply each scale pair to
@@ -284,8 +344,12 @@ module mxdotp_final_engine
     place_SECOND = mxf_place(SECOND_val, SECOND_sh, 13);
     place_acc    = mxf_place(smant,      acc_sh,    25);
 
-    back1_word_comb   = place_F.contrib + place_SECOND.contrib + place_acc.contrib;
-    back1_sticky_comb = place_F.sticky | place_SECOND.sticky | place_acc.sticky;
+    back1a_f_contrib_comb   = place_F.contrib;
+    back1a_f_sticky_comb    = place_F.sticky;
+    back1a_sec_contrib_comb = place_SECOND.contrib;
+    back1a_sec_sticky_comb  = place_SECOND.sticky;
+    back1a_acc_contrib_comb = place_acc.contrib;
+    back1a_acc_sticky_comb  = place_acc.sticky;
 
     // Bypasses (return old_acc verbatim) - see mxdotp_pkg.sv MXFINAL header:
     //   (1) acc dominates; (2) both products zero; (3) products cancel exactly.
@@ -294,6 +358,12 @@ module mxdotp_final_engine
     back1_is_acc_comb = (acc_shift > mx_exp_t'(MXF_MAX_ACC_SHIFT))
                       || (p1_is_zero && (p2_q == '0))
                       || products_cancel;
+  end
+
+  // BACK1B: wide adder tree
+  always_comb begin
+    back1b_word_comb   = f_contrib_q + sec_contrib_q + acc_contrib_q;
+    back1b_sticky_comb = f_sticky_q | sec_sticky_q | acc_sticky_q;
   end
 
   //----------------------------------------------------------------------------
@@ -336,8 +406,8 @@ module mxdotp_final_engine
     .sign_i       (lead_q.sign),
     .lead_pos_i   (lead_q.lead_pos),
     .mag_i        (lead_q.mag),
-    .acc_sticky_i (mxf_sticky_q),
-    .scale_exp_i  (anchor_q),
+    .acc_sticky_i (mxf_sticky_q_stage4),
+    .scale_exp_i  (anchor_q_stage4),
     .result_o     (back3_finalized)
   );
 
@@ -346,21 +416,21 @@ module mxdotp_final_engine
   // accumulator verbatim (registered in bypass_acc_q). Otherwise the
   // finalized frame word, with the scale (anchor) re-entering on the
   // exponent only and the aggregate sticky ORed into the round decision.
-  assign back3_result_comb = mxf_is_acc_q ? bypass_acc_q : back3_finalized;
+  assign back3_result_comb = mxf_is_acc_q_stage4 ? bypass_acc_q_stage4 : back3_finalized;
 
   logic [X_RFW_WIDTH-1:0] result_data_q;
 
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin
-      // No reset: result_data_q is only sampled by mxdotp_xif.sv when its own
-      // (reset) final_state_q reaches MX_RESULT, which cannot happen before
-      // done_o has written this register.
-    end else if (done_o) begin
+  always_ff @(posedge clk_i) begin
+    if (!stall && back2_valid_q) begin
+      id_q5 <= id_q4;
+      rd_q5 <= rd_q4;
       result_data_q <= back3_result_comb;
     end
   end
 
   assign result_data = result_data_q;
+  assign result_id_o = id_q5;
+  assign result_rd_o = rd_q5;
 
 
   // synthesis translate_off
@@ -376,9 +446,9 @@ module mxdotp_final_engine
   // gate-level sim - exactly where an unreset-register bug would otherwise hide.
   //----------------------------------------------------------------------------
   always_ff @(posedge clk_i) begin
-    if (rst_ni && done_o) begin
-      assert (!$isunknown(back3_result_comb)) else
-        $error("%m: X on the result being latched at done_o - an unreset datapath register was read before it was written");
+    if (rst_ni && result_valid_q) begin
+      assert (!$isunknown(result_data_q)) else
+        $error("%m: X on the result being latched - an unreset datapath register was read before it was written");
     end
   end
   // synthesis translate_on
