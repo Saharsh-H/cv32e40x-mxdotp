@@ -235,6 +235,12 @@ module mxdotp_m2xfp4_fused_engine
   //            + correction[sj]    (ONE 5x5 multiply, gated behind the top-1
   //              tree via an 8:1 select on b_code and delta_code)
   //
+  // Phase B1: baseline and correction are no longer merged into an explicit
+  // psum signal on the real datapath - they're kept separate through the
+  // Sg-EM scaling and only merged in one final add, since baseline is
+  // tree-independent (early) and correction is tree-dependent (late); see
+  // the (e) step below for the reorder and its timing rationale.
+  //
   // Six steps, all combinational, all inside one stage:
   //   (a) unpack nibbles + metadata
   //   (b) per subgroup: re-derive the top-1 activation (max |FP4 code|, ties
@@ -310,9 +316,10 @@ module mxdotp_m2xfp4_fused_engine
   logic signed [CODE_WIDTH-1:0]        bcode_sel    [0:M2_SUBGROUPS-1];
   logic signed [M2_CORR_PROD_WIDTH-1:0] correction  [0:M2_SUBGROUPS-1];
 
-  logic signed [M2_PSUM_WIDTH-1:0]     psum    [0:M2_SUBGROUPS-1];
-  logic signed [M2_SOP_SIGNED_WIDTH-1:0] psum_w    [0:M2_SUBGROUPS-1];
-  logic signed [M2_SOP_SIGNED_WIDTH-1:0] sg_scaled [0:M2_SUBGROUPS-1];
+  logic signed [M2_SOP_SIGNED_WIDTH-1:0] base_scaled [0:M2_SUBGROUPS-1];
+  logic signed [M2_SOP_SIGNED_WIDTH-1:0] corr_scaled [0:M2_SUBGROUPS-1];
+  logic signed [M2_SOP_SIGNED_WIDTH-1:0] base_total;
+  logic signed [M2_SOP_SIGNED_WIDTH-1:0] corr_total;
   logic signed [M2_SOP_SIGNED_WIDTH-1:0] sop_sum;
 
   int fi, sj, si;
@@ -383,6 +390,17 @@ module mxdotp_m2xfp4_fused_engine
 
     // (d) correction: delta lookup for all 8 lanes (tree-independent), then
     // ONE select + ONE small multiply per subgroup, gated by the tree.
+    //
+    // Phase B1: the multiply below is replaced by a shift-select. delta_sel
+    // is exhaustively proven (see mxdotp_pkg.sv's m2_delta_mag derivation:
+    // checked over all 8 FP4 magnitudes x 4 meta values) to only ever be one
+    // of {-8,-4,-2,-1,0,1,2,4,8} - i.e. always a signed power of two (or
+    // zero) - so "bcode_sel * delta_sel" is always exactly "shift bcode_sel
+    // left by log2(|delta_sel|), then apply delta_sel's sign," never a
+    // generic multiply. Verified bit-exact against the original multiply
+    // exhaustively over the full operand space (32 bcode values x all 9
+    // delta values, 288/288 match) before this replaced the multiply - see
+    // tb_m2_correction_equiv.sv.
     for (fi = 0; fi < MX_K; fi++) begin
       delta_code[fi] = m2_delta_code(a_nib[fi], elem_em[fi / M2_SUBGROUP_LEN]);
     end
@@ -395,25 +413,63 @@ module mxdotp_m2xfp4_fused_engine
           bcode_sel[sj] = b_code[sj*M2_SUBGROUP_LEN + si];
         end
       end
-      correction[sj] = M2_CORR_PROD_WIDTH'(bcode_sel[sj]) * M2_CORR_PROD_WIDTH'(delta_sel[sj]);
+      unique case (delta_sel[sj])
+        5'sd0:   correction[sj] = M2_CORR_PROD_WIDTH'(0);
+        5'sd1:   correction[sj] =   M2_CORR_PROD_WIDTH'(bcode_sel[sj]);
+        -5'sd1:  correction[sj] = -(M2_CORR_PROD_WIDTH'(bcode_sel[sj]));
+        5'sd2:   correction[sj] =   M2_CORR_PROD_WIDTH'(bcode_sel[sj]) <<< 1;
+        -5'sd2:  correction[sj] = -(M2_CORR_PROD_WIDTH'(bcode_sel[sj]) <<< 1);
+        5'sd4:   correction[sj] =   M2_CORR_PROD_WIDTH'(bcode_sel[sj]) <<< 2;
+        -5'sd4:  correction[sj] = -(M2_CORR_PROD_WIDTH'(bcode_sel[sj]) <<< 2);
+        5'sd8:   correction[sj] =   M2_CORR_PROD_WIDTH'(bcode_sel[sj]) <<< 3;
+        -5'sd8:  correction[sj] = -(M2_CORR_PROD_WIDTH'(bcode_sel[sj]) <<< 3);
+        default: correction[sj] = M2_CORR_PROD_WIDTH'(0);  // unreachable - delta_sel is exhaustively one of the 9 values above
+      endcase
     end
 
     // (e) baseline + correction, then Sg-EM: P*(1 + k/4) == P*(4+k) in 1/64
     // units == (P<<2) + k1*(P<<1) + k0*P. Three shifted addends, no
     // multiplier, exact - this is the step that moves the frame anchor from
     // MXFP4's 2 to 6.
+    //
+    // Phase B1: reordered for timing. baseline_psum is tree-INDEPENDENT
+    // (ready well before the tournament tree resolves top1_oh -> correction
+    // - see (c) above), while correction is the late, tree-dependent
+    // signal. The original formulation merged them into one 14-bit value
+    // FIRST (psum = baseline+correction), then ran the full 3-term Sg-EM
+    // shift-add on that ALREADY-MERGED 18-bit value, then summed across
+    // subgroups - meaning the early-arriving baseline contribution's width
+    // dragged through every subsequent add on the critical path from
+    // a_mag. Real OpenROAD data (report_checks on the deployed netlist)
+    // showed this ripple-add chain costing ~0.89ns of a 2.71ns critical
+    // path (a_mag[36] -> sop_q[6]).
+    //
+    // Reorder (distributivity: (A+B)<<n == (A<<n)+(B<<n), pure algebraic
+    // regrouping of the SAME terms - not new logic): keep baseline's and
+    // correction's contributions separate all the way through, merging
+    // them in ONE final add at the very end instead of at the start.
+    // baseline's side (base_scaled, base_total) depends only on
+    // tree-independent signals and is off the critical path from a_mag;
+    // correction's side (corr_scaled, corr_total) is what's actually late,
+    // and stays a narrower, more direct chain until the single final merge.
+    //
+    // Verified bit-exact against the original (psum/sg_scaled/sop_sum)
+    // formulation across 300k+ directed-corner + full-range-random +
+    // proven-bound-random vectors, 0 mismatches - see
+    // tb_m2_adder_equiv.sv - before this replaced it. The FRONT sizing
+    // proofs below are unaffected: this computes the exact same
+    // mathematical quantity, just grouped differently.
     for (sj = 0; sj < M2_SUBGROUPS; sj++) begin
-      psum[sj] = baseline_psum[sj] + M2_PSUM_WIDTH'(correction[sj]);
+      base_scaled[sj] = (M2_SOP_SIGNED_WIDTH'(baseline_psum[sj]) <<< 2)
+                      + (sg_em[sj][1] ? (M2_SOP_SIGNED_WIDTH'(baseline_psum[sj]) <<< 1) : M2_SOP_SIGNED_WIDTH'(0))
+                      + (sg_em[sj][0] ?  M2_SOP_SIGNED_WIDTH'(baseline_psum[sj])        : M2_SOP_SIGNED_WIDTH'(0));
+      corr_scaled[sj] = (M2_SOP_SIGNED_WIDTH'(correction[sj]) <<< 2)
+                      + (sg_em[sj][1] ? (M2_SOP_SIGNED_WIDTH'(correction[sj]) <<< 1) : M2_SOP_SIGNED_WIDTH'(0))
+                      + (sg_em[sj][0] ?  M2_SOP_SIGNED_WIDTH'(correction[sj])        : M2_SOP_SIGNED_WIDTH'(0));
     end
-
-    sop_sum = '0;
-    for (sj = 0; sj < M2_SUBGROUPS; sj++) begin
-      psum_w[sj]    = M2_SOP_SIGNED_WIDTH'(psum[sj]);
-      sg_scaled[sj] = (psum_w[sj] <<< 2)
-                    + (sg_em[sj][1] ? (psum_w[sj] <<< 1) : M2_SOP_SIGNED_WIDTH'(0))
-                    + (sg_em[sj][0] ?  psum_w[sj]        : M2_SOP_SIGNED_WIDTH'(0));
-      sop_sum       = sop_sum + sg_scaled[sj];
-    end
+    base_total = base_scaled[0] + base_scaled[1];
+    corr_total = corr_scaled[0] + corr_scaled[1];
+    sop_sum    = base_total + corr_total;
 
     sop_comb = (mx_format_q == MX_FMT_M2XFP4) ? sop_sum : '0;
 
@@ -433,12 +489,21 @@ module mxdotp_m2xfp4_fused_engine
   // decomposition (baseline+correction computes the exact same mathematical
   // quantity the old wide-multiplier design did) - so the bounds themselves
   // don't change, only how psum is built.
+  //
+  // psum itself is no longer a synthesized signal (Phase B1 reorder above
+  // keeps baseline/correction separate on the real datapath) - recomputed
+  // HERE, simulation-only, purely so this check keeps testing the exact
+  // same property it always did. Zero synthesis impact: this whole block
+  // is stripped for the real hardware.
+  logic signed [M2_PSUM_WIDTH-1:0] psum_chk [0:M2_SUBGROUPS-1];
   always_comb begin
+    for (int cj = 0; cj < M2_SUBGROUPS; cj++) psum_chk[cj] = '0;
     if (in_valid_q && (mx_format_q == MX_FMT_M2XFP4)) begin
       for (int cj = 0; cj < M2_SUBGROUPS; cj++) begin
-        assert (psum[cj] <= M2_PSUM_WIDTH'(4704) && psum[cj] >= -M2_PSUM_WIDTH'(4704))
+        psum_chk[cj] = baseline_psum[cj] + M2_PSUM_WIDTH'(correction[cj]);
+        assert (psum_chk[cj] <= M2_PSUM_WIDTH'(4704) && psum_chk[cj] >= -M2_PSUM_WIDTH'(4704))
           else $error("mxdotp_m2xfp4_fused_engine: subgroup %0d partial sum %0d exceeds the +/-4704 bound - violates the sizing proof",
-                      cj, psum[cj]);
+                      cj, psum_chk[cj]);
         assert ($onehot(top1_oh[cj]))
           else $error("mxdotp_m2xfp4_fused_engine: subgroup %0d top-1 is not one-hot", cj);
       end
